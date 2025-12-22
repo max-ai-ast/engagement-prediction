@@ -7,7 +7,7 @@ __pycache__/
 .Python
 
 # Run outputs (large, machine-specific)
-outputs/
+outputs
 
 # Ops subdirectories (analysis scratch work)
 ops/*/

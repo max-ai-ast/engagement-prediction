@@ -22,6 +22,8 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'relevel_gini':  ("utils/03_relevel/stage_relevel_gini.py", "03_relevel"),
     'split':         ("utils/04_split/stage_split_users.py", "04_split"),
     'train':         ("utils/05_train/stage_train.py", "05_train"),
+    # Alternative two-tower training module
+    'train_two_tower': ("utils/05_train/stage_train_two_tower.py", "05_train"),
     'evaluate':      ("utils/06_evaluate/stage_evaluate.py", "06_evaluate"),
 }
 

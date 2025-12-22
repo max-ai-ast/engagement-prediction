@@ -57,6 +57,17 @@ def _load_run_training_pipeline():
     return getattr(mod, "run_training_pipeline")
 
 
+def _load_run_two_tower_pipeline():
+    """Dynamically load run_two_tower_pipeline from utils/05_train/stage_train_two_tower.py."""
+    stage_path = Path(__file__).parent / "utils" / "05_train" / "stage_train_two_tower.py"
+    spec = importlib.util.spec_from_file_location("utils_stage_train_two_tower", str(stage_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load two-tower training stage module at {stage_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    return getattr(mod, "run_two_tower_pipeline")
+
+
 def _load_stage_evaluate():
     """Dynamically load utils/06_evaluate/stage_evaluate.py module."""
     stage_path = Path(__file__).parent / "utils" / "06_evaluate" / "stage_evaluate.py"
@@ -216,9 +227,9 @@ def cmd_evaluate(args) -> int:
 
 def cmd_train_eval(args) -> int:
     """Train using an embedding bundle + splits (auto-discovered from run-dir when provided), then run full-feed evaluation."""
-    # Lazy import training entrypoint (dynamic)
-    run_training_pipeline = _load_run_training_pipeline()
-
+    # Determine model type
+    model_type = getattr(args, 'model_type', 'mlp')
+    
     # Resolve run_dir (preferred) and auto-select bundle/splits if not explicitly provided
     run_dir: Optional[Path] = Path(args.run_dir).resolve() if args.run_dir else None
 
@@ -289,35 +300,68 @@ def cmd_train_eval(args) -> int:
         except Exception:
             run_dir = OUTPUTS_DIR
 
-    # Train
-    results = run_training_pipeline(
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        epochs=args.epochs,
-        patience=args.patience,
-        hidden_dims=args.hidden_dims,
-        dropout_rate=args.dropout_rate,
-        device=args.device,
-        random_seed=args.random_seed,
-        save_model=not args.no_save_model,
-        generate_plots=not args.no_plots,
-        embedding_bundle=str(bundle_path),
-        user_splits=str(splits_path),
-        # Schema is set internally by training (multi_centroid by default)
-        topic_model_path=args.topic_model_path,
-        topic_pca_path=args.topic_pca_path,
-        output_dir=run_dir,
-        disable_progress=getattr(args, 'disable_progress', False),
-        tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
-        tqdm_miniters=getattr(args, 'tqdm_miniters', None),
-    )
-
-    trained_model_path = results.get("model_path")
-    if trained_model_path:
-        print(f"\n✅ Training complete. Model: {trained_model_path}")
+    # Train based on model type
+    if model_type == 'two-tower':
+        print("🏗️  Using Two-Tower model architecture")
+        run_two_tower_pipeline = _load_run_two_tower_pipeline()
+        results = run_two_tower_pipeline(
+            embedding_bundle=str(bundle_path),
+            user_splits=str(splits_path),
+            shared_dim=getattr(args, 'shared_dim', 128),
+            user_hidden_dim=getattr(args, 'user_hidden_dim', 256),
+            post_hidden_dim=getattr(args, 'post_hidden_dim', 256),
+            num_attention_heads=getattr(args, 'num_attention_heads', 4),
+            num_attention_layers=getattr(args, 'num_attention_layers', 2),
+            max_history_len=getattr(args, 'max_history_len', 20),
+            dropout_rate=args.dropout_rate,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            epochs=args.epochs,
+            patience=args.patience,
+            device=args.device,
+            random_seed=args.random_seed,
+            output_dir=run_dir,
+            disable_progress=getattr(args, 'disable_progress', False),
+        )
     else:
-        print("\n✅ Training complete.")
+        print("🏗️  Using MLP model architecture")
+        run_training_pipeline = _load_run_training_pipeline()
+        results = run_training_pipeline(
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            epochs=args.epochs,
+            patience=args.patience,
+            hidden_dims=args.hidden_dims,
+            dropout_rate=args.dropout_rate,
+            device=args.device,
+            random_seed=args.random_seed,
+            save_model=not args.no_save_model,
+            generate_plots=not args.no_plots,
+            embedding_bundle=str(bundle_path),
+            user_splits=str(splits_path),
+            # Schema is set internally by training (multi_centroid by default)
+            topic_model_path=args.topic_model_path,
+            topic_pca_path=args.topic_pca_path,
+            output_dir=run_dir,
+            disable_progress=getattr(args, 'disable_progress', False),
+            tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
+            tqdm_miniters=getattr(args, 'tqdm_miniters', None),
+        )
+
+    # Report training results
+    if model_type == 'two-tower':
+        training_results = results.get("results", {})
+        print(f"\n✅ Two-Tower training complete.")
+        if 'model_path' in training_results:
+            print(f"   Model: {training_results['model_path']}")
+    else:
+        trained_model_path = results.get("model_path")
+        if trained_model_path:
+            print(f"\n✅ Training complete. Model: {trained_model_path}")
+        else:
+            print("\n✅ Training complete.")
 
     # Directly invoke stage 6 run (pairs mode)
     _stage_eval = _load_stage_evaluate()
@@ -438,7 +482,13 @@ def cmd__run_all_exec(args) -> int:
     elif relevel_method == 'uniform':
         relevel_key = 'relevel'
     
-    stage_order = ['get_data', 'featurize', relevel_key, 'split', 'train', 'evaluate']
+    # Override train stage key if --model-type is specified
+    model_type = getattr(args, 'model_type', 'mlp')
+    train_key = 'train'  # default MLP
+    if model_type == 'two-tower':
+        train_key = 'train_two_tower'
+    
+    stage_order = ['get_data', 'featurize', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
@@ -452,6 +502,11 @@ def cmd__run_all_exec(args) -> int:
         start_from = relevel_key
     if stop_after == 'relevel':
         stop_after = relevel_key
+    # Map 'train' to the actual train key (train or train_two_tower)
+    if start_from == 'train':
+        start_from = train_key
+    if stop_after == 'train':
+        stop_after = train_key
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
 
@@ -512,7 +567,8 @@ def cmd__run_all_exec(args) -> int:
             'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
             'relevel_simple': "Stage 3: Relevel (simple)…",
             'split': "Stage 4: Split users…",
-            'train': "Stage 5: Train model…",
+            'train': "Stage 5: Train model (MLP)…",
+            'train_two_tower': "Stage 5: Train model (Two-Tower)…",
             'evaluate': "Stage 6: Evaluate model…",
         }
         label = label_map.get(key, f"Stage {idx+1}: {key}…")
@@ -600,6 +656,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_te.add_argument("--run-dir", type=str, default=None, help="Run directory; auto-discovers bundle and splits when provided")
     p_te.add_argument("--embedding-bundle", type=str, default=None, help="Optional path to embedding_bundle_*.pkl (auto from --run-dir if omitted)")
     p_te.add_argument("--user-splits", type=str, default=None, help="Optional path to user_splits.json (auto from --run-dir if omitted)")
+    # Model type selection
+    p_te.add_argument("--model-type", type=str, choices=["mlp", "two-tower"], default="mlp",
+                      help="Model architecture: 'mlp' (default) or 'two-tower'")
+    # Two-tower specific options
+    p_te.add_argument("--shared-dim", type=int, default=128, help="Two-tower shared embedding dimension")
+    p_te.add_argument("--user-hidden-dim", type=int, default=256, help="Two-tower user encoder hidden dimension")
+    p_te.add_argument("--post-hidden-dim", type=int, default=256, help="Two-tower post encoder hidden dimension")
+    p_te.add_argument("--num-attention-heads", type=int, default=4, help="Two-tower attention heads")
+    p_te.add_argument("--num-attention-layers", type=int, default=2, help="Two-tower attention layers")
+    p_te.add_argument("--max-history-len", type=int, default=20, help="Two-tower max user history length")
     # Topic-model options are ignored by training (default multi_centroid); kept for eval compatibility if needed
     p_te.add_argument("--topic-model-path", type=str, default=None)
     p_te.add_argument("--topic-pca-path", type=str, default=None)
@@ -646,7 +712,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--val-ratio", type=float, default=0.2)
     p_all.add_argument("--holdout-ratio", type=float, default=0.2)
     p_all.add_argument("--random-seed", type=int, default=42)
-    # Stage 3 options (subset)
+    # Stage 5 (train) model selection
+    p_all.add_argument("--model-type", type=str, choices=["mlp", "two-tower"], default="mlp",
+                      help="Model architecture: 'mlp' (default MLP) or 'two-tower' (two-tower with attention)")
+    # Two-tower specific options
+    p_all.add_argument("--shared-dim", type=int, default=128, help="Two-tower shared embedding dimension")
+    p_all.add_argument("--user-hidden-dim", type=int, default=256, help="Two-tower user encoder hidden dimension")
+    p_all.add_argument("--post-hidden-dim", type=int, default=256, help="Two-tower post encoder hidden dimension")
+    p_all.add_argument("--num-attention-heads", type=int, default=4, help="Two-tower attention heads")
+    p_all.add_argument("--num-attention-layers", type=int, default=2, help="Two-tower attention layers")
+    p_all.add_argument("--max-history-len", type=int, default=20, help="Two-tower max user history length")
+    # Stage 5 options (shared)
     p_all.add_argument("--epochs", type=int, default=300)
     p_all.add_argument("--batch-size", type=int, default=256)
     p_all.add_argument("--learning-rate", type=float, default=0.001)
@@ -654,6 +730,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--hidden-dims", type=int, nargs="+", default=None)
     p_all.add_argument("--dropout-rate", type=float, default=0.5)
     p_all.add_argument("--device", type=str, default=DEFAULT_DEVICE)
+    p_all.add_argument("--patience", type=int, default=50, help="Early stopping patience")
     p_all.add_argument("--no-plots", action="store_true")
     p_all.add_argument("--no-save-model", action="store_true")
     # Stage 4 options (subset)
