@@ -953,3 +953,76 @@ def relevel_uniform_mixture(
         if len(final) >= int(min_users_per_topic) * int(global_topic_k):
             return final
     return kept
+
+
+# ----------------------------------------
+# Logging utilities
+# ----------------------------------------
+import logging
+from datetime import datetime
+
+# Global logger instances per stage (initialized on first use)
+_stage_loggers: Dict[str, logging.Logger] = {}
+
+
+def get_stage_logger(stage_name: str, log_file: Optional[Path] = None) -> logging.Logger:
+    """Get or create a logger for a specific stage with timestamped formatting.
+    
+    Args:
+        stage_name: Name of the stage (e.g., 'STAGE_01_GET_DATA')
+        log_file: Optional path to log file. If None, logs only to stdout.
+    
+    Returns:
+        Configured logger instance
+    """
+    if stage_name in _stage_loggers:
+        return _stage_loggers[stage_name]
+    
+    logger = logging.getLogger(f"pipeline.{stage_name}")
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Create formatter with timestamp
+    formatter = logging.Formatter(
+        '[%(asctime)s.%(msecs)03d] [%(name)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Console handler (stdout)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # Optional file handler
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    
+    # Prevent propagation to root logger
+    logger.propagate = False
+    
+    _stage_loggers[stage_name] = logger
+    return logger
+
+
+def log_operation_start(operation_name: str, stage_name: str, logger: Optional[logging.Logger] = None) -> logging.Logger:
+    """Log the start of a major operation with timestamp.
+    
+    Args:
+        operation_name: Name of the operation being started
+        stage_name: Name of the stage (e.g., 'STAGE_01_GET_DATA')
+        logger: Optional logger instance. If None, will get/create one for the stage.
+    
+    Returns:
+        Logger instance used
+    """
+    if logger is None:
+        logger = get_stage_logger(stage_name)
+    logger.info(f"Starting: {operation_name}")
+    return logger

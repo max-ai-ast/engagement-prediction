@@ -32,6 +32,8 @@ from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output
 from utils.helpers import (
     get_actual_feature_columns,
     create_pairs_dataset,
+    get_stage_logger,
+    log_operation_start,
 )
 
 
@@ -132,12 +134,17 @@ def run(context, args) -> Dict[str, Any]:
     out_dir.rename(mode_dir)
     out_dir = mode_dir
 
+    # Initialize logger
+    logger = get_stage_logger('STAGE_06_EVALUATE', log_file=out_dir / 'stage.log')
+
+    log_operation_start('Resolve assets (model, bundle, splits)', 'STAGE_06_EVALUATE', logger)
     model_path, bundle_path, splits_path = _resolve_assets(run_dir, context, args)
     device = str(getattr(args, 'device', 'cpu'))
     batch_size = int(getattr(args, 'batch_size', 8192))
     enforce_training_config = bool(getattr(args, 'enforce_training_config', True))
 
     # Load model & bundle
+    log_operation_start('Load model and bundle', 'STAGE_06_EVALUATE', logger)
     model, checkpoint = load_saved_model(model_path, device=device)
     bundle = load_embedding_bundle(bundle_path)
     posts_emb_df: pd.DataFrame = bundle['posts_emb_df']  # type: ignore[assignment]
@@ -183,6 +190,7 @@ def run(context, args) -> Dict[str, Any]:
     from utils.helpers import get_actual_feature_columns, create_pairs_dataset
 
     # Eligibility computation (joinable likes vs embedded posts)
+    log_operation_start('Compute eligible holdout users', 'STAGE_06_EVALUATE', logger)
     likes_hou = likes_df[likes_df['did'].isin(holdout_users)].copy()
     available_posts = set(posts_emb_df[join_post].astype(str).unique())
     likes_hou[join_like] = likes_hou[join_like].astype(str)
@@ -209,6 +217,7 @@ def run(context, args) -> Dict[str, Any]:
     likes_local = likes_local[likes_local[join_like].isin(available_posts)]
 
     # Allocate disjoint sets
+    log_operation_start('Allocate disjoint sets per user', 'STAGE_06_EVALUATE', logger)
     embedding_likes_list = []
     prediction_likes_list = []
     for user_id, g in likes_local.groupby('did'):
@@ -229,6 +238,7 @@ def run(context, args) -> Dict[str, Any]:
     prediction_likes_df = pd.concat(prediction_likes_list, ignore_index=True) if prediction_likes_list else pd.DataFrame()
 
     # Build user features matching checkpoint feature_columns layout
+    log_operation_start('Build user features', 'STAGE_06_EVALUATE', logger)
     user_emb_df = build_user_features_shared(
         schema='multi_centroid' if any(c.startswith('user_k') for c in feature_columns[0]) else ('topic_mixture' if any(c.startswith('user_topic_') for c in feature_columns[0]) else 'mean'),
         likes_df=embedding_likes_df if len(embedding_likes_df) else likes_local,
@@ -244,6 +254,7 @@ def run(context, args) -> Dict[str, Any]:
     # Create outputs depending on mode
     artifacts: Dict[str, Any] = {}
     t0 = time.time()
+    log_operation_start(f'Run inference (mode={mode})', 'STAGE_06_EVALUATE', logger)
     if mode == 'heterogeneity':
         # Prefer Stage 5 holdout predictions
         # Resolve 05_train (fallback 'train')
@@ -377,6 +388,7 @@ def run(context, args) -> Dict[str, Any]:
                           'heterogeneity_summary_json': str((out_dir / f"heterogeneity_summary_{timestamp}.json").resolve())})
 
     elif mode == 'matrix':
+        log_operation_start('Compute user×post probability matrix', 'STAGE_06_EVALUATE', logger)
         prob_matrix, user_ids, post_ids = predict_user_post_matrix(
             model,
             user_emb_df,
@@ -396,6 +408,7 @@ def run(context, args) -> Dict[str, Any]:
         )
         artifacts['prob_matrix_path'] = str(prob_path)
     elif mode == 'global_unliked':
+        log_operation_start('Filter posts to unliked and compute probability matrix', 'STAGE_06_EVALUATE', logger)
         # Filter posts to those unliked by anyone
         all_liked_posts = set(likes_df[join_like].astype(str).unique())
         posts_emb_df = posts_emb_df.copy()
@@ -422,6 +435,7 @@ def run(context, args) -> Dict[str, Any]:
         artifacts['global_prob_matrix_path'] = str(prob_path)
     else:
         # pairs
+        log_operation_start('Create prediction pairs and run inference', 'STAGE_06_EVALUATE', logger)
         text_emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_')]
         image_emb_cols = [c for c in posts_emb_df.columns if c.startswith('image_emb_')]
         post_emb_cols = text_emb_cols + image_emb_cols
@@ -492,6 +506,7 @@ def run(context, args) -> Dict[str, Any]:
         artifacts['pairs_eval_npz'] = str(pairs_npz_path)
 
     # Summary
+    log_operation_start('Compute metrics and save outputs', 'STAGE_06_EVALUATE', logger)
     summary = {
         'timestamp': timestamp,
         'mode': mode,

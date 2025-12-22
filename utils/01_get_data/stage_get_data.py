@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 from utils.pipeline.core import new_stage_timestamp_dir
-from utils.helpers import load_most_recent_raw_data
+from utils.helpers import load_most_recent_raw_data, get_stage_logger, log_operation_start
 import time
 
 
@@ -23,11 +23,17 @@ def run(context, args) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '01_get_data')
 
+    # Initialize logger
+    logger = get_stage_logger('STAGE_01_GET_DATA', log_file=out_dir / 'stage.log')
+
     max_files = int(getattr(args, 'max_files_per_table', 5))
     t0 = time.time()
+    
+    log_operation_start('Load data from DigitalOcean Spaces', 'STAGE_01_GET_DATA', logger)
     posts_df, likes_df, metadata_df = load_most_recent_raw_data(max_files)
 
     # Save compact pickle
+    log_operation_start('Save raw data bundle', 'STAGE_01_GET_DATA', logger)
     import pickle
     ts_name = out_dir.name
     raw_path = out_dir / f"raw_data_{ts_name}.pkl"
@@ -35,6 +41,7 @@ def run(context, args) -> Dict[str, Any]:
         pickle.dump({'posts_df': posts_df, 'likes_df': likes_df, 'metadata_df': metadata_df}, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # Summary
+    log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
     summary = {
         'max_files_per_table': max_files,
         'counts': {

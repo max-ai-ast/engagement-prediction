@@ -21,6 +21,7 @@ from typing import Dict, Any, List
 import pandas as pd
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output
+from utils.helpers import get_stage_logger, log_operation_start
 import time
 
 
@@ -28,7 +29,11 @@ def run(context, args) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '04_split')
 
+    # Initialize logger
+    logger = get_stage_logger('STAGE_04_SPLIT', log_file=out_dir / 'stage.log')
+
     # Locate embedding bundle
+    log_operation_start('Locate embedding bundle from prior stage', 'STAGE_04_SPLIT', logger)
     prior_featurize = select_prior_output(run_dir, '02_featurize', use_latest=context.use_latest, prior_path=context.prior_outputs.get('02_featurize'))
     if prior_featurize is None:
         raise FileNotFoundError("Featurize output not found.")
@@ -38,6 +43,7 @@ def run(context, args) -> Dict[str, Any]:
     bundle_path = bundle_candidates[0]
 
     # Load bundle
+    log_operation_start('Load embedding bundle', 'STAGE_04_SPLIT', logger)
     import pickle
     with open(bundle_path, 'rb') as f:
         bundle = pickle.load(f)
@@ -54,10 +60,13 @@ def run(context, args) -> Dict[str, Any]:
     likes_df_local[join_like] = likes_df_local[join_like].astype(str)
     likes_joinable = likes_df_local[likes_df_local[join_like].isin(available_posts)]
     min_likes_per_user = int(getattr(args, 'min_likes_per_user', 4))
+    
+    log_operation_start(f'Compute eligible users (min_likes_per_user={min_likes_per_user})', 'STAGE_04_SPLIT', logger)
     counts = likes_joinable.groupby('did', observed=True)[join_like].nunique().astype(int)
     eligible_users = counts[counts >= min_likes_per_user].index.astype(str).tolist()
 
     # Apply retained_users if present (from relevel stage)
+    log_operation_start('Apply retained users filter (if available)', 'STAGE_04_SPLIT', logger)
     prior_relevel = select_prior_output(run_dir, '03_relevel', use_latest=context.use_latest, prior_path=context.prior_outputs.get('03_relevel'))
     if prior_relevel is not None:
         retained = prior_relevel / 'retained_users.json'
@@ -74,6 +83,7 @@ def run(context, args) -> Dict[str, Any]:
 
     # Split
     t0 = time.time()
+    log_operation_start('Split users into train/val/holdout', 'STAGE_04_SPLIT', logger)
     import numpy as np
     rng = np.random.RandomState(int(getattr(args, 'random_seed', 42)))
     users_shuffled = eligible_users.copy()
@@ -88,6 +98,7 @@ def run(context, args) -> Dict[str, Any]:
     val_users = remaining[:n_val]
     train_users = remaining[n_val:]
 
+    log_operation_start('Save user splits', 'STAGE_04_SPLIT', logger)
     splits = {
         'train_users': train_users,
         'val_users': val_users,

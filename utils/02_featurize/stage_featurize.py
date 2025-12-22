@@ -26,6 +26,8 @@ from utils.helpers import (
     save_bundle,
     find_text_column,
     find_join_key,
+    get_stage_logger,
+    log_operation_start,
 )
 import time
 
@@ -44,12 +46,17 @@ def run(context, args) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '02_featurize')
 
+    # Initialize logger
+    logger = get_stage_logger('STAGE_02_FEATURIZE', log_file=out_dir / 'stage.log')
+
     # Try to use prior get_data output when available
     prior_get = select_prior_output(run_dir, '01_get_data', use_latest=context.use_latest, prior_path=context.prior_outputs.get('01_get_data'))
 
     if prior_get is not None:
+        log_operation_start('Load raw data from prior stage', 'STAGE_02_FEATURIZE', logger)
         posts_df, likes_df, metadata_df = _load_raw_from_prior(prior_get)
     else:
+        log_operation_start('Load raw data from DigitalOcean Spaces', 'STAGE_02_FEATURIZE', logger)
         max_files = int(getattr(args, 'max_files_per_table', 5))
         posts_df, likes_df, metadata_df = load_most_recent_raw_data(max_files)
 
@@ -65,6 +72,7 @@ def run(context, args) -> Dict[str, Any]:
 
     # Candidate posts
     t0 = time.time()
+    log_operation_start('Build candidate posts', 'STAGE_02_FEATURIZE', logger)
     candidate_posts = build_candidate_posts(
         posts_df, likes_df, join_like, join_post, author_col,
         max_posts_per_author=max_posts_per_author,
@@ -73,6 +81,7 @@ def run(context, args) -> Dict[str, Any]:
     )
 
     # Persist liked-posts texts (by join keys)
+    log_operation_start('Write liked posts texts', 'STAGE_02_FEATURIZE', logger)
     try:
         text_col_raw = find_text_column(posts_df)
     except Exception:
@@ -99,9 +108,13 @@ def run(context, args) -> Dict[str, Any]:
     liked_texts_df.rename(columns={join_post: 'post_id'}).to_parquet(liked_texts_by_user_path, index=False)
 
     # Compute embeddings
+    log_operation_start('Compute text embeddings', 'STAGE_02_FEATURIZE', logger)
+    if image_mode != 'off':
+        logger.info(f"Image mode: {image_mode} - will compute image embeddings")
     posts_emb_df, embedding_dim = compute_post_feature_frame(candidate_posts, image_mode=image_mode)
     text_col = find_text_column(posts_emb_df)
 
+    log_operation_start('Save embedding bundle', 'STAGE_02_FEATURIZE', logger)
     bundle_path = save_bundle(
         out_dir=out_dir,
         posts_emb_df=posts_emb_df,

@@ -23,6 +23,8 @@ from utils.helpers import (
     get_actual_feature_columns,
     plot_model_performance,
     create_pairs_dataset,
+    get_stage_logger,
+    log_operation_start,
 )
 import json
 import numpy as np
@@ -337,9 +339,14 @@ def run_training_pipeline(
     plots_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize logger
+    logger = get_stage_logger('STAGE_05_TRAIN', log_file=base_dir / 'stage.log')
+
     # Load bundle + splits (preferred path)
     if not (embedding_bundle and user_splits):
         raise RuntimeError("run_training_pipeline requires embedding_bundle and user_splits in stage context")
+    
+    log_operation_start('Load embedding bundle and user splits', 'STAGE_05_TRAIN', logger)
     import pickle, json as _json
     with open(embedding_bundle, 'rb') as f:
         bundle = pickle.load(f)
@@ -359,6 +366,7 @@ def run_training_pipeline(
     likes_local = likes_local[likes_local[join_like].isin(available_posts)]
 
     # Allocate per-user embedding vs prediction posts
+    log_operation_start('Allocate per-user embedding vs prediction posts', 'STAGE_05_TRAIN', logger)
     embedding_likes_list: List[pd.DataFrame] = []
     prediction_likes_list: List[pd.DataFrame] = []
     for user_id, g in likes_local.groupby('did'):
@@ -378,6 +386,7 @@ def run_training_pipeline(
 
     # Build user features (multi_centroid by default)
     effective_schema = 'multi_centroid' if schema in ('auto', 'topic_mixture', 'multi_centroid') else 'mean'
+    log_operation_start(f'Build user features (schema={effective_schema})', 'STAGE_05_TRAIN', logger)
     user_emb_df = build_user_feature_frame(
         schema=effective_schema,
         likes_df=embedding_likes_df,
@@ -396,6 +405,7 @@ def run_training_pipeline(
     )
 
     # Create prediction pairs
+    log_operation_start('Create prediction pairs', 'STAGE_05_TRAIN', logger)
     if negatives_liked_only:
         text_emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_')]
         image_emb_cols = [c for c in posts_emb_df.columns if c.startswith('image_emb_')]
@@ -431,14 +441,20 @@ def run_training_pipeline(
     feature_cols = user_cols + post_cols
     train_df = prediction_pairs_df[prediction_pairs_df['did'].isin(train_users)].copy()
     val_df = prediction_pairs_df[prediction_pairs_df['did'].isin(val_users)].copy()
+    
+    log_operation_start('Enforce 50/50 class balance', 'STAGE_05_TRAIN', logger)
     train_df = _enforce_strict_5050_balance(train_df, label_col='liked', random_seed=random_seed, context='Train')
     val_df = _enforce_strict_5050_balance(val_df, label_col='liked', random_seed=random_seed + 1, context='Val')
+    
     # Datasets
+    log_operation_start('Create datasets and data loaders', 'STAGE_05_TRAIN', logger)
     train_dataset = EngagementDataset(train_df[feature_cols].values, train_df['liked'].values, train_df['did'].tolist(), train_df[join_post].tolist())
     val_dataset = EngagementDataset(val_df[feature_cols].values, val_df['liked'].values, val_df['did'].tolist(), val_df[join_post].tolist())
     input_dim = train_dataset.features.shape[1]
     model = create_model(input_dim, hidden_dims, dropout_rate)
     train_loader, val_loader, _ = create_data_loaders(train_dataset, val_dataset, None, batch_size)
+    
+    log_operation_start(f'Training model (epochs={epochs}, batch_size={batch_size})', 'STAGE_05_TRAIN', logger)
     print("\n🏋️  Training model...")
     training_results = train_model(
         model=model,
@@ -460,6 +476,7 @@ def run_training_pipeline(
     evaluation_metrics = {'note': 'Holdout evaluation happens in Stage 6'}
     # Plots
     if generate_plots:
+        log_operation_start('Generate plots', 'STAGE_05_TRAIN', logger)
         from utils.helpers import plot_training_history, plot_model_performance
         hist = training_results['history']
         try:
@@ -496,6 +513,7 @@ def run_training_pipeline(
     # Save model
     model_path = None
     if save_model:
+        log_operation_start('Save model checkpoint', 'STAGE_05_TRAIN', logger)
         model_path = checkpoints_dir / f"engagement_model_{timestamp}.pth"
         # Sanitize training_results to avoid pickling the model object
         tr_sanitized = {k: v for k, v in training_results.items() if k != 'model'}
