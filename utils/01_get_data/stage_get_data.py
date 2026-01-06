@@ -18,6 +18,7 @@ from utils.pipeline.core import new_stage_timestamp_dir
 from utils.helpers import load_most_recent_raw_data_digital_ocean, get_stage_logger, log_operation_start, load_raw_data_ingex
 import time
 
+DEFAULT_GCS_BUCKET = 'greenearth-471522-ingex-extract-stage'
 
 def run(context, args) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
@@ -29,20 +30,21 @@ def run(context, args) -> Dict[str, Any]:
     # Parameters
     data_source = getattr(args, 'data_source', 'greenearth')
 
-    # Optional time range filters (not used for DigitalOcean)
+    # Inputs for GreenEarth Ingex version
+    gcs_bucket = getattr(args, 'gcs_bucket', DEFAULT_GCS_BUCKET)
     posts_start = getattr(args, 'posts_start', None)
     posts_end = getattr(args, 'posts_end', None)
     likes_start = getattr(args, 'likes_start', None)
     likes_end = getattr(args, 'likes_end', None)
     
+    # Inputs for DigitalOcean version
     max_files = int(getattr(args, 'max_files_per_table', 5))
     
     t0 = time.time()
     
     if data_source == 'greenearth':
         log_operation_start('Load data from GreenEarth Ingex', 'STAGE_01_GET_DATA', logger)
-        print("Loading data from Ingex...")
-        posts_df, likes_df = load_raw_data_ingex(posts_start, posts_end, likes_start, likes_end)
+        posts_df, likes_df = load_raw_data_ingex(gcs_bucket, posts_start, posts_end, likes_start, likes_end)
         metadata_df = None
     elif data_source == 'digitalocean': 
         log_operation_start('Load data from DigitalOcean Spaces', 'STAGE_01_GET_DATA', logger)

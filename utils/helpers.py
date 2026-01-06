@@ -91,9 +91,31 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 
 # ----------------------------------------
-# Data IO helpers (Spaces/S3 + parquet)
+# Datetime helpers
 # ----------------------------------------
-def list_recent_objects(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
+KNOWN_TS_FORMATS = [
+    "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+0000
+    "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+00:00
+    "%Y-%m-%dT%H:%M:%S",       # 2024-02-10T13:45:00
+    "%Y-%m-%d",                # 2024-02-10
+]
+
+def parse_one_ts(raw_ts: str) -> datetime:
+    for fmt in KNOWN_TS_FORMATS:
+        try:
+            dt = datetime.strptime(raw_ts, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
+
+
+# ----------------------------------------
+# Data IO helpers (Digital Ocean Spaces/S3 + parquet)
+# ----------------------------------------
+def list_recent_objects_digital_ocean(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
     """List S3 object keys from the last `days` days within `prefix`."""
     if boto3 is None:
         return [], []
@@ -123,7 +145,7 @@ def list_recent_objects(bucket: str, prefix: str, days: int) -> Tuple[List[str],
     return keys, file_info
 
 
-def list_all_objects(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
+def list_all_objects_digital_ocean(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
     """List all S3 object keys for a prefix (no time filter)."""
     if boto3 is None:
         return [], []
@@ -149,7 +171,7 @@ def list_all_objects(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
     return keys, file_info
 
 
-def download_parquet_files(keys: List[str], bucket: str, dest_dir: Path) -> List[Path]:
+def download_parquet_files_digital_ocean(keys: List[str], bucket: str, dest_dir: Path) -> List[Path]:
     """Download parquet files from Spaces/S3 to dest_dir; skip existing."""
     if boto3 is None:
         return []
@@ -170,7 +192,7 @@ def download_parquet_files(keys: List[str], bucket: str, dest_dir: Path) -> List
     return downloaded
 
 
-def load_and_combine_data(datasets: Dict[str, List[Path]], drop_unliked_posts: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_and_combine_data_digital_ocean(datasets: Dict[str, List[Path]], drop_unliked_posts: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load parquet dataframes for posts/likes/(optional images metadata) and optionally drop unliked posts."""
     posts_dfs: List[pd.DataFrame] = []
     likes_dfs: List[pd.DataFrame] = []
@@ -707,8 +729,10 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
 
 
 __all__ = [
-    # Data IO
-    'list_recent_objects', 'list_all_objects', 'download_parquet_files', 'load_and_combine_data', 'load_most_recent_raw_data',
+    # Datetime
+    'parse_one_ts',
+    # Data IO Digital Ocean
+    'list_recent_objects_digital_ocean', 'list_all_objects_digital_ocean', 'download_parquet_files_digital_ocean', 'load_and_combine_data_digital_ocean', 'load_most_recent_raw_data_digital_ocean',
     # Detection
     'find_join_key', 'find_text_column',
     # Embeddings
@@ -735,8 +759,8 @@ def load_most_recent_raw_data_digital_ocean(max_files_per_table: int = 5) -> Tup
     Selects the most recently modified up to `max_files_per_table` files for each table.
     """
     # Discover latest keys
-    posts_keys, posts_info = list_all_objects(SPACES_BUCKET, "bsky_firehose_posts_tmp")
-    likes_keys, likes_info = list_all_objects(SPACES_BUCKET, "bsky_firehose_likes_light_tmp")
+    posts_keys, posts_info = list_all_objects_digital_ocean(SPACES_BUCKET, "bsky_firehose_posts_tmp")
+    likes_keys, likes_info = list_all_objects_digital_ocean(SPACES_BUCKET, "bsky_firehose_likes_light_tmp")
     # Sort by LastModified desc using info arrays
     def _top_n(keys: List[str], info: List[dict], n: int) -> List[str]:
         if not keys or not info:
@@ -751,9 +775,9 @@ def load_most_recent_raw_data_digital_ocean(max_files_per_table: int = 5) -> Tup
     # Download and load
     with tempfile.TemporaryDirectory() as tmpd:
         tmp = Path(tmpd)
-        posts_files = download_parquet_files(posts_sel, SPACES_BUCKET, tmp / "posts") if posts_sel else []
-        likes_files = download_parquet_files(likes_sel, SPACES_BUCKET, tmp / "likes") if likes_sel else []
-        posts_df, likes_df, metadata_df = load_and_combine_data({
+        posts_files = download_parquet_files_digital_ocean(posts_sel, SPACES_BUCKET, tmp / "posts") if posts_sel else []
+        likes_files = download_parquet_files_digital_ocean(likes_sel, SPACES_BUCKET, tmp / "likes") if likes_sel else []
+        posts_df, likes_df, metadata_df = load_and_combine_data_digital_ocean({
             "posts": posts_files,
             "likes": likes_files,
             # images omitted in Stage 1 bundle; keep empty
