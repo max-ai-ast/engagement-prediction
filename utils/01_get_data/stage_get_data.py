@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 from utils.pipeline.core import new_stage_timestamp_dir
-from utils.helpers import load_most_recent_raw_data, get_stage_logger, log_operation_start
+from utils.helpers import load_most_recent_raw_data_digital_ocean, get_stage_logger, log_operation_start, load_raw_data_ingex
 import time
 
 
@@ -26,12 +26,30 @@ def run(context, args) -> Dict[str, Any]:
     # Initialize logger
     logger = get_stage_logger('STAGE_01_GET_DATA', log_file=out_dir / 'stage.log')
 
+    # Parameters
+    data_source = getattr(args, 'data_source', 'greenearth')
+
+    # Optional time range filters (not used for DigitalOcean)
+    posts_start = getattr(args, 'posts_start', None)
+    posts_end = getattr(args, 'posts_end', None)
+    likes_start = getattr(args, 'likes_start', None)
+    likes_end = getattr(args, 'likes_end', None)
+    
     max_files = int(getattr(args, 'max_files_per_table', 5))
+    
     t0 = time.time()
     
-    log_operation_start('Load data from DigitalOcean Spaces', 'STAGE_01_GET_DATA', logger)
-    posts_df, likes_df, metadata_df = load_most_recent_raw_data(max_files)
-
+    if data_source == 'greenearth':
+        log_operation_start('Load data from GreenEarth Ingex', 'STAGE_01_GET_DATA', logger)
+        print("Loading data from Ingex...")
+        posts_df, likes_df = load_raw_data_ingex(posts_start, posts_end, likes_start, likes_end)
+        metadata_df = None
+    elif data_source == 'digitalocean': 
+        log_operation_start('Load data from DigitalOcean Spaces', 'STAGE_01_GET_DATA', logger)
+        posts_df, likes_df, metadata_df = load_most_recent_raw_data_digital_ocean(max_files)
+    else:
+        raise ValueError(f"Unknown data_source: {data_source}")
+    
     # Save compact pickle
     log_operation_start('Save raw data bundle', 'STAGE_01_GET_DATA', logger)
     import pickle
@@ -43,6 +61,11 @@ def run(context, args) -> Dict[str, Any]:
     # Summary
     log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
     summary = {
+        'data_source': data_source,
+        'posts_start': posts_start,
+        'posts_end': posts_end,
+        'likes_start': likes_start,
+        'likes_end': likes_end,
         'max_files_per_table': max_files,
         'counts': {
             'posts': int(len(posts_df)),

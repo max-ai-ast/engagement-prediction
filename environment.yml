@@ -14,6 +14,7 @@ dependencies:
   - boto3
   - pyarrow
   - pip
+  - google-cloud-storage
   - pip:
     - torch
     - torchvision

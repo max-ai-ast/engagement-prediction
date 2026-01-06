@@ -729,7 +729,7 @@ __all__ = [
 # ----------------------------------------
 # Stage 1 convenience: load most recent small raw bundle
 # ----------------------------------------
-def load_most_recent_raw_data(max_files_per_table: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_most_recent_raw_data_digital_ocean(max_files_per_table: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Download and load a compact slice of recent posts/likes (and optional images) from Spaces.
 
     Selects the most recently modified up to `max_files_per_table` files for each table.

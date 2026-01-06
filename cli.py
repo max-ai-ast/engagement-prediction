@@ -693,6 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     # run-all (modular 6-stage end-to-end)
     p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
+    p_all.add_argument("--data-source", type=str, choices=["greenearth", "digitalocean"], default="greenearth")
     p_all.add_argument("--max-files-per-table", type=int, default=5)
     p_all.add_argument("--image-mode", type=str, choices=["auto", "off", "on"], default="auto")
     p_all.add_argument("--max-posts-per-author", type=int, default=3)
