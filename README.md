@@ -10,7 +10,7 @@ New design goals:
 
 ### Repository layout (stages under `utils/`)
 
-- `utils/01_get_data/stage_get_data.py`: Stage 1 — Load most recent parquet dumps from Spaces and save a compact raw bundle.
+- `utils/01_get_data/stage_get_data.py`: Stage 1 — Load most recent parquet dumps from Green Earth Ingex or Spaces and save a compact raw bundle.
 - `utils/02_featurize/stage_featurize.py`: Stage 2 — Build candidate post set and compute text+image embeddings → save `embedding_bundle_*.pkl`.
 - `utils/03_relevel/stage_relevel_uniform.py`: Stage 3 — Discover topics and compute per-user mixtures; optional uniform-mixture-balanced relevel selection.
 - `utils/04_split/stage_split_users.py`: Stage 4 — Produce `user_splits.json` (train/val/holdout).
@@ -47,10 +47,16 @@ A retrieval-optimized architecture with separate user and post encoders:
 
 Below, replace paths with your actual workspace if different.
 
-1) Stage 1 — Get data (creates a run dir)
+1) Stage 1 — Get data (creates a run dir)  
+The default behavior is to use data from [Green Earth ingex](https://github.com/greenearth-social/ingex) with date filters. For example:
 ```bash
 python cli.py run-all --foreground --use-latest \
-  --max-files-per-table 5 --max-posts-per-author 3 --image-mode auto
+  --posts-start 2026-01-04 --posts-end 2026-01-04T06:00:00 --likes-start 2026-01-04 --likes-end 2026-01-04T06:00:00
+```
+Note that there is a default GCS Bucket but it can also be overridden using `--gcs-bucket`. To use Digital Ocean Spaces data instead, specify the data source, e.g.:
+```bash
+python cli.py run-all --foreground --use-latest \
+  --data-source digitalocean --max-files-per-table 5 --max-posts-per-author 3 --image-mode auto
 ```
 Creates a run directory like `outputs/<timestamp>_run_d<files>_mppa<cap>/` and, at Stage 2, saves `featurize/embedding_bundle_<timestamp>.pkl` with:
 - `posts_emb_df` (post_emb_* and image_emb_* columns)

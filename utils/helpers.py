@@ -25,6 +25,9 @@ from functools import partial
 import warnings
 from io import BytesIO
 import multiprocessing as mp
+from google.cloud import storage
+import re
+import polars as pl
 
 import numpy as np
 import pandas as pd
@@ -91,9 +94,109 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 
 # ----------------------------------------
-# Data IO helpers (Spaces/S3 + parquet)
+# Datetime helpers
 # ----------------------------------------
-def list_recent_objects(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
+# For parsing GCS Ingex filenames
+TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
+
+# For parsing CLI arg strings
+KNOWN_TS_FORMATS = [
+    "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+0000
+    "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+00:00
+    "%Y-%m-%dT%H:%M:%S",       # 2024-02-10T13:45:00
+    "%Y-%m-%d",                # 2024-02-10
+]
+
+def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
+    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
+    if raw_ts is None:
+        return None
+    for fmt in KNOWN_TS_FORMATS:
+        try:
+            dt = datetime.strptime(raw_ts, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
+
+
+# ----------------------------------------
+# Data IO helpers (Green Earth Ingex + GCS)
+# ----------------------------------------
+def parse_ts_from_name_ingex_gcs(
+        blob_name: str, 
+        blob_prefix: str
+    ) -> Optional[datetime]:
+    """Parse timestamp from GCS blob name based on Ingex naming convention."""
+    pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
+    m = pattern.match(blob_name)
+    if not m:
+        return None
+    ymd, hms = m.group(1), m.group(2)
+    return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+
+def list_files_in_range_ingex_gcs(
+        gcs_bucket: str, 
+        blob_prefix: str, 
+        start: Optional[datetime], 
+        end: Optional[datetime],
+        ) -> list[str]:
+    """List GCS blob URIs within specified time range based on Ingex naming convention."""
+    client = storage.Client()
+    blobs = client.list_blobs(gcs_bucket)
+    out = []
+    for b in blobs:
+        ts = parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
+        if ts is None:
+            continue
+        if start is not None and ts < start:
+            continue
+        if end is not None and ts >= end:
+            continue
+        out.append(f"gs://{gcs_bucket}/{b.name}")
+    return out
+
+def load_raw_data_ingex(
+        gcs_bucket: str, 
+        blob_prefix: str,
+        start_str: Optional[str], 
+        end_str: Optional[str], 
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load raw data from GreenEarth Ingex on GCS within specified time ranges."""
+    
+    start_dt: Optional[datetime] = parse_one_ts(start_str)
+    end_dt: Optional[datetime] = parse_one_ts(end_str)
+    
+    paths = list_files_in_range_ingex_gcs(
+        gcs_bucket = gcs_bucket,
+        blob_prefix = blob_prefix,
+        start = start_dt,
+        end = end_dt,
+    )
+
+    # LazyFrame (from polars)
+    lf = (
+        pl
+        .scan_parquet(paths)
+        .with_columns(
+            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+        )
+    )
+    if start_dt is not None:
+        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+    if end_dt is not None:
+        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+    pandas_df = lf.collect().to_pandas()
+
+    return pandas_df
+
+
+# ----------------------------------------
+# Data IO helpers (Digital Ocean Spaces/S3 + parquet)
+# ----------------------------------------
+def list_recent_objects_digital_ocean(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
     """List S3 object keys from the last `days` days within `prefix`."""
     if boto3 is None:
         return [], []
@@ -123,7 +226,7 @@ def list_recent_objects(bucket: str, prefix: str, days: int) -> Tuple[List[str],
     return keys, file_info
 
 
-def list_all_objects(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
+def list_all_objects_digital_ocean(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
     """List all S3 object keys for a prefix (no time filter)."""
     if boto3 is None:
         return [], []
@@ -149,7 +252,7 @@ def list_all_objects(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
     return keys, file_info
 
 
-def download_parquet_files(keys: List[str], bucket: str, dest_dir: Path) -> List[Path]:
+def download_parquet_files_digital_ocean(keys: List[str], bucket: str, dest_dir: Path) -> List[Path]:
     """Download parquet files from Spaces/S3 to dest_dir; skip existing."""
     if boto3 is None:
         return []
@@ -170,7 +273,7 @@ def download_parquet_files(keys: List[str], bucket: str, dest_dir: Path) -> List
     return downloaded
 
 
-def load_and_combine_data(datasets: Dict[str, List[Path]], drop_unliked_posts: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_and_combine_data_digital_ocean(datasets: Dict[str, List[Path]], drop_unliked_posts: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load parquet dataframes for posts/likes/(optional images metadata) and optionally drop unliked posts."""
     posts_dfs: List[pd.DataFrame] = []
     likes_dfs: List[pd.DataFrame] = []
@@ -203,6 +306,8 @@ def find_join_key(posts_df: pd.DataFrame, likes_df: pd.DataFrame) -> Tuple[str, 
     """Find joins between posts and likes with common cases and overlap fallback."""
     if "subject_cid" in likes_df.columns and "commit_cid" in posts_df.columns:
         return "subject_cid", "commit_cid"
+    if "subject_uri" in likes_df.columns and "at_uri" in posts_df.columns:
+        return "subject_uri", "at_uri"
     common = set(posts_df.columns) & set(likes_df.columns)
     if not common:
         raise ValueError("No common column names between likes and posts tables")
@@ -214,6 +319,8 @@ def find_join_key(posts_df: pd.DataFrame, likes_df: pd.DataFrame) -> Tuple[str, 
 
 def find_text_column(posts_df: pd.DataFrame) -> str:
     """Heuristic to find the text column."""
+    if "record_text" in posts_df.columns:
+        return "record_text"
     text_cols = [c for c in posts_df.columns if "text" in c.lower()]
     if not text_cols:
         raise ValueError("No text column found in posts table for embedding")
@@ -707,8 +814,12 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
 
 
 __all__ = [
-    # Data IO
-    'list_recent_objects', 'list_all_objects', 'download_parquet_files', 'load_and_combine_data', 'load_most_recent_raw_data',
+    # Datetime
+    'parse_one_ts',
+    # Data IO Green Earth Ingex GCS
+    'load_raw_data_ingex',
+    # Data IO Digital Ocean
+    'list_recent_objects_digital_ocean', 'list_all_objects_digital_ocean', 'download_parquet_files_digital_ocean', 'load_and_combine_data_digital_ocean', 'load_most_recent_raw_data_digital_ocean',
     # Detection
     'find_join_key', 'find_text_column',
     # Embeddings
@@ -729,14 +840,14 @@ __all__ = [
 # ----------------------------------------
 # Stage 1 convenience: load most recent small raw bundle
 # ----------------------------------------
-def load_most_recent_raw_data(max_files_per_table: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_most_recent_raw_data_digital_ocean(max_files_per_table: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Download and load a compact slice of recent posts/likes (and optional images) from Spaces.
 
     Selects the most recently modified up to `max_files_per_table` files for each table.
     """
     # Discover latest keys
-    posts_keys, posts_info = list_all_objects(SPACES_BUCKET, "bsky_firehose_posts_tmp")
-    likes_keys, likes_info = list_all_objects(SPACES_BUCKET, "bsky_firehose_likes_light_tmp")
+    posts_keys, posts_info = list_all_objects_digital_ocean(SPACES_BUCKET, "bsky_firehose_posts_tmp")
+    likes_keys, likes_info = list_all_objects_digital_ocean(SPACES_BUCKET, "bsky_firehose_likes_light_tmp")
     # Sort by LastModified desc using info arrays
     def _top_n(keys: List[str], info: List[dict], n: int) -> List[str]:
         if not keys or not info:
@@ -751,9 +862,9 @@ def load_most_recent_raw_data(max_files_per_table: int = 5) -> Tuple[pd.DataFram
     # Download and load
     with tempfile.TemporaryDirectory() as tmpd:
         tmp = Path(tmpd)
-        posts_files = download_parquet_files(posts_sel, SPACES_BUCKET, tmp / "posts") if posts_sel else []
-        likes_files = download_parquet_files(likes_sel, SPACES_BUCKET, tmp / "likes") if likes_sel else []
-        posts_df, likes_df, metadata_df = load_and_combine_data({
+        posts_files = download_parquet_files_digital_ocean(posts_sel, SPACES_BUCKET, tmp / "posts") if posts_sel else []
+        likes_files = download_parquet_files_digital_ocean(likes_sel, SPACES_BUCKET, tmp / "likes") if likes_sel else []
+        posts_df, likes_df, metadata_df = load_and_combine_data_digital_ocean({
             "posts": posts_files,
             "likes": likes_files,
             # images omitted in Stage 1 bundle; keep empty

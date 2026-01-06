@@ -46,6 +46,9 @@ DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_EPOCHS = 300
 DEFAULT_PATIENCE = 10
 DEFAULT_DEVICE = "cuda" if False else "cpu"  # will be overridden by training module at runtime
+
+DEFAULT_GCS_BUCKET = 'greenearth-471522-ingex-extract-stage'
+
 def _load_run_training_pipeline():
     """Dynamically load run_training_pipeline from utils/05_train/stage_train.py (numeric folder)."""
     stage_path = Path(__file__).parent / "utils" / "05_train" / "stage_train.py"
@@ -693,6 +696,12 @@ def build_parser() -> argparse.ArgumentParser:
     # run-all (modular 6-stage end-to-end)
     p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
+    p_all.add_argument("--data-source", type=str, choices=["greenearth", "digitalocean"], default="greenearth")
+    p_all.add_argument("--gcs-bucket", type=str, default=DEFAULT_GCS_BUCKET, help="GCS bucket name for ingex data")
+    p_all.add_argument("--posts-start", type=str, default=None, help="ISO date string for ingex GCS posts start (inclusive)")
+    p_all.add_argument("--posts-end", type=str, default=None, help="ISO date string for ingex GCS posts end (exclusive)")
+    p_all.add_argument("--likes-start", type=str, default=None, help="ISO date string for ingex GCS likes start (inclusive)")
+    p_all.add_argument("--likes-end", type=str, default=None, help="ISO date string for ingex GCS likes end (exclusive)")
     p_all.add_argument("--max-files-per-table", type=int, default=5)
     p_all.add_argument("--image-mode", type=str, choices=["auto", "off", "on"], default="auto")
     p_all.add_argument("--max-posts-per-author", type=int, default=3)
