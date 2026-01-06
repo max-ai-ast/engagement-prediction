@@ -812,6 +812,8 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
 __all__ = [
     # Datetime
     'parse_one_ts',
+    # Data IO Green Earth Ingex GCS
+    'load_raw_data_ingex',
     # Data IO Digital Ocean
     'list_recent_objects_digital_ocean', 'list_all_objects_digital_ocean', 'download_parquet_files_digital_ocean', 'load_and_combine_data_digital_ocean', 'load_most_recent_raw_data_digital_ocean',
     # Detection

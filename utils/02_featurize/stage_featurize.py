@@ -20,7 +20,7 @@ import pickle
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output
 from utils.helpers import (
-    load_most_recent_raw_data,
+    load_most_recent_raw_data_digital_ocean,
     build_candidate_posts,
     compute_post_feature_frame,
     save_bundle,
@@ -58,7 +58,7 @@ def run(context, args) -> Dict[str, Any]:
     else:
         log_operation_start('Load raw data from DigitalOcean Spaces', 'STAGE_02_FEATURIZE', logger)
         max_files = int(getattr(args, 'max_files_per_table', 5))
-        posts_df, likes_df, metadata_df = load_most_recent_raw_data(max_files)
+        posts_df, likes_df, metadata_df = load_most_recent_raw_data_digital_ocean(max_files)
 
     join_like, join_post = find_join_key(posts_df, likes_df)
     author_col = 'did' if 'did' in posts_df.columns else None

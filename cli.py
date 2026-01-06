@@ -695,6 +695,10 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 1 options
     p_all.add_argument("--data-source", type=str, choices=["greenearth", "digitalocean"], default="greenearth")
     p_all.add_argument("--max-files-per-table", type=int, default=5)
+    p_all.add_argument("--posts-start", type=str, default=None, help="ISO date string for ingex GCS posts start (inclusive)")
+    p_all.add_argument("--posts-end", type=str, default=None, help="ISO date string for ingex GCS posts end (exclusive)")
+    p_all.add_argument("--likes-start", type=str, default=None, help="ISO date string for ingex GCS likes start (inclusive)")
+    p_all.add_argument("--likes-end", type=str, default=None, help="ISO date string for ingex GCS likes end (exclusive)")
     p_all.add_argument("--image-mode", type=str, choices=["auto", "off", "on"], default="auto")
     p_all.add_argument("--max-posts-per-author", type=int, default=3)
     p_all.add_argument("--max-liked-posts-per-user", type=int, default=100)
