@@ -17,6 +17,9 @@ import time
 import random
 import hashlib
 import tempfile
+import base64
+import struct
+import zlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any
 from datetime import datetime, timedelta, timezone
@@ -330,6 +333,11 @@ def find_text_column(posts_df: pd.DataFrame) -> str:
 # ----------------------------------------
 # Embeddings (text + image)
 # ----------------------------------------
+def get_embed_col_names(dim: int) -> List[str]:
+    """Generate embedding column names for given dimension."""
+    return [f"post_emb_{i}" for i in range(dim)]
+
+
 def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str = DEFAULT_EMBED_MODEL) -> Tuple[pd.DataFrame, int]:
     """Compute sentence-transformer embeddings for all posts."""
     import time
@@ -361,10 +369,82 @@ def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name
     rate = len(texts) / (time.time() - t1) if time.time() - t1 > 0 else 0
     print(f"  Embeddings computed in {time.time()-t1:.2f}s ({rate:.1f} posts/sec)")
     
-    emb_cols = [f"post_emb_{i}" for i in range(dim)]
+    emb_cols = get_embed_col_names(dim)
     emb_df = pd.DataFrame(all_emb, columns=emb_cols)
     posts_emb_df = pd.concat([posts_df.reset_index(drop=True), emb_df], axis=1)
     return posts_emb_df, dim
+
+
+def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
+    """
+    Convert an embedding from a base85-encoded string to a list of floats.
+
+    If `decompress` is `True`, decompress with zlib and throw an error if decompression fails.
+
+    If `decompress` is `False`, do not decompress before unpacking.
+
+    If `decompress` is `None`, attempt decompression and silently fallback to an uncompressed string
+    if decompression fails.
+    """
+
+    bs = base64.b85decode(s.encode())
+
+    if decompress or decompress is None:
+        try:
+            bs = zlib.decompress(bs)
+        except zlib.error:
+            if decompress:
+                raise
+
+    return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
+
+
+def extract_encoded_embedding_ingex(emb_list: Optional[list[dict]], model_name: str) -> Optional[str]:
+    """Extract base85-encoded embedding string from Ingex embeddings list for given model name."""
+    if emb_list is None:
+        return None
+    for emb_dict in emb_list:
+        if emb_dict['key'] == model_name:
+            return emb_dict['value']
+    return None
+
+
+def load_embeddings_ingex(posts_df: pd.DataFrame, model_name: str = DEFAULT_EMBED_MODEL) -> Tuple[pd.DataFrame, int]:
+    """Load precomputed embeddings from GreenEarth Ingex."""
+
+    # get the dimension of the embeddings by finding one example:
+    embed_dim = None
+    for _, row in posts_df.iterrows():
+        emb_list = row['embeddings']
+        if emb_list is None:
+            continue
+        else:
+            emb_str = extract_encoded_embedding_ingex(emb_list, model_name)
+            if emb_str is not None:
+                sample_emb = embedding_loads(emb_str, decompress=True)
+                embed_dim = len(sample_emb)
+                break
+    if embed_dim is None:
+        raise ValueError(f"No embeddings found for model {model_name} in posts data")
+
+    # Now load all embeddings
+    # First get the string out of the list of dicts for the given model
+    embed_str_col = f"embed_{model_name}"
+    posts_df[embed_str_col] = posts_df['embeddings'].map(lambda x: extract_encoded_embedding_ingex(x, model_name))
+
+    # Pre-allocate the numpy array to speed things up
+    n = len(posts_df)
+    arr = np.zeros((n, embed_dim), dtype=float)
+    for i, x in enumerate(posts_df[embed_str_col].to_numpy()):
+        if x is not None:
+            arr[i] = embedding_loads(x, True)
+
+    emb_cols = get_embed_col_names(embed_dim)
+
+    lded_embs_df = pd.DataFrame(arr, index=posts_df.index, columns=emb_cols)
+    posts_emb_df = pd.concat([posts_df, lded_embs_df], axis=1)
+
+    return posts_emb_df, embed_dim
 
 
 def _load_image_tensor(image_url: str, target_size: Tuple[int, int] = (224, 224)):
@@ -935,20 +1015,26 @@ def build_candidate_posts(
     return candidates
 
 
-def compute_post_feature_frame(candidate_posts: pd.DataFrame, image_mode: str = 'auto') -> Tuple[pd.DataFrame, int]:
+def compute_post_feature_frame(candidate_posts: pd.DataFrame, data_source: str, image_mode: str = 'auto') -> Tuple[pd.DataFrame, int]:
     """Compute embeddings for candidate posts (text always; optional image).
 
     image_mode: 'off' | 'on' | 'auto' (currently same as 'off' unless image_url present)
     """
-    text_col = find_text_column(candidate_posts)
-    posts_emb_df, text_dim = compute_post_embeddings(candidate_posts, text_col)
-    img_dim = 0
-    if image_mode in ('on', 'auto') and 'image_url' in candidate_posts.columns:
-        try:
-            posts_emb_df, img_dim = compute_image_embeddings(posts_emb_df, 'image_url')
-        except Exception:
-            img_dim = 0
-    return posts_emb_df, (text_dim + img_dim)
+    if data_source == 'digitalocean':
+        text_col = find_text_column(candidate_posts)
+        posts_emb_df, text_dim = compute_post_embeddings(candidate_posts, text_col)
+        img_dim = 0
+        if image_mode in ('on', 'auto') and 'image_url' in candidate_posts.columns:
+            try:
+                posts_emb_df, img_dim = compute_image_embeddings(posts_emb_df, 'image_url')
+            except Exception:
+                img_dim = 0
+        return posts_emb_df, (text_dim + img_dim)
+    elif data_source == 'greenearth':
+        posts_emb_df, text_dim = load_embeddings_ingex(candidate_posts, model_name='all_MiniLM_L6_v2')
+        return posts_emb_df, text_dim
+    else:
+        raise ValueError(f"Unsupported data_source: {data_source}")
 
 
 def save_bundle(

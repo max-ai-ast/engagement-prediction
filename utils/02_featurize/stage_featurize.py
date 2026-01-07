@@ -111,7 +111,8 @@ def run(context, args) -> Dict[str, Any]:
     log_operation_start('Compute text embeddings', 'STAGE_02_FEATURIZE', logger)
     if image_mode != 'off':
         logger.info(f"Image mode: {image_mode} - will compute image embeddings")
-    posts_emb_df, embedding_dim = compute_post_feature_frame(candidate_posts, image_mode=image_mode)
+    data_source = getattr(args, 'data_source')
+    posts_emb_df, embedding_dim = compute_post_feature_frame(candidate_posts, data_source, image_mode=image_mode)
     text_col = find_text_column(posts_emb_df)
 
     log_operation_start('Save embedding bundle', 'STAGE_02_FEATURIZE', logger)
