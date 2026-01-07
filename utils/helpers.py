@@ -902,7 +902,7 @@ __all__ = [
     # Detection
     'find_join_key', 'find_text_column',
     # Embeddings
-    'compute_post_embeddings', 'compute_image_embeddings',
+    'get_embed_col_names', 'embedding_loads', 'extract_encoded_embedding_ingex', 'load_embeddings_ingex', 'compute_post_embeddings', 'compute_image_embeddings',
     # Features/columns
     'get_actual_feature_columns', 'build_user_feature_frame', 'build_candidate_posts', 'compute_post_feature_frame', 'save_bundle',
     # Relevel/topic helpers
@@ -1046,6 +1046,8 @@ def save_bundle(
     join_post: str,
     text_column: str,
     author_column: str,
+    data_source: str,
+    embedding_model: str,
     embedding_dim: int,
     image_mode: str,
     extra_meta: Optional[Dict[str, Any]] = None,
@@ -1062,6 +1064,8 @@ def save_bundle(
         'join_post': join_post,
         'text_column': text_column,
         'author_column': author_column,
+        'data_source': data_source,
+        'embedding_model': embedding_model,
         'embedding_dim': int(embedding_dim),
         'image_mode': str(image_mode),
         'meta': dict(extra_meta or {}),

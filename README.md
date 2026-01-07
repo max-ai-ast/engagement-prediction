@@ -58,13 +58,16 @@ Note that there is a default GCS Bucket but it can also be overridden using `--g
 python cli.py run-all --foreground --use-latest \
   --data-source digitalocean --max-files-per-table 5 --max-posts-per-author 3 --image-mode auto
 ```
-Creates a run directory like `outputs/<timestamp>_run_d<files>_mppa<cap>/` and, at Stage 2, saves `featurize/embedding_bundle_<timestamp>.pkl` with:
+Creates a run directory like `outputs/<timestamp>_run_d<files>_mppa<cap>/` 
+2) Stage 2 - Featurize, saves `featurize/embedding_bundle_<timestamp>.pkl` with:
 - `posts_emb_df` (post_emb_* and image_emb_* columns)
 - `likes_df`
 - `join_like`, `join_post`, `text_column`, `author_column`
-- `embedding_dim`, `image_mode`, metadata
+- `embedding_dim`, `image_mode`, `embedding_model`, metadata  
 
-2) Stage 3 — Relevel users (iterate here without recomputing embeddings)
+If `--data-source` is `greenearth`, embeddings are assumed to already exist and just need to be extracted. If `--data-source` is `digitalocean`, embeddings are computed.
+
+3) Stage 3 — Relevel users (iterate here without recomputing embeddings)
 ```bash
 # via run-all or directly calling the stage script; parameters still accepted
 ```

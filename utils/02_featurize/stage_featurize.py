@@ -125,6 +125,8 @@ def run(context, args) -> Dict[str, Any]:
         join_post=join_post,
         text_column=text_col,
         author_column=author_col,
+        data_source=data_source,
+        embedding_model=model_name,
         embedding_dim=int(embedding_dim),
         image_mode=image_mode,
         extra_meta={
@@ -144,6 +146,8 @@ def run(context, args) -> Dict[str, Any]:
         f"N_posts_raw: {len(posts_df)}",
         f"N_likes_raw: {len(likes_df)}",
         f"N_posts_candidates: {len(candidate_posts)}",
+        f"data_source: {data_source}",
+        f"embedding_model: {model_name}",
         f"embedding_dim: {embedding_dim}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
