@@ -27,3 +27,5 @@ dependencies:
   - pytorch::pytorch-cuda=12.1
 
   - pip
+  - pip:
+    - clearml
