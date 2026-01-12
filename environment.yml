@@ -18,10 +18,11 @@ dependencies:
   - polars
   - requests
   - sentence-transformers
+  - pyyaml
 
   - pytorch
   - torchvision
   - torchaudio
-  - pytorch-cuda=12.1
+  # - pytorch-cuda=12.1
 
   - pip
