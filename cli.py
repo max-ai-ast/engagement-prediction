@@ -363,7 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
     p_all.add_argument("--data-source", type=str, choices=["greenearth", "digitalocean"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Data source provider", "data_source"))
+                      help=_help_with_default("Source for raw input data - posts and likes", "data_source"))
     p_all.add_argument("--gcs-bucket", type=str, default=argparse.SUPPRESS,
                       help=_help_with_default("GCS bucket name for ingex data", "gcs_bucket"))
     p_all.add_argument("--posts-start", type=str, default=argparse.SUPPRESS,
