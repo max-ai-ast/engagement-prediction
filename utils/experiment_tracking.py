@@ -7,7 +7,10 @@ Experiment tracking abstraction with a ClearML implementation.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Protocol
+from typing import Any, Dict, Iterable, Optional, Protocol, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from clearml import Task
 
 
 class ExperimentTracker(Protocol):
@@ -47,12 +50,12 @@ class ClearMLExperimentTracker:
     ) -> None:
         from clearml import Task
 
-        self._task = Task.init(
+        self._task: Task = Task.init(
             project_name=project_name,
             task_name=task_name,
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
-            auto_connect_frameworks=False,
+            auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
         )
         self._logger = self._task.get_logger()
         self._iteration = 0

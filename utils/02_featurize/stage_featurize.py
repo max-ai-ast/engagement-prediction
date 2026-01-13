@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, Any
 import pickle
 
-from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output
+from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
 from utils.helpers import (
     load_most_recent_raw_data_digital_ocean,
     build_candidate_posts,
@@ -42,7 +42,7 @@ def _load_raw_from_prior(prior_dir: Path) -> tuple:
     return payload['posts_df'], payload['likes_df'], payload.get('metadata_df')
 
 
-def run(context, args) -> Dict[str, Any]:
+def run(context: Context, args) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '02_featurize')
 
@@ -152,9 +152,6 @@ def run(context, args) -> Dict[str, Any]:
             }
         }
     })
-    context.tracker.log_artifact("embedding_bundle", Path(bundle_path))
-    context.tracker.log_artifact("liked_posts_texts", liked_texts_path)
-    context.tracker.log_artifact("liked_posts_by_user_texts", liked_texts_by_user_path)
 
     # Stage info
     info_lines = [
