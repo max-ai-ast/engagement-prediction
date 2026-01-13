@@ -103,6 +103,20 @@ def _help_with_default(text: Optional[str], key: str) -> Optional[str]:
     return f"{text} (default: {default_val})"
 
 
+def _arg_key_from_flag(flag: str) -> str:
+    """Convert a CLI flag (e.g., --posts-start) to the DEFAULTS key."""
+    return flag.lstrip("-").replace("-", "_")
+
+
+def _add_arg_with_default(parser: argparse.ArgumentParser, flag: str, *, key: Optional[str] = None,
+                          help_text: Optional[str] = None, **kwargs: Any) -> None:
+    """Add an argument with standardized default-aware help text."""
+    if help_text is not None:
+        effective_key = key or _arg_key_from_flag(flag)
+        kwargs["help"] = _help_with_default(help_text, effective_key)
+    parser.add_argument(flag, **kwargs)
+
+
 def _load_config_file(path_str: str) -> Dict[str, Any]:
     """Load a YAML (or JSON) config file mapping CLI args to values."""
     path = Path(path_str).expanduser()
@@ -362,120 +376,122 @@ def build_parser() -> argparse.ArgumentParser:
     # run-all (modular 6-stage end-to-end)
     p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
-    p_all.add_argument("--data-source", type=str, choices=["greenearth", "digitalocean"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Source for raw input data - posts and likes", "data_source"))
-    p_all.add_argument("--gcs-bucket", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("GCS bucket name for ingex data", "gcs_bucket"))
-    p_all.add_argument("--posts-start", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("ISO date string for ingex GCS posts start (inclusive)", "posts_start"))
-    p_all.add_argument("--posts-end", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("ISO date string for ingex GCS posts end (exclusive)", "posts_end"))
-    p_all.add_argument("--likes-start", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("ISO date string for ingex GCS likes start (inclusive)", "likes_start"))
-    p_all.add_argument("--likes-end", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("ISO date string for ingex GCS likes end (exclusive)", "likes_end"))
-    p_all.add_argument("--max-files-per-table", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Maximum files to read per ingex table", "max_files_per_table"))
-    p_all.add_argument("--image-mode", type=str, choices=["auto", "off", "on"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Control image handling during data pull", "image_mode"))
-    p_all.add_argument("--max-posts-per-author", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Cap on posts per author during ingestion", "max_posts_per_author"))
-    p_all.add_argument("--max-liked-posts-per-user", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Cap on liked posts per user during ingestion", "max_liked_posts_per_user"))
-    p_all.add_argument("--cap-random-seed", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Random seed for ingestion capping", "cap_random_seed"))
-    p_all.add_argument("--output-dir", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Optional explicit run directory root", "output_dir"))
-    p_all.add_argument("--run-name", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Optional suffix for Stage 1 run dir name", "run_name"))
-    p_all.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
-                      help=_help_with_default("Enable verbose debug logging for Stage 1", "debug"))
+    _add_arg_with_default(p_all, "--data-source", type=str, choices=["greenearth", "digitalocean"],
+                          default=argparse.SUPPRESS, help_text="Source for raw input data - posts and likes")
+    _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
+                          help_text="GCS bucket name for ingex data")
+    _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS posts start (inclusive)")
+    _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS posts end (exclusive)")
+    _add_arg_with_default(p_all, "--likes-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS likes start (inclusive)")
+    _add_arg_with_default(p_all, "--likes-end", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS likes end (exclusive)")
+    _add_arg_with_default(p_all, "--max-files-per-table", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum files to read per ingex table")
+    _add_arg_with_default(p_all, "--image-mode", type=str, choices=["auto", "off", "on"],
+                          default=argparse.SUPPRESS, help_text="Control image handling during data pull")
+    _add_arg_with_default(p_all, "--max-posts-per-author", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on posts per author during ingestion")
+    _add_arg_with_default(p_all, "--max-liked-posts-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on liked posts per user during ingestion")
+    _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Random seed for ingestion capping")
+    _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
+                          help_text="Optional explicit run directory root")
+    _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,
+                          help_text="Optional suffix for Stage 1 run dir name")
+    _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable verbose debug logging for Stage 1")
     # Stage 2 options
-    p_all.add_argument("--global-topic-k", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Number of global topics", "global_topic_k"))
-    p_all.add_argument("--relevel-method", type=str, choices=["uniform", "gini", "simple"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Which relevel script to use: uniform, gini, or simple", "relevel_method"))
-    p_all.add_argument("--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Relevel weighting strategy", "relevel_strategy"))
-    p_all.add_argument("--relevel-alpha", type=float, default=argparse.SUPPRESS,
-                      help=_help_with_default("Alpha parameter for relevel weighting", "relevel_alpha"))
-    p_all.add_argument("--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Minimum users per topic when releveling", "relevel_min_users_per_topic"))
-    p_all.add_argument("--min-likes-per-user", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Minimum likes per user for inclusion", "min_likes_per_user"))
-    p_all.add_argument("--val-ratio", type=float, default=argparse.SUPPRESS,
-                      help=_help_with_default("Validation ratio", "val_ratio"))
-    p_all.add_argument("--holdout-ratio", type=float, default=argparse.SUPPRESS,
-                      help=_help_with_default("Holdout ratio", "holdout_ratio"))
-    p_all.add_argument("--random-seed", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Random seed for splitting", "random_seed"))
-    p_all.add_argument("--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"], default=argparse.SUPPRESS,
-                      help=_help_with_default("SentenceTransformers model for embeddings", "embedding_model"))
+    _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of global topics")
+    _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
+                          default=argparse.SUPPRESS, help_text="Which relevel script to use: uniform, gini, or simple")
+    _add_arg_with_default(p_all, "--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"],
+                          default=argparse.SUPPRESS, help_text="Relevel weighting strategy")
+    _add_arg_with_default(p_all, "--relevel-alpha", type=float, default=argparse.SUPPRESS,
+                          help_text="Alpha parameter for relevel weighting")
+    _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum users per topic when releveling")
+    _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum likes per user for inclusion")
+    _add_arg_with_default(p_all, "--val-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Validation ratio")
+    _add_arg_with_default(p_all, "--holdout-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Holdout ratio")
+    _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Random seed for splitting")
+    _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
+                          default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
     # Stage 5 (train) model selection
-    p_all.add_argument("--model-type", type=str, choices=["mlp", "two-tower"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Model architecture: mlp or two-tower", "model_type"))
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options
-    p_all.add_argument("--shared-dim", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Two-tower shared embedding dimension", "shared_dim"))
-    p_all.add_argument("--user-hidden-dim", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Two-tower user encoder hidden dimension", "user_hidden_dim"))
-    p_all.add_argument("--post-hidden-dim", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Two-tower post encoder hidden dimension", "post_hidden_dim"))
-    p_all.add_argument("--num-attention-heads", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Two-tower attention heads", "num_attention_heads"))
-    p_all.add_argument("--num-attention-layers", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Two-tower attention layers", "num_attention_layers"))
-    p_all.add_argument("--max-history-len", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Two-tower max user history length", "max_history_len"))
+    _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower shared embedding dimension")
+    _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower user encoder hidden dimension")
+    _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower post encoder hidden dimension")
+    _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower attention heads")
+    _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower attention layers")
+    _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower max user history length")
     # Stage 5 options (shared)
-    p_all.add_argument("--epochs", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Training epochs", "epochs"))
-    p_all.add_argument("--batch-size", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Training batch size", "batch_size"))
-    p_all.add_argument("--learning-rate", type=float, default=argparse.SUPPRESS,
-                      help=_help_with_default("Learning rate", "learning_rate"))
-    p_all.add_argument("--weight-decay", type=float, default=argparse.SUPPRESS,
-                      help=_help_with_default("Weight decay", "weight_decay"))
-    p_all.add_argument("--hidden-dims", type=int, nargs="+", default=argparse.SUPPRESS,
-                      help=_help_with_default("Hidden layer sizes", "hidden_dims"))
-    p_all.add_argument("--dropout-rate", type=float, default=argparse.SUPPRESS,
-                      help=_help_with_default("Dropout rate", "dropout_rate"))
-    p_all.add_argument("--device", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Device for training", "device"))
-    p_all.add_argument("--patience", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Early stopping patience", "patience"))
-    p_all.add_argument("--no-plots", action="store_true", default=argparse.SUPPRESS,
-                      help=_help_with_default("Disable training plots", "no_plots"))
-    p_all.add_argument("--no-save-model", action="store_true", default=argparse.SUPPRESS,
-                      help=_help_with_default("Skip saving model checkpoints", "no_save_model"))
+    _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
+                          help_text="Training epochs")
+    _add_arg_with_default(p_all, "--batch-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Training batch size")
+    _add_arg_with_default(p_all, "--learning-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Learning rate")
+    _add_arg_with_default(p_all, "--weight-decay", type=float, default=argparse.SUPPRESS,
+                          help_text="Weight decay")
+    _add_arg_with_default(p_all, "--hidden-dims", type=int, nargs="+", default=argparse.SUPPRESS,
+                          help_text="Hidden layer sizes")
+    _add_arg_with_default(p_all, "--dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate")
+    _add_arg_with_default(p_all, "--device", type=str, default=argparse.SUPPRESS,
+                          help_text="Device for training")
+    _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
+                          help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Disable training plots")
+    _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Skip saving model checkpoints")
     # Stage 4 options (subset)
-    p_all.add_argument("--eval-batch-size", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("Batch size for evaluation", "eval_batch_size"))
-    p_all.add_argument("--eval-max-users", type=int, default=argparse.SUPPRESS,
-                      help=_help_with_default("0 = all eligible users for evaluation", "eval_max_users"))
+    _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Batch size for evaluation")
+    _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
+                          help_text="0 = all eligible users for evaluation")
     # Selection behavior
-    p_all.add_argument("--use-latest", action="store_true", default=argparse.SUPPRESS,
-                      help=_help_with_default("(Deprecated) Always enabled during sequential run-all", "use_latest"))
+    _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
+                          help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
-    p_all.add_argument("--start-from", type=str, choices=["get_data","featurize","relevel","split","train","evaluate"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Begin execution at this stage", "start_from"))
-    p_all.add_argument("--stop-after", type=str, choices=["get_data","featurize","relevel","split","train","evaluate"], default=argparse.SUPPRESS,
-                      help=_help_with_default("Stop after this stage completes", "stop_after"))
-    p_all.add_argument("--prior-get-data", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Path to a specific 01_get_data/<ts> directory", "prior_get_data"))
-    p_all.add_argument("--prior-featurize", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Path to a specific 02_featurize/<ts> directory", "prior_featurize"))
-    p_all.add_argument("--prior-relevel", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Path to a specific 03_relevel/<ts> directory", "prior_relevel"))
-    p_all.add_argument("--prior-split", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Path to a specific 04_split/<ts> directory", "prior_split"))
-    p_all.add_argument("--prior-train", type=str, default=argparse.SUPPRESS,
-                      help=_help_with_default("Path to a specific 05_train/<ts> directory", "prior_train"))
-    p_all.add_argument("--pick-prior", action="store_true", default=argparse.SUPPRESS,
-                      help=_help_with_default("If multiple prior outputs exist, prompt to pick (foreground only)", "pick_prior"))
+    _add_arg_with_default(p_all, "--start-from", type=str,
+                          choices=["get_data", "featurize", "relevel", "split", "train", "evaluate"],
+                          default=argparse.SUPPRESS, help_text="Begin execution at this stage")
+    _add_arg_with_default(p_all, "--stop-after", type=str,
+                          choices=["get_data", "featurize", "relevel", "split", "train", "evaluate"],
+                          default=argparse.SUPPRESS, help_text="Stop after this stage completes")
+    _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 01_get_data/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-featurize", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 02_featurize/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-relevel", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 03_relevel/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-split", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 04_split/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-train", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 05_train/<ts> directory")
+    _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
+                          help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
-    p_all.add_argument("--foreground", action="store_true", default=argparse.SUPPRESS,
-                      help=_help_with_default("Run in foreground (default: background with nohup)", "foreground"))
+    _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Run in foreground (default: background with nohup)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p_all.set_defaults(func=cmd_run_all)
 
