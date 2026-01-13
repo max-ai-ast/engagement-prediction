@@ -924,14 +924,14 @@ def run(context, args) -> Dict[str, Any]:
     likes_joinable = likes_df_local[likes_df_local[join_like].isin(available_posts)]
     
     # Topic discovery with Gini optimization
-    global_topic_k = int(getattr(args, 'global_topic_k', 20))
+    global_topic_k = int(args.global_topic_k)
     k_range = tuple(getattr(args, 'k_range', (20, 30)))
     if isinstance(k_range, (list, tuple)) and len(k_range) == 2:
         k_range = (int(k_range[0]), int(k_range[1]))
     else:
         k_range = (max(global_topic_k - 5, 10), global_topic_k + 5)
     
-    random_seed = int(getattr(args, 'random_seed', 42))
+    random_seed = int(args.random_seed)
     use_pca = bool(getattr(args, 'use_pca', True))
     pca_components = int(getattr(args, 'pca_components', 50))
     
@@ -966,12 +966,12 @@ def run(context, args) -> Dict[str, Any]:
     # Optional Gini-based selection
     relevel_strategy = str(getattr(args, 'relevel_strategy', 'gini_based'))
     target_gini = float(getattr(args, 'target_gini', 0.1))
-    relevel_min_users_per_topic = int(getattr(args, 'relevel_min_users_per_topic', 0))
+    relevel_min_users_per_topic = int(args.relevel_min_users_per_topic)
     
     retained_users_path = None
     if relevel_strategy == 'gini_based' and artifacts.global_topic_k:
         # Eligible users based on min likes per user
-        min_likes_per_user = int(getattr(args, 'min_likes_per_user', 4))
+        min_likes_per_user = int(args.min_likes_per_user)
         counts = likes_joinable.groupby('did', observed=True)[join_like].nunique().astype(int)
         eligible_users = counts[counts >= min_likes_per_user].index.astype(str).tolist()
         
@@ -1023,4 +1023,3 @@ def run(context, args) -> Dict[str, Any]:
             'embedding_bundle_path': str(bundle_path.resolve()),
         }
     }
-
