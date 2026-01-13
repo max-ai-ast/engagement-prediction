@@ -20,7 +20,7 @@ import json
 import time
 import copy
 
-from utils.experiment_tracking import build_experiment_tracker
+from utils.experiment_tracking import build_experiment_tracker, normalize_params
 
 
 # Avoid heavy imports at module import time; import lazily inside handlers
@@ -96,6 +96,11 @@ DEFAULTS: Dict[str, Any] = {
     # Execution behavior
     "foreground": False,
     "_initial_log": None,
+    # Experiment tracking
+    "experiment_tracker": "clearml",
+    "experiment_project": "Engagement Prediction",
+    "experiment_task": None,
+    "experiment_tags": None,
 }
 
 
@@ -121,6 +126,64 @@ def _add_arg_with_default(parser: argparse.ArgumentParser, flag: str, *, key: Op
         effective_key = key or _arg_key_from_flag(flag)
         kwargs["help"] = _help_with_default(help_text or "", effective_key)
     parser.add_argument(flag, **kwargs)
+
+
+def _extract_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    for key, default in DEFAULTS.items():
+        if hasattr(args, key):
+            value = getattr(args, key)
+            if value != default:
+                overrides[key] = value
+    return overrides
+
+
+def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str, Any]:
+    return {
+        "meta": {
+            "run_dir": str(run_dir),
+            "start_from": getattr(args, "start_from", None),
+            "stop_after": getattr(args, "stop_after", None),
+            "model_type": getattr(args, "model_type", None),
+            "data_source": getattr(args, "data_source", None),
+            "relevel_method": getattr(args, "relevel_method", None),
+        },
+        "data": {
+            "posts_start": getattr(args, "posts_start", None),
+            "posts_end": getattr(args, "posts_end", None),
+            "likes_start": getattr(args, "likes_start", None),
+            "likes_end": getattr(args, "likes_end", None),
+            "max_files_per_table": getattr(args, "max_files_per_table", None),
+            "image_mode": getattr(args, "image_mode", None),
+            "max_posts_per_author": getattr(args, "max_posts_per_author", None),
+            "max_liked_posts_per_user": getattr(args, "max_liked_posts_per_user", None),
+        },
+        "featurize": {
+            "embedding_model": getattr(args, "embedding_model", None),
+            "global_topic_k": getattr(args, "global_topic_k", None),
+        },
+        "relevel": {
+            "strategy": getattr(args, "relevel_strategy", None),
+            "alpha": getattr(args, "relevel_alpha", None),
+            "min_users_per_topic": getattr(args, "relevel_min_users_per_topic", None),
+        },
+        "train": {
+            "epochs": getattr(args, "epochs", None),
+            "batch_size": getattr(args, "batch_size", None),
+            "learning_rate": getattr(args, "learning_rate", None),
+            "weight_decay_mlp": getattr(args, "weight_decay_mlp", None),
+            "weight_decay_two_tower": getattr(args, "weight_decay_two_tower", None),
+            "hidden_dims": getattr(args, "hidden_dims", None),
+            "dropout_rate_mlp": getattr(args, "dropout_rate_mlp", None),
+            "dropout_rate_two_tower": getattr(args, "dropout_rate_two_tower", None),
+            "patience": getattr(args, "patience", None),
+            "device": getattr(args, "device", None),
+        },
+        "eval": {
+            "eval_batch_size": getattr(args, "eval_batch_size", None),
+            "eval_max_users": getattr(args, "eval_max_users", None),
+        },
+    }
 
 
 def _load_config_file(path_str: str) -> Dict[str, Any]:
@@ -259,11 +322,16 @@ def cmd__run_all_exec(args) -> int:
 
     run_dir = Path(args.output_dir).resolve()
     tracker = build_experiment_tracker(
-        getattr(args, "experiment_tracker", "none"),
-        project_name=getattr(args, "experiment_project", "Engagement Prediction"),
-        task_name=getattr(args, "experiment_task", None) or run_dir.name,
-        tags=getattr(args, "experiment_tags", None),
+        args.experiment_tracker,
+        project_name=args.experiment_project,
+        task_name=args.experiment_task or run_dir.name,
+        tags=args.experiment_tags,
     )
+    tracking_payload = {
+        "run": _build_tracking_params(args, run_dir),
+        "overrides": _extract_overrides(args),
+    }
+    tracker.log_params(normalize_params(tracking_payload))
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
     ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
 
@@ -525,14 +593,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
                           help_text="Run in foreground (default: background with nohup)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    p_all.add_argument("--experiment-tracker", type=str, choices=["none", "clearml"], default="none",
-                      help="Experiment tracker backend: 'clearml' or 'none' (default)")
-    p_all.add_argument("--experiment-project", type=str, default="Engagement Prediction",
-                      help="Experiment tracking project name")
-    p_all.add_argument("--experiment-task", type=str, default=None,
-                      help="Experiment tracking task name (defaults to run directory name)")
-    p_all.add_argument("--experiment-tags", type=str, nargs="*", default=None,
-                      help="Optional tags for the experiment tracker")
+    # Experiment tracking
+    _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,
+                          help_text="Type of experiment tracker to use")
+    _add_arg_with_default(p_all, "--experiment-project", type=str, default=argparse.SUPPRESS,
+                          help_text="Experiment tracking project name")
+    _add_arg_with_default(p_all, "--experiment-task", type=str, default=argparse.SUPPRESS,
+                          help_text="Experiment tracking task name")
+    _add_arg_with_default(p_all, "--experiment-tags", type=str, nargs="*", default=argparse.SUPPRESS,
+                          help_text="Optional tags for the experiment tracker")
     p_all.set_defaults(func=cmd_run_all)
 
     return parser

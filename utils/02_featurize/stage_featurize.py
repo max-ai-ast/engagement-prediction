@@ -137,6 +137,25 @@ def run(context, args) -> Dict[str, Any]:
         liked_posts_texts_path=str(liked_texts_path),
     )
 
+    context.tracker.log_params({
+        "stages": {
+            "featurize": {
+                "data_source": data_source,
+                "embedding_model": model_name,
+                "embedding_dim": int(embedding_dim),
+                "image_mode": image_mode,
+                "max_posts_per_author": int(max_posts_per_author),
+                "max_liked_posts_per_user": int(max_liked_posts_per_user),
+                "posts_raw": int(len(posts_df)),
+                "likes_raw": int(len(likes_df)),
+                "posts_candidates": int(len(candidate_posts)),
+            }
+        }
+    })
+    context.tracker.log_artifact("embedding_bundle", Path(bundle_path))
+    context.tracker.log_artifact("liked_posts_texts", liked_texts_path)
+    context.tracker.log_artifact("liked_posts_by_user_texts", liked_texts_by_user_path)
+
     # Stage info
     info_lines = [
         f"stage: featurize",
@@ -160,4 +179,3 @@ def run(context, args) -> Dict[str, Any]:
             'liked_posts_by_user_texts_path': str(liked_texts_by_user_path),
         }
     }
-

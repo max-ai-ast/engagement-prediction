@@ -81,6 +81,19 @@ class ClearMLExperimentTracker:
         self._task.close()
 
 
+def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: _normalize(v) for k, v in value.items() if v is not None}
+        if isinstance(value, (list, tuple)):
+            return [_normalize(v) for v in value]
+        return value
+
+    return {k: _normalize(v) for k, v in params.items() if v is not None}
+
+
 def build_experiment_tracker(
     kind: str,
     *,
