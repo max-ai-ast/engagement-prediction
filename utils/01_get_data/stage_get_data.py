@@ -11,14 +11,15 @@ Outputs under <run_dir>/get_data/<timestamp>/:
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 from typing import Dict, Any
 
-from utils.pipeline.core import new_stage_timestamp_dir
+from utils.pipeline.core import new_stage_timestamp_dir, Context
 from utils.helpers import load_most_recent_raw_data_digital_ocean, get_stage_logger, log_operation_start, load_raw_data_ingex
 import time
 
-def run(context, args) -> Dict[str, Any]:
+def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '01_get_data')
 
@@ -77,14 +78,20 @@ def run(context, args) -> Dict[str, Any]:
     with open(out_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
 
+    n_posts = len(posts_df)
+    n_likes = len(likes_df)
+
+    context.tracker.log_single_value(name="get_data/n_posts", value=n_posts)
+    context.tracker.log_single_value(name="get_data/n_likes", value=n_likes)
+
     # Stage info
     info_lines = [
         f"stage: get_data",
         f"runtime_seconds: {time.time()-t0:.2f}",
         f"settings: max_files_per_table={max_files}",
         f"inputs: none",
-        f"N_posts: {len(posts_df)}",
-        f"N_likes: {len(likes_df)}",
+        f"N_posts: {n_posts}",
+        f"N_likes: {n_likes}",
         f"N_metadata: {len(metadata_df) if metadata_df is not None else 0}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
