@@ -311,7 +311,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     try:
         initial_log.parent.mkdir(parents=True, exist_ok=True)
         with open(initial_log, 'a') as f:
-            f.write(f"run-all started at {timestamp_str}\n")
+            f.write(f"run-all started at {timestamp}\n")
     except Exception:
         pass
 
