@@ -19,6 +19,7 @@ Outputs under <run_dir>/evaluate/<timestamp>_<mode>/
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
@@ -26,7 +27,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output
+from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
 
 # Shared helpers
 from utils.helpers import (
@@ -34,10 +35,11 @@ from utils.helpers import (
     create_pairs_dataset,
     get_stage_logger,
     log_operation_start,
+    get_device,
 )
 
 
-def load_saved_model(model_path: str, device: str = 'cpu'):
+def load_saved_model(model_path: str, device: str):
     """Load a trained model checkpoint and reconstruct the network architecture.
 
     This redefines the training-time architecture locally to avoid importing training modules.
@@ -124,7 +126,7 @@ def _load_holdout_users(splits_path: str) -> List[str]:
     return list(map(str, splits.get('holdout_users', [])))
 
 
-def run(context, args) -> Dict[str, Any]:
+def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
 
     mode = str(getattr(args, 'mode', 'heterogeneity'))  # 'heterogeneity' | 'pairs' | 'matrix' | 'global_unliked'
@@ -139,7 +141,7 @@ def run(context, args) -> Dict[str, Any]:
 
     log_operation_start('Resolve assets (model, bundle, splits)', 'STAGE_06_EVALUATE', logger)
     model_path, bundle_path, splits_path = _resolve_assets(run_dir, context, args)
-    device = str(args.device)
+    device = get_device(args.device)
     batch_size = int(args.eval_batch_size)
     enforce_training_config = bool(getattr(args, 'enforce_training_config', True))
 

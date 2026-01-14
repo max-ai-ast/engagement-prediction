@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import select_prior_output
-from utils.helpers import get_stage_logger, log_operation_start
+from utils.helpers import get_stage_logger, log_operation_start, get_device
 
 
 # =============================================================================
@@ -704,7 +704,7 @@ def train_two_tower_model(
     model: TwoTowerEngagement,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    device: str,
     epochs: int = 100,
     learning_rate: float = 1e-3,
     weight_decay: float = 0.01,
@@ -840,7 +840,7 @@ def train_two_tower_model(
 def evaluate_model(
     model: TwoTowerEngagement,
     data_loader: DataLoader,
-    device: str = 'cpu',
+    device: str,
 ) -> Dict[str, Any]:
     """Evaluate model and return metrics."""
     from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_curve, average_precision_score
@@ -994,6 +994,7 @@ def plot_model_performance(
 def run_two_tower_pipeline(
     embedding_bundle: str,
     user_splits: str,
+    device: str,
     shared_dim: int = 128,
     user_hidden_dim: int = 256,
     post_hidden_dim: int = 256,
@@ -1007,7 +1008,6 @@ def run_two_tower_pipeline(
     weight_decay: float = 0.01,
     epochs: int = 100,
     patience: int = 20,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     random_seed: int = 42,
     output_dir: Optional[Path] = None,
     disable_progress: bool = False,
@@ -1344,6 +1344,7 @@ def run(context, args) -> Dict[str, Any]:
     # Get parameters from args
     log_operation_start('Call run_two_tower_pipeline', 'STAGE_05_TRAIN_TWO_TOWER', entry_logger)
     t0 = time.time()
+    device = get_device(args.device)
     results = run_two_tower_pipeline(
         embedding_bundle=str(bundle_path.resolve()),
         user_splits=str(splits_path.resolve()),
@@ -1360,7 +1361,7 @@ def run(context, args) -> Dict[str, Any]:
         weight_decay=float(args.weight_decay_two_tower),
         epochs=int(args.epochs),
         patience=int(args.patience),
-        device=str(args.device),
+        device=device,
         random_seed=int(args.random_seed),
         output_dir=run_dir,
         disable_progress=bool(getattr(args, 'disable_progress', False)),

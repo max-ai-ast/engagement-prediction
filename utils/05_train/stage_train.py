@@ -25,13 +25,12 @@ from utils.helpers import (
     create_pairs_dataset,
     get_stage_logger,
     log_operation_start,
+    get_device,
 )
 import json
 import numpy as np
 import pandas as pd
 import time
-import torch
-
 
 import argparse
 from datetime import datetime
@@ -39,6 +38,7 @@ from typing import List
 
 import numpy as np
 import pandas as pd
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -491,10 +491,12 @@ def run_training_pipeline(
             best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
-        # try using ClearML logging to replicate above:
+        # store training history in experiment tracker
         for e in range(len(hist['train_loss'])):
-            context.tracker.log_scalar(title="Training History", series="Train Loss", value=hist['train_loss'][e], iteration=e+1)
-            context.tracker.log_scalar(title="Training History", series="Validation Loss", value=hist['val_loss'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist['train_loss'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist['val_loss'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist['train_auc'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist['val_auc'][e], iteration=e+1)
 
         # Train/Val performance plots
         try:
@@ -574,6 +576,7 @@ def run_training_pipeline(
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     run_dir = Path(context.run_dir).resolve()
+    device = get_device(args.device)
     
     # Create a temporary logger for the stage entry point
     from datetime import datetime
@@ -619,7 +622,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         patience=int(args.patience),
         hidden_dims=args.hidden_dims,
         dropout_rate=float(args.dropout_rate_mlp),
-        device=str(args.device),
+        device=device,
         random_seed=int(args.random_seed),
         save_model=not bool(args.no_save_model),
         generate_plots=not bool(args.no_plots),
@@ -633,7 +636,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     trained_model = results.get('model_obj') or results.get('model')
     if trained_model is not None:
         try:
-            trained_model.to(str(args.device))
+            trained_model.to(device)
             trained_model.eval()
         except Exception:
             pass
@@ -777,7 +780,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                     pass
 
                 # Inference
-                device = str(args.device)
                 model = trained_model
                 user_cols = feature_columns[0]
                 post_cols = feature_columns[1]
@@ -794,7 +796,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                     with torch.no_grad():
                         for start in range(0, X.shape[0], bs):
                             end = min(start + bs, X.shape[0])
-                            xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=str(args.device))
+                            xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=device)
                             pb = model(xb).squeeze().detach().cpu().numpy()
                             preds_list.append(pb)
                 y_pred = np.concatenate(preds_list, axis=0) if preds_list else np.array([])

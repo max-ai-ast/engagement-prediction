@@ -77,7 +77,7 @@ DEFAULTS: Dict[str, Any] = {
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
     "prediction_posts_per_user": 1,
-    "device": "cpu",
+    "device": None,
     "patience": 50,
     "no_plots": False,
     "no_save_model": False,
@@ -589,7 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Dropout rate for two tower model")
     _add_arg_with_default(p_all, "--prediction-posts-per-user", type=float, default=argparse.SUPPRESS,
                           help_text="Prediction posts per user")
-    _add_arg_with_default(p_all, "--device", type=str, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--device", type=str, choices=["cpu", "cuda"], default=argparse.SUPPRESS,
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
