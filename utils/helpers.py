@@ -541,7 +541,7 @@ def build_user_feature_frame(
     embedding_dim: int,
     *,
     selected_users: Optional[List[str]] = None,
-    feature_columns: Optional[Tuple[List[str], List[str], List[str]]] = None,
+    feature_columns: Optional[List[List[str]]] = None,
     random_seed: int = 42,
     topic_model: Optional[Any] = None,
     pca_model: Optional[Any] = None,
