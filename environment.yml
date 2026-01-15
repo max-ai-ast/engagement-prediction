@@ -1,8 +1,9 @@
 name: eng-pred
 channels:
-  - conda-forge
   - pytorch
   - nvidia
+  - conda-forge
+
 dependencies:
   - python=3.11
   - numpy
@@ -20,9 +21,9 @@ dependencies:
   - sentence-transformers
   - pyyaml
 
-  - pytorch
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=12.1
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::torchaudio
+  - pytorch::pytorch-cuda=12.1
 
   - pip
