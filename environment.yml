@@ -20,6 +20,8 @@ dependencies:
   - requests
   - sentence-transformers
   - pyyaml
+  - pytest
+  - conda-lock
 
   - pytorch::pytorch
   - pytorch::torchvision
