@@ -15,11 +15,15 @@ jobs:
       - name: Set up micromamba
         uses: mamba-org/setup-micromamba@v1
         with:
-          environment-file: environment.yml
-          cache-environment: true
           cache-downloads: true
           init-shell: bash
 
+      - name: Install env from lockfile
+        shell: bash -l {0}
+        run: |
+          python -m pip install --upgrade pip conda-lock
+          conda-lock install --name eng-pred-ci conda-lock.ci.yml --micromamba
+
       - name: Run pytest
         shell: bash -l {0}
-        run: micromamba run -n eng-pred pytest
+        run: micromamba run -n eng-pred-ci pytest
