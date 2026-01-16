@@ -59,6 +59,9 @@ conda-lock -f environment.yml -p linux-64 --mamba --lockfile conda-lock.yml
 conda-lock -f environment.ci.yml -p linux-64 --mamba --lockfile conda-lock.ci.yml
 ```
 
+5. Experiment tracking setup
+   The only currently implemented experiment tracker is ClearML. If you'd like to use it, make sure you have ClearML installed (it should be installed via the conda-lock above), and run `clearml-init` in the repo. 
+
 ### Testing
 This repo utilizes `pytest`. To run the tests locally, simply run the `pytest` command. The tests will automatically be run in github actions for all commits to `main` or any pull request (see `.github/workflows/ci.yml`). The default behavior is to store tmp files in the `/tmp/pytest-of-{username}` directory. To use the current directory, instead run:
 
