@@ -276,7 +276,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
     """
     outputs_dir = OUTPUTS_DIR
-    outputs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     # Create run_dir deterministically up front

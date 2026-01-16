@@ -55,10 +55,12 @@ def run(context: Context, args) -> Dict[str, Any]:
     if prior_get is not None:
         log_operation_start('Load raw data from prior stage', 'STAGE_02_FEATURIZE', logger)
         posts_df, likes_df, metadata_df = _load_raw_from_prior(prior_get)
-    else:
+    elif args.data_source == 'digitalocean':
         log_operation_start('Load raw data from DigitalOcean Spaces', 'STAGE_02_FEATURIZE', logger)
         max_files = int(args.max_files_per_table)
         posts_df, likes_df, metadata_df = load_most_recent_raw_data_digital_ocean(max_files)
+    else:
+        raise FileNotFoundError("Data source is greenearth and no prior greenearth raw data was found. Please run the get_data stage and try again.")
 
     join_like, join_post = find_join_key(posts_df, likes_df)
     author_col = 'did' if 'did' in posts_df.columns else None
