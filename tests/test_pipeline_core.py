@@ -21,7 +21,9 @@ def test_select_prior_output_prefers_latest_alt_stage_dir(tmp_path):
 def test_select_prior_output_honors_explicit_prior_path(tmp_path):
     run_dir = Path(tmp_path)
     explicit = run_dir / "custom_prior"
+    other = run_dir / "05_train" / "20240101_000000"
     explicit.mkdir(parents=True)
+    other.mkdir(parents=True)
 
     chosen = select_prior_output(run_dir, "train", prior_path=explicit)
 
