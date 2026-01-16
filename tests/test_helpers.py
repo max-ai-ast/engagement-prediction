@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 
+import pandas as pd
 import pytest
 
-from utils.helpers import parse_one_ts
+from utils.helpers import find_join_key, find_text_column, parse_one_ts
 
 
 @pytest.mark.parametrize(
@@ -24,3 +25,29 @@ def test_parse_one_ts_returns_none_for_missing():
 def test_parse_one_ts_rejects_unrecognized_format():
     with pytest.raises(ValueError):
         parse_one_ts("10-02-2024 13:45")
+
+
+def test_find_join_key_prefers_known_columns():
+    posts = pd.DataFrame({"commit_cid": ["c1", "c2"], "other": [1, 2]})
+    likes = pd.DataFrame({"subject_cid": ["c1", "c3"], "other": [2, 3]})
+
+    assert find_join_key(posts, likes) == ("subject_cid", "commit_cid")
+
+
+def test_find_join_key_falls_back_to_common_overlap():
+    posts = pd.DataFrame({"post_id": ["p1", "p2"], "text": ["foo", "bar"]})
+    likes = pd.DataFrame({"post_id": ["p2", "p3"], "user": ["u1", "u2"]})
+
+    assert find_join_key(posts, likes) == ("post_id", "post_id")
+
+
+def test_find_text_column_prefers_record_text_when_present():
+    posts = pd.DataFrame({"record_text": ["body"], "titleText": ["t1"]})
+
+    assert find_text_column(posts) == "record_text"
+
+
+def test_find_text_column_falls_back_to_first_text_column():
+    posts = pd.DataFrame({"titleText": ["t1"], "some_text_field": ["body"]})
+
+    assert find_text_column(posts) == "titleText"
