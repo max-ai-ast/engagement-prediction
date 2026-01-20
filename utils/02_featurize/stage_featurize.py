@@ -70,17 +70,23 @@ def run(context: Context, args) -> Dict[str, Any]:
     cap_seed = int(args.cap_random_seed)
     image_mode = str(args.image_mode)
 
-    # Candidate posts
+    # Candidate posts (and capped likes)
     t0 = time.time()
+    n_likes_before = len(likes_df)
     log_operation_start('Build candidate posts', 'STAGE_02_FEATURIZE', logger)
-    candidate_posts = build_candidate_posts(
+    candidate_posts, likes_df_capped = build_candidate_posts(
         posts_df, likes_df, join_like, join_post, author_col,
         max_posts_per_author=max_posts_per_author,
         max_liked_posts_per_user=max_liked_posts_per_user,
         rng_seed=cap_seed,
     )
+    n_likes_after = len(likes_df_capped)
+    
+    # Log likes capping statistics to experiment tracker
+    context.tracker.log_single_value(name="featurize/n_likes_before_per_user_cap", value=n_likes_before)
+    context.tracker.log_single_value(name="featurize/n_likes_after_per_user_cap", value=n_likes_after)
 
-    # Persist liked-posts texts (by join keys)
+    # Persist liked-posts texts (by join keys) - use capped likes
     log_operation_start('Write liked posts texts', 'STAGE_02_FEATURIZE', logger)
     try:
         text_col_raw = find_text_column(posts_df)
@@ -91,7 +97,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     posts_df_str = posts_df_str.rename(columns={text_col_raw: 'text'})
 
     likes_min = (
-        likes_df[["did", join_like]]
+        likes_df_capped[["did", join_like]]
         .dropna(subset=["did", join_like])
         .astype({"did": str, join_like: str})
         .drop_duplicates()
@@ -120,7 +126,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     bundle_path = save_bundle(
         out_dir=out_dir,
         posts_emb_df=posts_emb_df,
-        likes_df=likes_df,
+        likes_df=likes_df_capped,  # Use capped likes in the bundle
         join_like=join_like,
         join_post=join_post,
         text_column=text_col,
@@ -133,6 +139,8 @@ def run(context: Context, args) -> Dict[str, Any]:
             'run_dir': str(run_dir.resolve()),
             'max_posts_per_author': max_posts_per_author,
             'max_liked_posts_per_user': max_liked_posts_per_user,
+            'n_likes_before_cap': n_likes_before,
+            'n_likes_after_cap': n_likes_after,
         },
         liked_posts_texts_path=str(liked_texts_path),
     )
@@ -145,6 +153,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"inputs: posts_df, likes_df",
         f"N_posts_raw: {len(posts_df)}",
         f"N_likes_raw: {len(likes_df)}",
+        f"N_likes_after_cap: {n_likes_after}",
         f"N_posts_candidates: {len(candidate_posts)}",
         f"data_source: {data_source}",
         f"embedding_model: {model_name}",

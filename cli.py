@@ -45,6 +45,7 @@ DEFAULTS: Dict[str, Any] = {
     "image_mode": "auto",
     "max_posts_per_author": 3,
     "max_liked_posts_per_user": 100,
+    "max_liking_users": 0,  # 0 = no limit; sample this many unique liking users
     "cap_random_seed": 42,
     "output_dir": None,
     "run_name": None,
@@ -157,6 +158,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "likes_start": args.likes_start,
             "likes_end": args.likes_end,
             "max_files_per_table": args.max_files_per_table,
+            "max_liking_users": args.max_liking_users,
         },
         "featurize": {
             "max_posts_per_author": args.max_posts_per_author,
@@ -525,6 +527,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Cap on posts per author during ingestion")
     _add_arg_with_default(p_all, "--max-liked-posts-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on liked posts per user during ingestion")
+    _add_arg_with_default(p_all, "--max-liking-users", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on total liking users to sample (0 = no limit)")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,

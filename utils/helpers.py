@@ -1148,19 +1148,44 @@ def build_candidate_posts(
     max_posts_per_author: int = 3,
     max_liked_posts_per_user: int = 100,
     rng_seed: int = 42,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Select candidate posts by union of liked posts and per-author caps.
 
-    - Always include posts that appear in likes_df[join_like].
+    - Caps likes per user to max_liked_posts_per_user (random sampling across time).
+    - Always include posts that appear in the (capped) likes_df[join_like].
     - Augment with up to `max_posts_per_author` posts per author (random selection).
+    
+    Returns:
+        Tuple of (candidate_posts_df, capped_likes_df)
     """
     import time
     t0 = time.time()
     
     rng = np.random.RandomState(int(rng_seed))
-    join_like_str = likes_df[join_like].astype(str)
+    
+    # Cap likes per user with RANDOM sampling across time.
+    # NOTE: In deployment/inference, we would want recency-based capping (most recent N likes)
+    # to reflect current user preferences. However, during training we use random sampling
+    # across a consistent time period so the model can learn recency effects from the data
+    # rather than having them baked in by the sampling strategy.
+    likes_df_capped = likes_df.copy()
+    n_likes_before = len(likes_df_capped)
+    
+    if max_liked_posts_per_user > 0 and 'did' in likes_df_capped.columns:
+        def _cap_user_likes(g: pd.DataFrame) -> pd.DataFrame:
+            if len(g) <= max_liked_posts_per_user:
+                return g
+            return g.sample(n=max_liked_posts_per_user, random_state=rng)
+        
+        likes_df_capped = likes_df_capped.groupby('did', group_keys=False).apply(_cap_user_likes)
+        n_likes_after = len(likes_df_capped)
+        print(f"  Capped likes per user: {n_likes_before} -> {n_likes_after} (max {max_liked_posts_per_user}/user)")
+    else:
+        n_likes_after = n_likes_before
+    
+    join_like_str = likes_df_capped[join_like].astype(str)
     liked_post_ids = set(join_like_str.dropna().unique().tolist())
-    print(f"  Found {len(liked_post_ids)} unique liked posts")
+    print(f"  Found {len(liked_post_ids)} unique liked posts (after per-user cap)")
 
     posts_df_local = posts_df.copy()
     posts_df_local[join_post] = posts_df_local[join_post].astype(str)
@@ -1195,7 +1220,7 @@ def build_candidate_posts(
     print(f"  Concatenating and deduplicating...")
     candidates = pd.concat(pool, ignore_index=True).drop_duplicates(subset=[join_post])
     print(f"  Built {len(candidates)} candidate posts (took {time.time()-t0:.2f}s)")
-    return candidates
+    return candidates, likes_df_capped
 
 
 def compute_post_feature_frame(candidate_posts: pd.DataFrame, data_source: str, model_name: str, image_mode: str = 'auto') -> Tuple[pd.DataFrame, int]:
