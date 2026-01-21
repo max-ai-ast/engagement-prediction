@@ -772,6 +772,97 @@ def create_pairs_dataset(
 # ----------------------------------------
 # Data integrity validation (shared)
 # ----------------------------------------
+def validate_dataframe_schema(
+    df: pd.DataFrame,
+    expected_schema: Dict[str, Any],
+    *,
+    allow_extra_columns: bool = True,
+) -> None:
+    """Validate a DataFrame against an expected schema of column names and dtypes.
+
+    expected_schema maps column name -> dtype spec, where dtype spec can be a
+    Python type (e.g., int, float, str), a pandas/numpy dtype, a dtype string,
+    or an iterable of allowed specs.
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"df must be a pandas DataFrame, got {type(df)!r}")
+    if not isinstance(expected_schema, dict) or not expected_schema:
+        raise ValueError("expected_schema must be a non-empty dict")
+
+    def _matches_expected_dtype(series: pd.Series, expected: Any) -> bool:
+        if isinstance(expected, (list, tuple, set)):
+            return any(_matches_expected_dtype(series, e) for e in expected)
+
+        dtype = series.dtype
+
+        if isinstance(expected, str):
+            key = expected.strip().lower()
+            if key in ("int", "int64", "integer"):
+                return pd.api.types.is_integer_dtype(dtype)
+            if key in ("float", "float64", "double"):
+                return pd.api.types.is_float_dtype(dtype)
+            if key in ("bool", "boolean"):
+                return pd.api.types.is_bool_dtype(dtype)
+            if key in ("string", "str"):
+                return pd.api.types.is_string_dtype(dtype)
+            if key in ("object", "obj"):
+                return pd.api.types.is_object_dtype(dtype)
+            if key in ("category", "categorical"):
+                return pd.api.types.is_categorical_dtype(dtype)
+            if key in ("datetime", "datetime64", "datetime64[ns]", "datetime64[ns, tz]"):
+                return pd.api.types.is_datetime64_any_dtype(dtype)
+            if key in ("timedelta", "timedelta64", "timedelta64[ns]"):
+                return pd.api.types.is_timedelta64_dtype(dtype)
+            try:
+                return pd.api.types.is_dtype_equal(dtype, np.dtype(expected))
+            except Exception:
+                return False
+
+        if isinstance(expected, np.dtype):
+            return pd.api.types.is_dtype_equal(dtype, expected)
+
+        if isinstance(expected, type):
+            if issubclass(expected, (int, np.integer)):
+                return pd.api.types.is_integer_dtype(dtype)
+            if issubclass(expected, (float, np.floating)):
+                return pd.api.types.is_float_dtype(dtype)
+            if issubclass(expected, (bool, np.bool_)):
+                return pd.api.types.is_bool_dtype(dtype)
+            if issubclass(expected, str):
+                return pd.api.types.is_string_dtype(dtype)
+            if issubclass(expected, (np.datetime64, datetime)):
+                return pd.api.types.is_datetime64_any_dtype(dtype)
+            if issubclass(expected, (np.timedelta64, timedelta)):
+                return pd.api.types.is_timedelta64_dtype(dtype)
+
+        try:
+            return pd.api.types.is_dtype_equal(dtype, expected)
+        except Exception:
+            return False
+
+    missing_cols = [col for col in expected_schema if col not in df.columns]
+    extra_cols = [col for col in df.columns if col not in expected_schema] if not allow_extra_columns else []
+
+    mismatches = []
+    for col, expected in expected_schema.items():
+        if col not in df.columns:
+            continue
+        if not _matches_expected_dtype(df[col], expected):
+            mismatches.append((col, expected, df[col].dtype))
+
+    errors = []
+    if missing_cols:
+        errors.append(f"Missing columns: {missing_cols}")
+    if extra_cols:
+        errors.append(f"Unexpected columns: {extra_cols}")
+    if mismatches:
+        formatted = ", ".join([f"{col} (expected {exp!r}, got {actual})" for col, exp, actual in mismatches])
+        errors.append(f"Dtype mismatches: {formatted}")
+
+    if errors:
+        raise ValueError("Schema validation failed: " + "; ".join(errors))
+
+
 def validate_data_integrity(data_dict: Dict) -> bool:
     required_keys = ['train_df', 'embedding_dim', 'join_post', 'join_like']
     for key in required_keys:
@@ -910,7 +1001,7 @@ __all__ = [
     # Dataset construction
     'create_pairs_dataset',
     # Validation
-    'validate_data_integrity',
+    'validate_dataframe_schema', 'validate_data_integrity',
     # Viz
     'plot_training_history', 'plot_model_performance', 'create_user_visualization',
 ]

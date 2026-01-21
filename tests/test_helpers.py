@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
-from utils.helpers import find_join_key, find_text_column, parse_one_ts
+from utils.helpers import (
+    find_join_key,
+    find_text_column,
+    parse_one_ts,
+    validate_dataframe_schema,
+)
 
 
 @pytest.mark.parametrize(
@@ -51,3 +56,40 @@ def test_find_text_column_falls_back_to_first_text_column():
     posts = pd.DataFrame({"titleText": ["t1"], "some_text_field": ["body"]})
 
     assert find_text_column(posts) == "titleText"
+
+
+def test_validate_dataframe_schema_accepts_matching_schema():
+    df = pd.DataFrame(
+        {
+            "did": ["u1", "u2"],
+            "liked": [1, 0],
+            "created_at": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        }
+    )
+    schema = {"did": str, "liked": int, "created_at": "datetime64[ns]"}
+
+    validate_dataframe_schema(df, schema, allow_extra_columns=True)
+
+
+def test_validate_dataframe_schema_rejects_missing_columns():
+    df = pd.DataFrame({"did": ["u1"]})
+    schema = {"did": str, "liked": int}
+
+    with pytest.raises(ValueError, match="Missing columns"):
+        validate_dataframe_schema(df, schema)
+
+
+def test_validate_dataframe_schema_rejects_dtype_mismatch():
+    df = pd.DataFrame({"liked": ["yes", "no"]})
+    schema = {"liked": int}
+
+    with pytest.raises(ValueError, match="Dtype mismatches"):
+        validate_dataframe_schema(df, schema)
+
+
+def test_validate_dataframe_schema_rejects_unexpected_columns_when_strict():
+    df = pd.DataFrame({"did": ["u1"], "liked": [1], "extra": [True]})
+    schema = {"did": str, "liked": int}
+
+    with pytest.raises(ValueError, match="Unexpected columns"):
+        validate_dataframe_schema(df, schema, allow_extra_columns=False)
