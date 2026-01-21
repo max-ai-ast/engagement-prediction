@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 import pandas as pd
+import polars as pl
 import pytest
 
 from utils.helpers import (
@@ -71,6 +72,19 @@ def test_validate_dataframe_schema_accepts_matching_schema():
     validate_dataframe_schema(df, schema, allow_extra_columns=True)
 
 
+def test_validate_dataframe_schema_accepts_polars_lazyframe():
+    lf = pl.DataFrame(
+        {
+            "did": ["u1", "u2"],
+            "liked": [1, 0],
+            "created_at": [datetime(2024, 1, 1), datetime(2024, 1, 2)],
+        }
+    ).lazy()
+    schema = {"did": str, "liked": int, "created_at": "datetime64[ns]"}
+
+    validate_dataframe_schema(lf, schema, allow_extra_columns=True)
+
+
 def test_validate_dataframe_schema_rejects_missing_columns():
     df = pd.DataFrame({"did": ["u1"]})
     schema = {"did": str, "liked": int}
@@ -79,8 +93,29 @@ def test_validate_dataframe_schema_rejects_missing_columns():
         validate_dataframe_schema(df, schema)
 
 
+def test_validate_dataframe_schema_rejects_missing_columns_polars():
+    df = pl.DataFrame({"did": ["u1"]})
+    schema = {"did": str, "liked": int}
+
+    with pytest.raises(ValueError, match="Missing columns"):
+        validate_dataframe_schema(df, schema)
+
+
 def test_validate_dataframe_schema_rejects_dtype_mismatch():
-    df = pd.DataFrame({"liked": ["yes", "no"]})
+    df = pd.DataFrame(
+        {
+            "liked": ["yes", "no"],
+            "created_at": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        }
+    )
+    schema = {"liked": int, "created_at": "datetime64[ns]"}
+
+    with pytest.raises(ValueError, match="Dtype mismatches"):
+        validate_dataframe_schema(df, schema)
+
+
+def test_validate_dataframe_schema_rejects_dtype_mismatch_polars():
+    df = pl.DataFrame({"liked": ["yes", "no"]})
     schema = {"liked": int}
 
     with pytest.raises(ValueError, match="Dtype mismatches"):
@@ -89,6 +124,14 @@ def test_validate_dataframe_schema_rejects_dtype_mismatch():
 
 def test_validate_dataframe_schema_rejects_unexpected_columns_when_strict():
     df = pd.DataFrame({"did": ["u1"], "liked": [1], "extra": [True]})
+    schema = {"did": str, "liked": int}
+
+    with pytest.raises(ValueError, match="Unexpected columns"):
+        validate_dataframe_schema(df, schema, allow_extra_columns=False)
+
+
+def test_validate_dataframe_schema_rejects_unexpected_columns_when_strict_polars():
+    df = pl.DataFrame({"did": ["u1"], "liked": [1], "extra": [True]})
     schema = {"did": str, "liked": int}
 
     with pytest.raises(ValueError, match="Unexpected columns"):
