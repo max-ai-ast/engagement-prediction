@@ -50,8 +50,8 @@ DEFAULTS: Dict[str, Any] = {
     "run_name": None,
     "debug": False,
     # Stage 2/3/4
-    "bucket_duration": "1h",
-    "num_buckets_lookback": "7",
+    "bucket_duration": "hourly",
+    "num_buckets_lookback": "168",  # 7 days if hourly
     "max_likes_per_bucket": -1,
     "global_topic_k": 20,
     "relevel_method": "uniform",
@@ -541,8 +541,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     # Stage 2 options
-    _add_arg_with_default(p_all, "--bucket-duration", type=str, default=argparse.SUPPRESS,
-                          help_text="")
+    _add_arg_with_default(p_all, "--bucket-duration", type=str, choices=['hourly', 'daily'], 
+                          default=argparse.SUPPRESS, help_text="")
     _add_arg_with_default(p_all, "--num-buckets-lookback", type=int, default=argparse.SUPPRESS,
                           help_text="")
     _add_arg_with_default(p_all, "--max-likes-per-bucket", type=int, default=argparse.SUPPRESS,
