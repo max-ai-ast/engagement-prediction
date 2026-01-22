@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Stage 2: 
+Stage 3: 
 
 Inputs:
 
@@ -18,14 +18,14 @@ import polars as pl
 import time
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
-from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior
+from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, get_embed_cols_from_lf
 
 
 def _calc_time_weighted_exp_mov_avg(
     lf: pl.LazyFrame,
     value_cols: list[str],
     group_cols: list[str],
-    tau: int,
+    tau_hours: int,
 ) -> pl.LazyFrame:
     lf = (
         lf
@@ -39,7 +39,7 @@ def _calc_time_weighted_exp_mov_avg(
             .alias("time_diff")
         )
         .with_columns(
-            (-pl.col("time_diff") / pl.lit(tau)).exp().alias("one_minus_alpha_i")
+            (-pl.col("time_diff") / pl.lit(tau_hours)).exp().alias("one_minus_alpha_i")
         )
         .with_columns(
             (pl.lit(1.0) - pl.col("one_minus_alpha_i")).fill_null(1.0).alias("alpha_i")
@@ -56,22 +56,19 @@ def _calc_time_weighted_exp_mov_avg(
             (pl.col("alpha_i") * pl.col("cumprod_one_minus_alpha")).alias("weight")
         )
     )
-    
     return lf.group_by(group_cols).agg([
         (pl.col("weight") * pl.col(c)).sum().alias(f"weighted_{c}")
         for c in value_cols
     ])
 
 
-def _get_embedding_cols():
-    return [f"post_emb_{i}" for i in range(128)]  # assuming 128-dim embeddings
-
-
 def _generate_user_summary_from_history(
     posts_core_lf: pl.LazyFrame,
     user_history_lf: pl.LazyFrame, 
+    group_cols: List[str],
+    tau_hours: int,
 ) -> pl.LazyFrame:
-    embedding_cols = _get_embedding_cols()
+    embedding_cols = get_embed_cols_from_lf(posts_core_lf)
     # join user_history to posts_core to get embeddings and timestamps
     posts_core_lf_cols = ["subject_uri", "inserted_at"] + embedding_cols
 
@@ -84,8 +81,8 @@ def _generate_user_summary_from_history(
     return _calc_time_weighted_exp_mov_avg(
         user_history_lf,
         value_cols=embedding_cols,
-        group_cols=["did"],
-        tau=24*7,  # 1 week time constant
+        group_cols=group_cols,
+        tau_hours=tau_hours,
     )
 
 
@@ -97,7 +94,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger = get_stage_logger('STAGE_02_FEATURIZE', log_file=out_dir / 'stage.log')
 
     # get args
-
+    tau_hours = args.tau_hours
     t0 = time.time()
 
     log_operation_start('Load raw data from prior stage', 'STAGE_02_FEATURIZE', logger)
@@ -114,7 +111,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(user_history_lf, {"did": str, "subject_uri": str, "inserted_at_bucket": pl.Datetime})
 
     log_operation_start('Aggregate likes into user history store', 'STAGE_02_FEATURIZE', logger)
-    user_summary_lf: pl.LazyFrame = _generate_user_summary_from_history(posts_core_lf, user_history_lf)
+    user_summary_lf: pl.LazyFrame = _generate_user_summary_from_history(posts_core_lf, user_history_lf, ['did'], tau_hours)
     validate_dataframe_schema(user_summary_lf, {})
 
     # Write out result

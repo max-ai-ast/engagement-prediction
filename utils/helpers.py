@@ -345,6 +345,24 @@ def get_embed_col_names(dim: int) -> List[str]:
     return [f"post_emb_{i}" for i in range(dim)]
 
 
+def get_embed_cols_from_lf(lf: pl.LazyFrame) -> List[str]:
+    """Get embedding column names from a LazyFrame based on naming convention."""
+    schema = lf.collect_schema()
+    emb_cols = [col for col in schema.names() if re.match(r'^post_emb_\d+$', col)]
+    
+    # ensure the columns are contiguous, from 0 to max index
+    def _emb_index(col: str) -> int:
+        m = re.match(r"^post_emb_(\d+)$", col)
+        if m is None:
+            raise ValueError(f"Invalid embedding column: {col}")
+        return int(m.group(1))
+
+    indices = sorted(_emb_index(col) for col in emb_cols)
+    if indices != list(range(len(indices))):
+        raise ValueError("Embedding columns are not contiguous from 0 to max index")
+    return emb_cols
+
+
 def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str) -> Tuple[pd.DataFrame, int]:
     """Compute sentence-transformer embeddings for all posts."""
     import time

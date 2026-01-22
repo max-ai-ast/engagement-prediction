@@ -63,6 +63,7 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_ratio": 0.2,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L6_v2",
+    "tau_hours": 24*7,  # 1 week
     # Stage 5 (train)
     "model_type": "mlp",
     "shared_dim": 128,
@@ -171,6 +172,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "embedding_model": args.embedding_model,
             "global_topic_k": args.global_topic_k,
             "min_likes_per_user": args.min_likes_per_user,
+            "tau_hours": args.tau_hours,
         },
         "relevel": {
             "relevel_method": args.relevel_method,
@@ -542,14 +544,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable verbose debug logging for Stage 1")
     # Stage 2 options
     _add_arg_with_default(p_all, "--bucket-duration", type=str, choices=['hourly', 'daily'], 
-                          default=argparse.SUPPRESS, help_text="")
+                          default=argparse.SUPPRESS, help_text="Length of time buckets for user history")
     _add_arg_with_default(p_all, "--num-buckets-lookback", type=int, default=argparse.SUPPRESS,
-                          help_text="")
+                          help_text="Number of buckets to include in the lookback for user history")
     _add_arg_with_default(p_all, "--max-likes-per-bucket", type=int, default=argparse.SUPPRESS,
-                          help_text="")
-    # bucket_duration: str,
-    # lookback_duration: str,
-    # max_likes_per_bucket: Optional[int]
+                          help_text="Maximum number of likes per user per time bucket")
+    _add_arg_with_default(p_all, "--tau-hours", type=int, default=argparse.SUPPRESS,
+                          help_text="Constant used in the time weighted exponential moving average for user summary")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
