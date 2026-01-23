@@ -38,7 +38,6 @@ from utils.helpers import (
     log_operation_start,
     load_likes_core_polars,
     load_posts_core_polars,
-    expand_embeddings_polars,
     # Memory safety checks and tracking
     check_data_load_safe,
     MemoryTracker,
@@ -270,9 +269,11 @@ def _run_greenearth_pipeline(
     
     mem_tracker.checkpoint("after_uri_extraction")
     
-    # Step 3: Load posts (liked + negative sample)
-    log_operation_start('Load and sample posts data', 'STAGE_01_GET_DATA', logger)
-    posts_df, posts_stats = load_posts_core_polars(
+    # Step 3: Load posts with early embedding expansion
+    # This loads posts, filters to liked + negative sample, and expands embeddings per-batch
+    # Early expansion dramatically reduces memory by dropping raw embedding blobs immediately
+    log_operation_start('Load posts with early embedding expansion', 'STAGE_01_GET_DATA', logger)
+    posts_core_df, posts_stats, embed_dim = load_posts_core_polars(
         gcs_bucket=gcs_bucket,
         start_str=posts_start,
         end_str=posts_end,
@@ -283,19 +284,9 @@ def _run_greenearth_pipeline(
         logger=logger,
     )
     all_stats['posts'] = posts_stats
-    
-    mem_tracker.checkpoint("after_posts_load")
-    
-    # Step 4: Expand embeddings
-    log_operation_start('Expand embeddings', 'STAGE_01_GET_DATA', logger)
-    posts_core_df, embed_dim = expand_embeddings_polars(
-        posts_df,
-        embedding_model=embedding_model,
-        logger=logger,
-    )
     all_stats['embedding_dim'] = embed_dim
     
-    mem_tracker.checkpoint("after_embedding_expansion")
+    mem_tracker.checkpoint("after_posts_load_and_expansion")
     
     # Memory summary: compare actual vs estimated
     memory_summary = mem_tracker.summary()

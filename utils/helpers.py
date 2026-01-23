@@ -510,8 +510,8 @@ def estimate_filtered_data_memory(
     
     # === Estimate filtered data sizes ===
     
-    # Estimate unique users from raw data (heuristic: ~10 likes per user)
-    avg_likes_per_user_estimate = 10
+    # Estimate unique users from raw data (heuristic: ~20 likes per user based on observed data)
+    avg_likes_per_user_estimate = 20
     estimated_raw_users = max(1, raw_likes_rows // avg_likes_per_user_estimate)
     
     # Apply user cap
@@ -523,50 +523,75 @@ def estimate_filtered_data_memory(
     # Estimate likes after filtering (users * max_likes, capped by raw)
     estimated_likes = min(estimated_users * max_likes_per_user, raw_likes_rows)
     
-    # Estimate liked posts (assume ~50% overlap in liked posts)
-    estimated_liked_posts = min(int(estimated_likes * 0.5), raw_posts_rows)
+    # Estimate liked posts more accurately:
+    # - Each like references a post, but there's overlap (same post liked by multiple users)
+    # - Observed: with 1M likes we get ~500K unique post URIs (~50% unique)
+    # - Then match rate against posts in time window is ~60-70%
+    unique_liked_uris_estimate = int(estimated_likes * 0.5)  # ~50% of likes are unique posts
+    liked_post_match_rate = 0.65  # ~65% of liked URIs match posts in time window
+    estimated_liked_posts = min(int(unique_liked_uris_estimate * liked_post_match_rate), raw_posts_rows)
     
     # Total posts = liked posts + negative sample
     estimated_posts = estimated_liked_posts + min(negative_posts_sample, raw_posts_rows)
     
     # === Memory estimation with incremental processing ===
     
-    # Bytes per row estimates
-    likes_bytes_per_row = 120   # did (string ~50) + subject_uri (string ~50) + timestamp (8)
-    posts_bytes_per_row_raw = 600  # Various string columns + embeddings blob
-    posts_bytes_per_row_expanded = 600 + (embedding_dim * 4)  # After embedding expansion
+    # Bytes per row estimates (in-memory representation)
+    # - Likes: simple struct with strings
+    # - Posts raw: includes base85-encoded embedding blob that expands ~3x in memory
+    # - Posts expanded: slim representation after embedding expansion drops the blob
+    likes_bytes_per_row = 200   # did (string ~80) + subject_uri (string ~80) + timestamp (8) + overhead
+    
+    # Estimate actual per-row bytes from parquet metadata + expansion factor
+    # Parquet is compressed; in-memory representation is ~3-5x larger
+    posts_bytes_per_row_parquet = posts_raw['estimated_bytes'] / max(raw_posts_rows, 1)
+    posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)  # ~4x expansion for in-memory
+    posts_bytes_per_row_expanded = 2_000 + (embedding_dim * 4)  # ~2KB base + expanded embeddings (~1.5KB)
     
     # Component 1: User set during likes processing (strings in memory)
     user_set_bytes = estimated_raw_users * 80  # ~80 bytes per DID string in set
     
-    # Component 2: Largest single parquet file (working memory)
+    # Component 2: Working memory per batch of files
+    # We process files in batches, capped at actual file count
+    batch_size = 20  # Files per batch
+    actual_likes_batch = min(batch_size, n_likes_files)
+    actual_posts_batch = min(batch_size, n_posts_files)
+    
     avg_likes_per_file = raw_likes_rows / max(n_likes_files, 1)
     avg_posts_per_file = raw_posts_rows / max(n_posts_files, 1)
-    likes_file_bytes = int(avg_likes_per_file * likes_bytes_per_row * 1.5)  # 1.5x for Polars overhead
-    posts_file_bytes = int(avg_posts_per_file * posts_bytes_per_row_raw * 1.5)
-    largest_file_bytes = max(likes_file_bytes, posts_file_bytes)
+    
+    likes_batch_rows = int(avg_likes_per_file * actual_likes_batch)
+    posts_batch_rows = int(avg_posts_per_file * actual_posts_batch)
+    
+    likes_batch_bytes = int(likes_batch_rows * likes_bytes_per_row * 1.5)  # 1.5x for Polars overhead
+    posts_batch_bytes = int(posts_batch_rows * posts_bytes_per_row_raw * 1.5)
     
     # Component 3: Output data (filtered results)
     likes_output_bytes = int(estimated_likes * likes_bytes_per_row)
+    # After early expansion, posts are stored with expanded embeddings (much smaller)
     posts_output_bytes = int(estimated_posts * posts_bytes_per_row_expanded)
     
-    # Component 4: Negative reservoir (during posts processing)
-    negative_reservoir_bytes = int(negative_posts_sample * posts_bytes_per_row_raw)
+    # Component 4: Negative reservoir (with expanded embeddings after early expansion)
+    negative_reservoir_bytes = int(negative_posts_sample * posts_bytes_per_row_expanded)
     
-    # Component 5: Pandas conversion + embedding expansion (temporary duplication)
-    embedding_expansion_bytes = int(estimated_posts * posts_bytes_per_row_expanded * 2)  # 2x for temp copies
+    # Component 5: Embedding expansion working memory (per-batch, not full dataset)
+    # With early expansion, we only expand one batch at a time
+    # Working memory = raw batch + expanded batch (temporary duplication)
+    expansion_working_bytes = int(posts_batch_rows * (posts_bytes_per_row_raw + posts_bytes_per_row_expanded) * 1.5)
     
-    # Peak memory during different phases
-    phase_1_likes = user_set_bytes + likes_file_bytes + likes_output_bytes  # Pass 1 + Pass 2
-    phase_2_posts = likes_output_bytes + posts_file_bytes + negative_reservoir_bytes + estimated_liked_posts * posts_bytes_per_row_raw
-    phase_3_expand = likes_output_bytes + embedding_expansion_bytes
+    # Peak memory during different phases (with early expansion optimization)
+    phase_1_likes = user_set_bytes + likes_batch_bytes + likes_output_bytes
+    # Phase 2: batch loading + accumulated expanded posts + reservoir
+    phase_2_posts = (likes_output_bytes + posts_batch_bytes + 
+                     posts_output_bytes + negative_reservoir_bytes + expansion_working_bytes)
+    # Phase 3: final output (already expanded during loading)
+    phase_3_final = likes_output_bytes + posts_output_bytes
     
-    peak_bytes = max(phase_1_likes, phase_2_posts, phase_3_expand)
+    peak_bytes = max(phase_1_likes, phase_2_posts, phase_3_final)
     
     # Add Python/Polars baseline overhead (~0.7 GB typical for this pipeline)
-    # Plus additional buffer for intermediate operations (50%)
     baseline_overhead_bytes = int(0.7 * (1024**3))
-    peak_bytes = int(peak_bytes * 1.5) + baseline_overhead_bytes
+    peak_bytes = int(peak_bytes * 1.2) + baseline_overhead_bytes  # 20% buffer
     
     result = {
         # Raw data stats
@@ -576,6 +601,9 @@ def estimate_filtered_data_memory(
         'raw_posts_gb': posts_raw['estimated_gb'],
         'n_likes_files': n_likes_files,
         'n_posts_files': n_posts_files,
+        # Per-row estimates (KB)
+        'posts_bytes_per_row_raw_kb': posts_bytes_per_row_raw / 1024,
+        'posts_bytes_per_row_expanded_kb': posts_bytes_per_row_expanded / 1024,
         # Estimated users
         'estimated_raw_users': estimated_raw_users,
         'estimated_filtered_users': estimated_users,
@@ -586,14 +614,15 @@ def estimate_filtered_data_memory(
         'estimated_total_posts': estimated_posts,
         # Memory breakdown (GB)
         'mem_user_set_gb': user_set_bytes / (1024**3),
-        'mem_largest_file_gb': largest_file_bytes / (1024**3),
+        'mem_likes_batch_gb': likes_batch_bytes / (1024**3),
+        'mem_posts_batch_gb': posts_batch_bytes / (1024**3),
         'mem_likes_output_gb': likes_output_bytes / (1024**3),
         'mem_posts_output_gb': posts_output_bytes / (1024**3),
-        'mem_embedding_expand_gb': embedding_expansion_bytes / (1024**3),
+        'mem_expansion_working_gb': expansion_working_bytes / (1024**3),
         # Phase peaks
         'phase_1_likes_gb': phase_1_likes / (1024**3),
         'phase_2_posts_gb': phase_2_posts / (1024**3),
-        'phase_3_expand_gb': phase_3_expand / (1024**3),
+        'phase_3_final_gb': phase_3_final / (1024**3),
         # Final estimates
         'estimated_peak_gb': peak_bytes / (1024**3),
         'estimated_total_gb': peak_bytes / (1024**3),
@@ -604,14 +633,17 @@ def estimate_filtered_data_memory(
             'min_likes_per_user': min_likes_per_user,
             'negative_posts_sample': negative_posts_sample,
             'embedding_dim': embedding_dim,
+            'batch_size': batch_size,
+            'actual_posts_batch': actual_posts_batch,
         },
     }
     
-    _log("Memory estimation (incremental file processing):")
+    _log("Memory estimation (batch processing with early embedding expansion):")
     _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
+    _log(f"  Batch size: {actual_posts_batch} files, {posts_batch_rows:,} posts/batch ({posts_bytes_per_row_raw/1024:.1f}KB raw -> {posts_bytes_per_row_expanded/1024:.1f}KB expanded)")
     _log(f"  Est. users: {estimated_raw_users:,} raw -> {estimated_users:,} after cap")
-    _log(f"  Est. output: {estimated_likes:,} likes, {estimated_posts:,} posts")
-    _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, expand={result['phase_3_expand_gb']:.2f}GB")
+    _log(f"  Est. output: {estimated_likes:,} likes, {estimated_liked_posts:,} liked posts + {min(negative_posts_sample, raw_posts_rows):,} negative = {estimated_posts:,} total posts")
+    _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, final={result['phase_3_final_gb']:.2f}GB")
     _log(f"  Estimated peak: {result['estimated_peak_gb']:.2f} GB")
     
     return result
@@ -824,9 +856,12 @@ def load_likes_core_polars(
     _log(f"Found {len(paths)} likes parquet files")
     log_memory_checkpoint("likes_before_scan", logger)
     
-    # Helper to normalize column names and apply time filter for a single file
-    def _prepare_file_lf(path: str) -> pl.LazyFrame:
-        lf = pl.scan_parquet(path)
+    # Batch size for processing multiple files at once
+    BATCH_SIZE = 20
+    
+    # Helper to normalize column names and apply time filter for batch of files
+    def _prepare_batch_lf(batch_paths: List[str]) -> pl.LazyFrame:
+        lf = pl.scan_parquet(batch_paths)
         schema = lf.collect_schema()
         
         # Normalize column names
@@ -856,21 +891,23 @@ def load_likes_core_polars(
         
         return lf
     
-    # ===== PASS 1: Collect unique users and counts (memory-efficient) =====
-    _log("Pass 1: Scanning files for unique users...")
+    # ===== PASS 1: Collect unique users and counts (batch processing) =====
+    _log(f"Pass 1: Scanning files for unique users (batch size: {BATCH_SIZE})...")
     all_users: Set[str] = set()
     n_likes_initial = 0
     
-    for i, path in enumerate(paths):
-        lf = _prepare_file_lf(path)
-        # Only collect the 'did' column - minimal memory
-        file_users = lf.select('did').collect()
-        all_users.update(file_users['did'].to_list())
-        n_likes_initial += len(file_users)
+    for batch_start in range(0, len(paths), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(paths))
+        batch_paths = paths[batch_start:batch_end]
         
-        if (i + 1) % 10 == 0 or i == len(paths) - 1:
-            _log(f"  Scanned {i+1}/{len(paths)} files: {n_likes_initial:,} likes, {len(all_users):,} unique users")
-            log_memory_checkpoint(f"likes_pass1_file_{i+1}", logger)
+        lf = _prepare_batch_lf(batch_paths)
+        # Only collect the 'did' column - minimal memory
+        batch_users = lf.select('did').collect()
+        all_users.update(batch_users['did'].to_list())
+        n_likes_initial += len(batch_users)
+        
+        _log(f"  Scanned {batch_end}/{len(paths)} files: {n_likes_initial:,} likes, {len(all_users):,} unique users")
+        log_memory_checkpoint(f"likes_pass1_batch_{batch_end}", logger)
     
     n_users_initial = len(all_users)
     _log(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
@@ -898,23 +935,25 @@ def load_likes_core_polars(
     del all_users
     log_memory_checkpoint("likes_after_user_sample", logger)
     
-    # ===== PASS 2: Collect likes only for sampled users =====
-    _log("Pass 2: Collecting likes for sampled users...")
+    # ===== PASS 2: Collect likes only for sampled users (batch processing) =====
+    _log(f"Pass 2: Collecting likes for sampled users (batch size: {BATCH_SIZE})...")
     likes_chunks: List[pl.DataFrame] = []
     n_likes_collected = 0
     
-    for i, path in enumerate(paths):
-        lf = _prepare_file_lf(path)
+    for batch_start in range(0, len(paths), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(paths))
+        batch_paths = paths[batch_start:batch_end]
+        
+        lf = _prepare_batch_lf(batch_paths)
         # Filter to sampled users before collecting
-        file_df = lf.filter(pl.col('did').is_in(sampled_user_set)).collect()
+        batch_df = lf.filter(pl.col('did').is_in(sampled_user_set)).collect()
         
-        if len(file_df) > 0:
-            likes_chunks.append(file_df)
-            n_likes_collected += len(file_df)
+        if len(batch_df) > 0:
+            likes_chunks.append(batch_df)
+            n_likes_collected += len(batch_df)
         
-        if (i + 1) % 10 == 0 or i == len(paths) - 1:
-            _log(f"  Processed {i+1}/{len(paths)} files: {n_likes_collected:,} likes collected")
-            log_memory_checkpoint(f"likes_pass2_file_{i+1}", logger)
+        _log(f"  Processed {batch_end}/{len(paths)} files: {n_likes_collected:,} likes collected")
+        log_memory_checkpoint(f"likes_pass2_batch_{batch_end}", logger)
     
     # Combine chunks
     if likes_chunks:
@@ -988,19 +1027,21 @@ def load_posts_core_polars(
     embedding_model: str = 'all_MiniLM_L6_v2',
     random_seed: int = 42,
     logger: Optional[Any] = None,
-) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
     """
-    Load posts data using memory-efficient incremental processing.
+    Load posts data using batch processing with early embedding expansion.
     
-    Instead of loading all files at once, this processes files incrementally:
-    1. For each file: extract liked posts + reservoir sample for negatives
-    2. Combine results at the end
+    Key optimization: expand embeddings per-batch BEFORE accumulating.
+    This reduces memory by ~98% (150KB/post raw -> 2KB/post expanded).
     
-    Uses reservoir sampling to get a uniform random sample of negative posts
-    without loading all data into memory.
+    Processing flow:
+    1. Process files in batches (20 files at a time)
+    2. For each batch: filter to liked posts + sample negatives
+    3. Expand embeddings and DROP the raw blob
+    4. Accumulate only the slim expanded data
     
     Returns:
-        Tuple of (posts_df: pl.DataFrame, stats: Dict with loading statistics)
+        Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
     """
     def _log(msg: str):
         if logger:
@@ -1025,9 +1066,12 @@ def load_posts_core_polars(
     _log(f"Found {len(paths)} posts parquet files")
     log_memory_checkpoint("posts_before_scan", logger)
     
-    # Helper to prepare file with time filter
-    def _prepare_file_lf(path: str) -> pl.LazyFrame:
-        lf = pl.scan_parquet(path)
+    # Batch size for processing
+    BATCH_SIZE = 20
+    
+    # Helper to prepare batch with time filter
+    def _prepare_batch_lf(batch_paths: List[str]) -> pl.LazyFrame:
+        lf = pl.scan_parquet(batch_paths)
         
         if 'inserted_at' in lf.collect_schema().names():
             lf = lf.with_columns(
@@ -1040,79 +1084,97 @@ def load_posts_core_polars(
         
         return lf
     
-    # Initialize random state for reservoir sampling
+    # Initialize random state
     rng = np.random.RandomState(random_seed)
     
-    # Accumulators
-    liked_posts_chunks: List[pl.DataFrame] = []
-    negative_reservoir: List[pl.DataFrame] = []  # Reservoir sample
-    n_non_liked_seen = 0  # Total non-liked posts seen (for reservoir sampling)
+    # Accumulators - these store EXPANDED data (small memory footprint)
+    liked_posts_expanded: List[pl.DataFrame] = []
+    negative_reservoir_expanded: List[pl.DataFrame] = []
+    n_non_liked_seen = 0
     n_posts_total = 0
     n_liked_posts = 0
+    embed_dim = 0  # Will be set on first successful expansion
     
-    _log(f"Processing {len(paths)} files incrementally...")
+    _log(f"Processing {len(paths)} files in batches of {BATCH_SIZE} with early embedding expansion...")
     
-    for i, path in enumerate(paths):
-        lf = _prepare_file_lf(path)
+    for batch_start in range(0, len(paths), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(paths))
+        batch_paths = paths[batch_start:batch_end]
         
-        # Collect just this file
-        file_df = lf.collect()
-        n_file = len(file_df)
-        n_posts_total += n_file
+        lf = _prepare_batch_lf(batch_paths)
+        batch_df = lf.collect()
+        n_batch = len(batch_df)
+        n_posts_total += n_batch
         
-        if n_file == 0:
+        if n_batch == 0:
             continue
         
         # Check for at_uri column
-        if 'at_uri' not in file_df.columns:
-            _log(f"  Warning: File {i+1} missing 'at_uri' column, skipping")
+        if 'at_uri' not in batch_df.columns:
+            _log(f"  Warning: Batch {batch_end} missing 'at_uri' column, skipping")
             continue
         
-        # Extract liked posts from this file
-        file_liked = file_df.filter(pl.col('at_uri').is_in(liked_post_uris))
-        if len(file_liked) > 0:
-            liked_posts_chunks.append(file_liked)
-            n_liked_posts += len(file_liked)
+        # === Extract liked posts from this batch ===
+        batch_liked = batch_df.filter(pl.col('at_uri').is_in(liked_post_uris))
         
-        # Reservoir sampling for negative posts
+        if len(batch_liked) > 0:
+            # EARLY EXPANSION: Expand embeddings and drop raw blob
+            batch_liked_expanded, batch_embed_dim = _expand_embeddings_chunk(
+                batch_liked, embedding_model, logger=None  # Quiet for per-batch
+            )
+            if batch_embed_dim > 0:
+                embed_dim = batch_embed_dim
+            batch_liked_expanded = batch_liked_expanded.with_columns(pl.lit(True).alias('is_liked'))
+            liked_posts_expanded.append(batch_liked_expanded)
+            n_liked_posts += len(batch_liked_expanded)
+        
+        # === Reservoir sampling for negative posts ===
         if negative_posts_sample > 0:
-            file_non_liked = file_df.filter(~pl.col('at_uri').is_in(liked_post_uris))
-            n_file_non_liked = len(file_non_liked)
+            batch_non_liked = batch_df.filter(~pl.col('at_uri').is_in(liked_post_uris))
+            n_batch_non_liked = len(batch_non_liked)
             
-            if n_file_non_liked > 0:
-                if len(negative_reservoir) < negative_posts_sample:
-                    # Reservoir not full yet, add directly
-                    space_remaining = negative_posts_sample - sum(len(r) for r in negative_reservoir)
-                    if n_file_non_liked <= space_remaining:
-                        negative_reservoir.append(file_non_liked)
-                    else:
-                        # Take a sample to fill the reservoir
-                        negative_reservoir.append(file_non_liked.sample(n=space_remaining, seed=rng.randint(0, 2**31)))
-                else:
-                    # Reservoir full - use reservoir sampling algorithm
-                    # For each item, probability of replacement = k / n where k = reservoir size, n = items seen
-                    for j in range(n_file_non_liked):
-                        n_non_liked_seen += 1
-                        # Probability this item replaces something in reservoir
-                        if rng.random() < negative_posts_sample / n_non_liked_seen:
-                            # Replace a random position in the reservoir
-                            # This is approximate since we're working with chunks, but good enough
-                            replace_idx = rng.randint(0, len(negative_reservoir))
-                            # Replace one row in that chunk with one row from this file
-                            # For simplicity, just occasionally replace entire chunks
-                            if rng.random() < 0.1 and j == 0:  # Replace chunk ~10% of time
-                                sample_size = min(len(file_non_liked), len(negative_reservoir[replace_idx]))
-                                negative_reservoir[replace_idx] = file_non_liked.sample(n=sample_size, seed=rng.randint(0, 2**31))
+            if n_batch_non_liked > 0:
+                current_reservoir_size = sum(len(r) for r in negative_reservoir_expanded)
                 
-                n_non_liked_seen += n_file_non_liked
+                if current_reservoir_size < negative_posts_sample:
+                    # Reservoir not full - add what we need
+                    space_remaining = negative_posts_sample - current_reservoir_size
+                    if n_batch_non_liked <= space_remaining:
+                        sample_to_add = batch_non_liked
+                    else:
+                        sample_to_add = batch_non_liked.sample(n=space_remaining, seed=rng.randint(0, 2**31))
+                    
+                    # EARLY EXPANSION for negatives too
+                    sample_expanded, _ = _expand_embeddings_chunk(
+                        sample_to_add, embedding_model, logger=None
+                    )
+                    sample_expanded = sample_expanded.with_columns(pl.lit(False).alias('is_liked'))
+                    negative_reservoir_expanded.append(sample_expanded)
+                else:
+                    # Reservoir full - probabilistic replacement (simplified for batches)
+                    # For batch processing, we use a simpler approximation:
+                    # Replace a fraction of the reservoir proportional to batch size
+                    n_non_liked_seen += n_batch_non_liked
+                    replace_prob = min(1.0, n_batch_non_liked / n_non_liked_seen)
+                    
+                    if rng.random() < replace_prob * 0.3:  # ~30% chance per qualifying batch
+                        # Replace one chunk with a sample from this batch
+                        if negative_reservoir_expanded:
+                            replace_idx = rng.randint(0, len(negative_reservoir_expanded))
+                            sample_size = min(n_batch_non_liked, len(negative_reservoir_expanded[replace_idx]))
+                            replacement = batch_non_liked.sample(n=sample_size, seed=rng.randint(0, 2**31))
+                            replacement_expanded, _ = _expand_embeddings_chunk(
+                                replacement, embedding_model, logger=None
+                            )
+                            replacement_expanded = replacement_expanded.with_columns(pl.lit(False).alias('is_liked'))
+                            negative_reservoir_expanded[replace_idx] = replacement_expanded
         
-        # Free the file data
-        del file_df
+        # Free batch data
+        del batch_df
         
-        if (i + 1) % 10 == 0 or i == len(paths) - 1:
-            n_neg_current = sum(len(r) for r in negative_reservoir)
-            _log(f"  Processed {i+1}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked, {n_neg_current:,} negative reservoir")
-            log_memory_checkpoint(f"posts_file_{i+1}", logger)
+        n_neg_current = sum(len(r) for r in negative_reservoir_expanded)
+        _log(f"  Processed {batch_end}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked (expanded), {n_neg_current:,} negative reservoir")
+        log_memory_checkpoint(f"posts_batch_{batch_end}", logger)
     
     _log(f"Extracted {len(liked_post_uris):,} unique liked post IDs")
     
@@ -1124,29 +1186,27 @@ def load_posts_core_polars(
     
     _log(f"Loaded {n_liked_posts:,} liked posts ({stats['liked_post_match_rate']:.1f}% match rate)")
     
-    # Combine liked posts
-    if liked_posts_chunks:
-        liked_posts_df = pl.concat(liked_posts_chunks)
-        liked_posts_df = liked_posts_df.with_columns(pl.lit(True).alias('is_liked'))
+    # Combine liked posts (already expanded)
+    if liked_posts_expanded:
+        liked_posts_df = pl.concat(liked_posts_expanded)
     else:
         liked_posts_df = None
     
-    del liked_posts_chunks
+    del liked_posts_expanded
     
-    # Combine negative reservoir
-    if negative_reservoir:
-        neg_sample_df = pl.concat(negative_reservoir)
+    # Combine negative reservoir (already expanded)
+    if negative_reservoir_expanded:
+        neg_sample_df = pl.concat(negative_reservoir_expanded)
         # Trim to exact sample size if we collected more
         if len(neg_sample_df) > negative_posts_sample:
             neg_sample_df = neg_sample_df.sample(n=negative_posts_sample, seed=random_seed)
-        neg_sample_df = neg_sample_df.with_columns(pl.lit(False).alias('is_liked'))
         stats['n_negative_sample'] = len(neg_sample_df)
         _log(f"Negative sample: {len(neg_sample_df):,} posts from reservoir")
     else:
         neg_sample_df = None
         stats['n_negative_sample'] = 0
     
-    del negative_reservoir
+    del negative_reservoir_expanded
     
     # Combine liked and negative sample posts
     if liked_posts_df is not None and neg_sample_df is not None:
@@ -1160,10 +1220,79 @@ def load_posts_core_polars(
     
     n_combined = len(posts_combined)
     _log(f"posts_core: {n_combined:,} rows ({n_liked_posts:,} liked + {stats['n_negative_sample']:,} negative)")
+    _log(f"Embeddings already expanded during loading (dim={embed_dim})")
     stats['n_posts_core'] = n_combined
+    stats['embedding_dim'] = embed_dim
     log_memory_checkpoint("posts_after_combine", logger)
     
-    return posts_combined, stats
+    return posts_combined, stats, embed_dim
+
+
+def _expand_embeddings_chunk(
+    posts_df: pl.DataFrame,
+    embedding_model: str,
+    logger: Optional[Any] = None,
+) -> Tuple[pl.DataFrame, int]:
+    """
+    Expand embeddings for a chunk of posts and drop the raw blob.
+    
+    This is an internal helper for early embedding expansion during batch loading.
+    Returns (expanded_df without embeddings column, embedding_dim).
+    """
+    if 'embeddings' not in posts_df.columns or len(posts_df) == 0:
+        return posts_df, 0
+    
+    # Convert to pandas for embedding extraction
+    pdf = posts_df.to_pandas()
+    
+    # Find embedding dimension from first valid example
+    embed_dim = None
+    for emb_list in pdf['embeddings']:
+        if emb_list is None:
+            continue
+        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
+        if emb_str is not None:
+            try:
+                sample_emb = embedding_loads(emb_str, decompress=True)
+                embed_dim = len(sample_emb)
+                break
+            except Exception:
+                continue
+    
+    if embed_dim is None:
+        # No valid embeddings - just drop the column
+        if 'embeddings' in posts_df.columns:
+            posts_df = posts_df.drop('embeddings')
+        return posts_df, 0
+    
+    # Extract embeddings for all rows
+    n_rows = len(pdf)
+    emb_array = np.zeros((n_rows, embed_dim), dtype=np.float32)
+    
+    for i, emb_list in enumerate(pdf['embeddings']):
+        if emb_list is None:
+            continue
+        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
+        if emb_str is not None:
+            try:
+                emb_array[i] = embedding_loads(emb_str, decompress=True)
+            except Exception:
+                continue
+    
+    # Create embedding column names
+    emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
+    
+    # Add embedding columns to dataframe
+    emb_df = pd.DataFrame(emb_array, columns=emb_col_names)
+    pdf = pd.concat([pdf.reset_index(drop=True), emb_df], axis=1)
+    
+    # Drop the original embeddings column (the large raw blob)
+    pdf = pdf.drop(columns=['embeddings'])
+    
+    # Convert back to polars
+    result_df = pl.from_pandas(pdf)
+    
+    return result_df, embed_dim
 
 
 def expand_embeddings_polars(
