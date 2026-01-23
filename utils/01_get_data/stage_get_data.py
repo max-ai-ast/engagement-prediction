@@ -49,19 +49,25 @@ Process posts in batches with early embedding expansion:
   - Scan posts parquet files in batches (20 files at a time)
   - Apply time-range filter (--posts-start / --posts-end)
   - For each batch:
-    a) Filter to liked posts (matching the URIs from Phase 1)
-    b) Expand embeddings immediately (float list -> individual columns)
-    c) Drop the raw embedding blob to free memory
-    d) Accumulate only the slim expanded data
+    a) Reservoir sampling for random sample (from ALL posts, independent of like status)
+    b) Extract liked posts NOT already in the random sample
+    c) Expand embeddings immediately (float list -> individual columns)
+    d) Drop the raw embedding blob to free memory
+    e) Accumulate only the slim expanded data
 
-Reservoir sampling for negatives (--negative-posts-sample):
-  - Maintain a reservoir of non-liked posts across all batches
-  - Early embedding expansion for negatives too
-  - Ensures random distribution across the full time range
+Reservoir sampling for random sample (--negative-posts-sample):
+  - Maintain a reservoir of posts sampled from ALL posts (not filtered by like status)
+  - This ensures the random sample is STATISTICALLY INDEPENDENT of like status
+  - Can be used for unbiased population statistics and as negative examples
+  - Early embedding expansion reduces memory footprint
+  - Some posts in the random sample may also be liked (this is expected and correct)
 
 Combine outputs:
-  - Concatenate liked posts + negative sample
-  - Add 'is_liked' flag (True for liked, False for negative sample)
+  - Concatenate liked-only posts + random sample
+  - Add 'in_random_sample' flag:
+    * True = post was collected via reservoir sampling (proper random sample)
+    * False = post was collected only because it was liked
+  - To identify liked posts: join with likes_core on subject_uri = at_uri
 
 ================================================================================
 DESIGN RATIONALE
@@ -84,8 +90,20 @@ Early embedding expansion:
   Raw embeddings are ~150KB/post (serialized float lists). Expanded columns are
   ~2KB/post. Expanding per-batch reduces peak memory by ~98%.
 
-Reservoir sampling for negatives:
-  Ensures the negative sample is representative of the full time range, not
+Statistically independent random sample:
+  The random sample is drawn from ALL posts, not filtered by like status. This
+  is critical for:
+  1. Unbiased population statistics (e.g., computing base rates)
+  2. Proper negative sampling (liked posts appearing in random sample is correct
+     behavior - it reflects the true probability of a random post being liked)
+  3. Downstream analyses that require a representative sample
+  
+  Note: Some posts in the random sample will also be liked by our users. This is
+  expected and correct - excluding liked posts would bias the sample toward less
+  engaging content.
+
+Reservoir sampling algorithm:
+  Ensures the random sample is representative of the full time range, not
   biased toward early or late files in the scan order.
 
 ================================================================================
@@ -94,9 +112,14 @@ OUTPUTS
 
 Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core.parquet: did, subject_uri, record_created_at
-  - posts_core.parquet: post columns + post_emb_0..N + is_liked flag
+  - posts_core.parquet: post columns + post_emb_0..N + in_random_sample flag
   - summary.json: full filtering statistics and parameters
   - stage.log: detailed execution log with memory checkpoints
+
+Using the outputs:
+  - Random sample (for population stats): filter posts_core where in_random_sample=True
+  - Liked posts: join likes_core.subject_uri with posts_core.at_uri
+  - Negative examples for training: sample from random sample excluding user's likes
 """
 
 from __future__ import annotations
@@ -445,8 +468,8 @@ def _run_digitalocean_legacy(
     likes_core_df = pl.from_pandas(likes_pdf)
     posts_core_df = pl.from_pandas(posts_pdf)
     
-    # Add is_liked flag (all true for legacy mode - no negative sampling)
-    posts_core_df = posts_core_df.with_columns(pl.lit(True).alias('is_liked'))
+    # Add in_random_sample flag (all false for legacy mode - no random sampling done)
+    posts_core_df = posts_core_df.with_columns(pl.lit(False).alias('in_random_sample'))
     
     # No embeddings in DO data by default
     embed_dim = 0

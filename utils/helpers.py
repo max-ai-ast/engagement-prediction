@@ -1177,9 +1177,21 @@ def load_posts_core_polars(
     
     Processing flow:
     1. Process files in batches (20 files at a time)
-    2. For each batch: filter to liked posts + sample negatives
-    3. Expand embeddings and DROP the raw blob
-    4. Accumulate only the slim expanded data
+    2. For each batch:
+       a) Reservoir sample from ALL posts (independent of like status)
+       b) Collect liked posts NOT already in the random sample
+       c) Expand embeddings and DROP the raw blob
+    3. Accumulate only the slim expanded data
+    
+    Statistical independence:
+    The random sample is drawn from ALL posts, not filtered by like status.
+    Posts that are both liked AND randomly sampled appear once with in_random_sample=True.
+    This ensures the random sample can be used for unbiased population statistics.
+    
+    Output columns:
+    - in_random_sample: True if post was collected via reservoir sampling,
+                        False if collected only because it was liked
+    - To identify liked posts: join with likes_core on subject_uri = at_uri
     
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
@@ -1230,8 +1242,9 @@ def load_posts_core_polars(
     
     # Accumulators - these store EXPANDED data (small memory footprint)
     liked_posts_expanded: List[pl.DataFrame] = []
-    negative_reservoir_expanded: List[pl.DataFrame] = []
-    n_non_liked_seen = 0
+    random_sample_expanded: List[pl.DataFrame] = []  # True random sample (independent of like status)
+    random_sample_uris: Set[str] = set()  # Track URIs in random sample to avoid duplicates
+    n_posts_seen_for_reservoir = 0
     n_posts_total = 0
     n_liked_posts = 0
     embed_dim = 0  # Will be set on first successful expansion
@@ -1255,8 +1268,59 @@ def load_posts_core_polars(
             _log(f"  Warning: Batch {batch_end} missing 'at_uri' column, skipping")
             continue
         
+        # === Reservoir sampling for random sample (INDEPENDENT of like status) ===
+        # IMPORTANT: This samples from ALL posts, not just non-liked posts.
+        # This ensures the random sample is statistically independent and can be
+        # used for unbiased population statistics.
+        if negative_posts_sample > 0 and n_batch > 0:
+            current_reservoir_size = sum(len(r) for r in random_sample_expanded)
+            
+            if current_reservoir_size < negative_posts_sample:
+                # Reservoir not full - add what we need
+                space_remaining = negative_posts_sample - current_reservoir_size
+                if n_batch <= space_remaining:
+                    sample_to_add = batch_df
+                else:
+                    sample_to_add = batch_df.sample(n=space_remaining, seed=rng.randint(0, 2**31))
+                
+                # EARLY EXPANSION for random sample
+                sample_expanded, sample_embed_dim = _expand_embeddings_chunk(
+                    sample_to_add, embedding_model, logger=None
+                )
+                if sample_embed_dim > 0:
+                    embed_dim = sample_embed_dim
+                sample_expanded = sample_expanded.with_columns(pl.lit(True).alias('in_random_sample'))
+                random_sample_expanded.append(sample_expanded)
+                # Track URIs to avoid duplicates when combining with liked posts
+                random_sample_uris.update(sample_expanded['at_uri'].to_list())
+            else:
+                # Reservoir full - probabilistic replacement (reservoir sampling algorithm)
+                n_posts_seen_for_reservoir += n_batch
+                replace_prob = min(1.0, n_batch / n_posts_seen_for_reservoir)
+                
+                if rng.random() < replace_prob * 0.3:  # ~30% chance per qualifying batch
+                    # Replace one chunk with a sample from this batch
+                    if random_sample_expanded:
+                        replace_idx = rng.randint(0, len(random_sample_expanded))
+                        old_chunk = random_sample_expanded[replace_idx]
+                        sample_size = min(n_batch, len(old_chunk))
+                        replacement = batch_df.sample(n=sample_size, seed=rng.randint(0, 2**31))
+                        replacement_expanded, _ = _expand_embeddings_chunk(
+                            replacement, embedding_model, logger=None
+                        )
+                        replacement_expanded = replacement_expanded.with_columns(pl.lit(True).alias('in_random_sample'))
+                        # Update URI tracking
+                        random_sample_uris -= set(old_chunk['at_uri'].to_list())
+                        random_sample_uris.update(replacement_expanded['at_uri'].to_list())
+                        random_sample_expanded[replace_idx] = replacement_expanded
+        
         # === Extract liked posts from this batch ===
-        batch_liked = batch_df.filter(pl.col('at_uri').is_in(liked_post_uris))
+        # Only add liked posts that are NOT already in the random sample
+        # This avoids duplicates while preserving the random sample's statistical properties
+        batch_liked = batch_df.filter(
+            pl.col('at_uri').is_in(liked_post_uris) & 
+            ~pl.col('at_uri').is_in(random_sample_uris)
+        )
         
         if len(batch_liked) > 0:
             # EARLY EXPANSION: Expand embeddings and drop raw blob
@@ -1265,102 +1329,74 @@ def load_posts_core_polars(
             )
             if batch_embed_dim > 0:
                 embed_dim = batch_embed_dim
-            batch_liked_expanded = batch_liked_expanded.with_columns(pl.lit(True).alias('is_liked'))
+            batch_liked_expanded = batch_liked_expanded.with_columns(pl.lit(False).alias('in_random_sample'))
             liked_posts_expanded.append(batch_liked_expanded)
             n_liked_posts += len(batch_liked_expanded)
-        
-        # === Reservoir sampling for negative posts ===
-        if negative_posts_sample > 0:
-            batch_non_liked = batch_df.filter(~pl.col('at_uri').is_in(liked_post_uris))
-            n_batch_non_liked = len(batch_non_liked)
-            
-            if n_batch_non_liked > 0:
-                current_reservoir_size = sum(len(r) for r in negative_reservoir_expanded)
-                
-                if current_reservoir_size < negative_posts_sample:
-                    # Reservoir not full - add what we need
-                    space_remaining = negative_posts_sample - current_reservoir_size
-                    if n_batch_non_liked <= space_remaining:
-                        sample_to_add = batch_non_liked
-                    else:
-                        sample_to_add = batch_non_liked.sample(n=space_remaining, seed=rng.randint(0, 2**31))
-                    
-                    # EARLY EXPANSION for negatives too
-                    sample_expanded, _ = _expand_embeddings_chunk(
-                        sample_to_add, embedding_model, logger=None
-                    )
-                    sample_expanded = sample_expanded.with_columns(pl.lit(False).alias('is_liked'))
-                    negative_reservoir_expanded.append(sample_expanded)
-                else:
-                    # Reservoir full - probabilistic replacement (simplified for batches)
-                    # For batch processing, we use a simpler approximation:
-                    # Replace a fraction of the reservoir proportional to batch size
-                    n_non_liked_seen += n_batch_non_liked
-                    replace_prob = min(1.0, n_batch_non_liked / n_non_liked_seen)
-                    
-                    if rng.random() < replace_prob * 0.3:  # ~30% chance per qualifying batch
-                        # Replace one chunk with a sample from this batch
-                        if negative_reservoir_expanded:
-                            replace_idx = rng.randint(0, len(negative_reservoir_expanded))
-                            sample_size = min(n_batch_non_liked, len(negative_reservoir_expanded[replace_idx]))
-                            replacement = batch_non_liked.sample(n=sample_size, seed=rng.randint(0, 2**31))
-                            replacement_expanded, _ = _expand_embeddings_chunk(
-                                replacement, embedding_model, logger=None
-                            )
-                            replacement_expanded = replacement_expanded.with_columns(pl.lit(False).alias('is_liked'))
-                            negative_reservoir_expanded[replace_idx] = replacement_expanded
         
         # Free batch data
         del batch_df
         
-        n_neg_current = sum(len(r) for r in negative_reservoir_expanded)
-        _log(f"  Processed {batch_end}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked (expanded), {n_neg_current:,} negative reservoir")
+        n_random_current = sum(len(r) for r in random_sample_expanded)
+        _log(f"  Processed {batch_end}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked (expanded), {n_random_current:,} random sample reservoir")
         log_memory_checkpoint(f"posts_batch_{batch_end}", logger)
     
     _log(f"Extracted {len(liked_post_uris):,} unique liked post IDs")
     
-    stats = {
-        'n_posts_total': n_posts_total,
-        'n_liked_posts': n_liked_posts,
-        'liked_post_match_rate': 100.0 * n_liked_posts / len(liked_post_uris) if liked_post_uris else 0,
-    }
-    
-    _log(f"Loaded {n_liked_posts:,} liked posts ({stats['liked_post_match_rate']:.1f}% match rate)")
-    
-    # Combine liked posts (already expanded)
-    if liked_posts_expanded:
-        liked_posts_df = pl.concat(liked_posts_expanded)
+    # Combine random sample (already expanded)
+    if random_sample_expanded:
+        random_sample_df = pl.concat(random_sample_expanded)
+        # Trim to exact sample size if we collected more
+        if len(random_sample_df) > negative_posts_sample:
+            random_sample_df = random_sample_df.sample(n=negative_posts_sample, seed=random_seed)
+            # Update URI set after trimming
+            random_sample_uris = set(random_sample_df['at_uri'].to_list())
+        n_random_sample = len(random_sample_df)
+        # Count how many liked posts happen to be in the random sample
+        n_liked_in_random = random_sample_df.filter(pl.col('at_uri').is_in(liked_post_uris)).height
+        _log(f"Random sample: {n_random_sample:,} posts ({n_liked_in_random:,} are also liked)")
     else:
-        liked_posts_df = None
+        random_sample_df = None
+        n_random_sample = 0
+        n_liked_in_random = 0
+    
+    del random_sample_expanded
+    
+    # Combine liked posts not in random sample (already expanded)
+    if liked_posts_expanded:
+        liked_only_df = pl.concat(liked_posts_expanded)
+        n_liked_only = len(liked_only_df)
+    else:
+        liked_only_df = None
+        n_liked_only = 0
     
     del liked_posts_expanded
     
-    # Combine negative reservoir (already expanded)
-    if negative_reservoir_expanded:
-        neg_sample_df = pl.concat(negative_reservoir_expanded)
-        # Trim to exact sample size if we collected more
-        if len(neg_sample_df) > negative_posts_sample:
-            neg_sample_df = neg_sample_df.sample(n=negative_posts_sample, seed=random_seed)
-        stats['n_negative_sample'] = len(neg_sample_df)
-        _log(f"Negative sample: {len(neg_sample_df):,} posts from reservoir")
-    else:
-        neg_sample_df = None
-        stats['n_negative_sample'] = 0
+    # Total liked posts = those only in liked set + those also in random sample
+    n_total_liked_posts = n_liked_only + n_liked_in_random
+    liked_post_match_rate = 100.0 * n_total_liked_posts / len(liked_post_uris) if liked_post_uris else 0
+    _log(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
     
-    del negative_reservoir_expanded
+    stats = {
+        'n_posts_total': n_posts_total,
+        'n_liked_posts': n_total_liked_posts,
+        'n_liked_only': n_liked_only,  # Liked posts not in random sample
+        'n_liked_in_random_sample': n_liked_in_random,  # Liked posts that are also in random sample
+        'liked_post_match_rate': liked_post_match_rate,
+        'n_random_sample': n_random_sample,
+    }
     
-    # Combine liked and negative sample posts
-    if liked_posts_df is not None and neg_sample_df is not None:
-        posts_combined = pl.concat([liked_posts_df, neg_sample_df])
-    elif liked_posts_df is not None:
-        posts_combined = liked_posts_df
-    elif neg_sample_df is not None:
-        posts_combined = neg_sample_df
+    # Combine liked-only and random sample posts
+    if liked_only_df is not None and random_sample_df is not None:
+        posts_combined = pl.concat([liked_only_df, random_sample_df])
+    elif liked_only_df is not None:
+        posts_combined = liked_only_df
+    elif random_sample_df is not None:
+        posts_combined = random_sample_df
     else:
         posts_combined = pl.DataFrame()
     
     n_combined = len(posts_combined)
-    _log(f"posts_core: {n_combined:,} rows ({n_liked_posts:,} liked + {stats['n_negative_sample']:,} negative)")
+    _log(f"posts_core: {n_combined:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
     _log(f"Embeddings already expanded during loading (dim={embed_dim})")
     stats['n_posts_core'] = n_combined
     stats['embedding_dim'] = embed_dim
