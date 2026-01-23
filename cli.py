@@ -50,6 +50,8 @@ DEFAULTS: Dict[str, Any] = {
     "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
     "negative_posts_sample": 100000,  # Stage 1: random posts for negative cases
     "cap_random_seed": 42,
+    "max_memory_gb": 0,  # Stage 1: max memory in GB (0 = auto based on percentage)
+    "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "output_dir": None,
     "run_name": None,
     "debug": False,
@@ -538,6 +540,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Number of random posts to sample for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
+    _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum memory to use in GB (0 = auto based on available RAM)")
+    _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum percentage of available RAM to use (default: 0.75)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
     _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,

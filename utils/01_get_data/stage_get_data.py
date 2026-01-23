@@ -39,6 +39,12 @@ from utils.helpers import (
     load_likes_core_polars,
     load_posts_core_polars,
     expand_embeddings_polars,
+    # Memory safety checks and tracking
+    check_data_load_safe,
+    MemoryTracker,
+    log_memory_checkpoint,
+    list_files_in_range_ingex_gcs,
+    parse_one_ts,
     # Legacy imports for DigitalOcean fallback
     load_most_recent_raw_data_digital_ocean,
 )
@@ -192,8 +198,54 @@ def _run_greenearth_pipeline(
     negative_posts_sample = int(getattr(args, 'negative_posts_sample', 100000))
     cap_random_seed = int(getattr(args, 'cap_random_seed', 42))
     embedding_model = getattr(args, 'embedding_model', 'all_MiniLM_L6_v2')
+    max_memory_gb = float(getattr(args, 'max_memory_gb', 0))
+    max_memory_pct = float(getattr(args, 'max_memory_pct', 0.75))
     
     all_stats = {}
+    
+    # Initialize memory tracker for actual memory monitoring
+    mem_tracker = MemoryTracker(logger=logger)
+    mem_tracker.checkpoint("pipeline_start")
+    
+    # Pre-flight memory safety check
+    log_operation_start('Pre-flight memory safety check', 'STAGE_01_GET_DATA', logger)
+    
+    # Get file paths for memory estimation
+    likes_start_dt = parse_one_ts(likes_start)
+    likes_end_dt = parse_one_ts(likes_end)
+    posts_start_dt = parse_one_ts(posts_start)
+    posts_end_dt = parse_one_ts(posts_end)
+    
+    likes_paths = list_files_in_range_ingex_gcs(
+        gcs_bucket=gcs_bucket,
+        blob_prefix='bsky_likes',
+        start=likes_start_dt,
+        end=likes_end_dt,
+    )
+    posts_paths = list_files_in_range_ingex_gcs(
+        gcs_bucket=gcs_bucket,
+        blob_prefix='bsky_posts',
+        start=posts_start_dt,
+        end=posts_end_dt,
+    )
+    
+    # Smart memory check that accounts for filtering parameters
+    memory_estimate = check_data_load_safe(
+        likes_paths=likes_paths,
+        posts_paths=posts_paths,
+        embedding_dim=384,  # Standard MiniLM dimension
+        max_memory_gb=max_memory_gb,
+        max_memory_pct=max_memory_pct,
+        max_liking_users=max_liking_users,
+        max_likes_per_user=max_likes_per_user,
+        min_likes_per_user=min_likes_per_user,
+        negative_posts_sample=negative_posts_sample,
+        logger=logger,
+    )
+    all_stats['memory_estimate'] = memory_estimate
+    logger.info("Memory check passed, proceeding with data load")
+    
+    mem_tracker.checkpoint("after_memory_check")
     
     # Step 1: Load and filter likes
     log_operation_start('Load and filter likes data', 'STAGE_01_GET_DATA', logger)
@@ -209,10 +261,14 @@ def _run_greenearth_pipeline(
     )
     all_stats['likes'] = likes_stats
     
+    mem_tracker.checkpoint("after_likes_load")
+    
     # Step 2: Extract liked post URIs
     log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
     liked_post_uris = set(likes_core_df['subject_uri'].unique().to_list())
     logger.info(f"Extracted {len(liked_post_uris):,} unique liked post URIs")
+    
+    mem_tracker.checkpoint("after_uri_extraction")
     
     # Step 3: Load posts (liked + negative sample)
     log_operation_start('Load and sample posts data', 'STAGE_01_GET_DATA', logger)
@@ -228,6 +284,8 @@ def _run_greenearth_pipeline(
     )
     all_stats['posts'] = posts_stats
     
+    mem_tracker.checkpoint("after_posts_load")
+    
     # Step 4: Expand embeddings
     log_operation_start('Expand embeddings', 'STAGE_01_GET_DATA', logger)
     posts_core_df, embed_dim = expand_embeddings_polars(
@@ -236,6 +294,20 @@ def _run_greenearth_pipeline(
         logger=logger,
     )
     all_stats['embedding_dim'] = embed_dim
+    
+    mem_tracker.checkpoint("after_embedding_expansion")
+    
+    # Memory summary: compare actual vs estimated
+    memory_summary = mem_tracker.summary()
+    all_stats['memory_actual'] = memory_summary
+    
+    # Log comparison
+    if memory_estimate and 'estimated_peak_gb' in memory_estimate:
+        actual_peak = memory_summary.get('peak_process_gb', 0)
+        estimated_peak = memory_estimate.get('estimated_peak_gb', 0)
+        if estimated_peak > 0:
+            accuracy_pct = 100.0 * actual_peak / estimated_peak
+            logger.info(f"Memory estimation accuracy: actual peak {actual_peak:.3f} GB vs estimated {estimated_peak:.2f} GB ({accuracy_pct:.1f}%)")
     
     return likes_core_df, posts_core_df, embed_dim, all_stats
 

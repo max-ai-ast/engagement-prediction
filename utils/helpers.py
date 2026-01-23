@@ -196,6 +196,563 @@ def load_raw_data_ingex(
 
 
 # ----------------------------------------
+# Stage 1: Memory estimation and safety checks
+# ----------------------------------------
+try:
+    import psutil  # type: ignore
+except ImportError:
+    psutil = None  # type: ignore
+
+# Memory estimation constants (bytes per value after Polars/pandas expansion)
+DTYPE_MEMORY_MAP = {
+    'String': 50,      # Average string length estimate
+    'Utf8': 50,
+    'Int64': 8,
+    'Int32': 4,
+    'Float64': 8,
+    'Float32': 4,
+    'Boolean': 1,
+    'Date': 8,
+    'Datetime': 8,
+    'List': 200,       # For embeddings column (nested structure)
+}
+
+
+def get_current_memory_usage() -> Dict[str, Any]:
+    """
+    Get current memory usage for both the process and system.
+    
+    Returns:
+        Dict with memory stats:
+        - process_rss_gb: Process resident set size in GB
+        - process_vms_gb: Process virtual memory size in GB
+        - system_used_gb: System used memory in GB
+        - system_available_gb: System available memory in GB
+        - system_total_gb: System total memory in GB
+        - system_percent: System memory usage percentage
+    """
+    if psutil is None:
+        return {'error': 'psutil not available'}
+    
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    sys_mem = psutil.virtual_memory()
+    
+    return {
+        'process_rss_gb': mem_info.rss / (1024**3),
+        'process_vms_gb': mem_info.vms / (1024**3),
+        'system_used_gb': sys_mem.used / (1024**3),
+        'system_available_gb': sys_mem.available / (1024**3),
+        'system_total_gb': sys_mem.total / (1024**3),
+        'system_percent': sys_mem.percent,
+    }
+
+
+def log_memory_checkpoint(
+    checkpoint_name: str,
+    logger: Optional[Any] = None,
+    *,
+    include_system: bool = True,
+) -> Dict[str, Any]:
+    """
+    Log a memory checkpoint with current usage stats.
+    
+    This function is designed to be called at key points in the pipeline
+    to track actual memory consumption vs. estimates.
+    
+    Args:
+        checkpoint_name: Descriptive name for this checkpoint (e.g., "after_likes_load")
+        logger: Logger instance to use for output
+        include_system: Whether to include system-wide memory stats
+        
+    Returns:
+        Dict with memory stats (same as get_current_memory_usage)
+    """
+    stats = get_current_memory_usage()
+    
+    if 'error' in stats:
+        if logger:
+            logger.warning(f"[MEMORY] {checkpoint_name}: {stats['error']}")
+        return stats
+    
+    if include_system:
+        msg = (
+            f"[MEMORY] {checkpoint_name}: "
+            f"process={stats['process_rss_gb']:.3f}GB, "
+            f"system={stats['system_used_gb']:.1f}/{stats['system_total_gb']:.1f}GB "
+            f"({stats['system_percent']:.1f}% used), "
+            f"available={stats['system_available_gb']:.1f}GB"
+        )
+    else:
+        msg = f"[MEMORY] {checkpoint_name}: process={stats['process_rss_gb']:.3f}GB"
+    
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
+    
+    return stats
+
+
+class MemoryTracker:
+    """
+    Track memory usage throughout a pipeline run for comparison with estimates.
+    
+    Usage:
+        tracker = MemoryTracker(logger=logger)
+        tracker.checkpoint("start")
+        # ... do work ...
+        tracker.checkpoint("after_load_likes")
+        # ... more work ...
+        tracker.checkpoint("end")
+        tracker.summary()  # logs all checkpoints and deltas
+    """
+    
+    def __init__(self, logger: Optional[Any] = None):
+        self.logger = logger
+        self.checkpoints: List[Tuple[str, float, Dict[str, Any]]] = []
+        self.start_time = time.time()
+    
+    def checkpoint(self, name: str) -> Dict[str, Any]:
+        """Record a memory checkpoint."""
+        elapsed = time.time() - self.start_time
+        stats = log_memory_checkpoint(name, self.logger)
+        self.checkpoints.append((name, elapsed, stats))
+        return stats
+    
+    def get_peak_process_memory_gb(self) -> float:
+        """Get the peak process memory observed across all checkpoints."""
+        if not self.checkpoints:
+            return 0.0
+        return max(
+            cp[2].get('process_rss_gb', 0) 
+            for cp in self.checkpoints 
+            if 'process_rss_gb' in cp[2]
+        )
+    
+    def summary(self) -> Dict[str, Any]:
+        """
+        Log a summary of all memory checkpoints and return the data.
+        """
+        if not self.checkpoints:
+            if self.logger:
+                self.logger.info("[MEMORY SUMMARY] No checkpoints recorded")
+            return {}
+        
+        peak_gb = self.get_peak_process_memory_gb()
+        start_gb = self.checkpoints[0][2].get('process_rss_gb', 0) if self.checkpoints else 0
+        end_gb = self.checkpoints[-1][2].get('process_rss_gb', 0) if self.checkpoints else 0
+        
+        summary_data = {
+            'n_checkpoints': len(self.checkpoints),
+            'peak_process_gb': peak_gb,
+            'start_process_gb': start_gb,
+            'end_process_gb': end_gb,
+            'growth_gb': end_gb - start_gb,
+            'checkpoints': [
+                {
+                    'name': name,
+                    'elapsed_sec': elapsed,
+                    'process_gb': stats.get('process_rss_gb', 0),
+                }
+                for name, elapsed, stats in self.checkpoints
+            ]
+        }
+        
+        if self.logger:
+            self.logger.info("=" * 60)
+            self.logger.info("[MEMORY SUMMARY]")
+            self.logger.info(f"  Peak process memory: {peak_gb:.3f} GB")
+            self.logger.info(f"  Memory growth: {start_gb:.3f} GB -> {end_gb:.3f} GB (+{summary_data['growth_gb']:.3f} GB)")
+            self.logger.info("  Checkpoints:")
+            for name, elapsed, stats in self.checkpoints:
+                self.logger.info(f"    {elapsed:6.1f}s  {name}: {stats.get('process_rss_gb', 0):.3f} GB")
+            self.logger.info("=" * 60)
+        
+        return summary_data
+
+
+def estimate_parquet_memory(
+    paths: List[str],
+    *,
+    embedding_expansion_dim: int = 384,
+) -> Dict[str, Any]:
+    """
+    Estimate memory required to load parquet files WITHOUT loading them.
+    
+    Uses parquet metadata (row counts, schema) to estimate in-memory size.
+    
+    Args:
+        paths: List of parquet file paths (gs:// or local)
+        embedding_expansion_dim: Number of embedding dimensions to expand (0 to skip)
+    
+    Returns:
+        Dict with estimated_bytes, estimated_gb, total_rows, etc.
+    """
+    if not paths:
+        return {'estimated_bytes': 0, 'estimated_gb': 0.0, 'total_rows': 0}
+    
+    total_rows = 0
+    schema = None
+    
+    for path in paths:
+        # Read just the metadata (no data loaded)
+        try:
+            lf = pl.scan_parquet(path)
+            meta = lf.collect_schema()
+            if schema is None:
+                schema = meta
+            
+            # Get row count from parquet metadata
+            row_count = lf.select(pl.len()).collect().item()
+            total_rows += row_count
+        except Exception:
+            continue
+    
+    if schema is None or total_rows == 0:
+        return {'estimated_bytes': 0, 'estimated_gb': 0.0, 'total_rows': 0}
+    
+    # Estimate memory per row based on schema
+    bytes_per_row = 0
+    has_embeddings = False
+    
+    for col_name, dtype in schema.items():
+        dtype_str = str(dtype)
+        
+        if col_name == 'embeddings':
+            has_embeddings = True
+            # Embeddings column will be dropped after expansion
+            continue
+        
+        # Get estimated bytes for this dtype
+        matched = False
+        for known_dtype, size in DTYPE_MEMORY_MAP.items():
+            if known_dtype.lower() in dtype_str.lower():
+                bytes_per_row += size
+                matched = True
+                break
+        if not matched:
+            bytes_per_row += 50  # Default estimate for unknown types
+    
+    # Add embedding expansion overhead
+    if has_embeddings and embedding_expansion_dim > 0:
+        # Each embedding dimension becomes a Float32 column
+        bytes_per_row += embedding_expansion_dim * 4
+    
+    # Add polars/pandas overhead (typically 1.5-2x raw data)
+    overhead_factor = 1.8
+    estimated_bytes = int(total_rows * bytes_per_row * overhead_factor)
+    
+    return {
+        'estimated_bytes': estimated_bytes,
+        'estimated_gb': estimated_bytes / (1024**3),
+        'total_rows': total_rows,
+        'bytes_per_row': bytes_per_row,
+        'n_columns': len(schema),
+        'has_embeddings': has_embeddings,
+    }
+
+
+def estimate_filtered_data_memory(
+    likes_paths: List[str],
+    posts_paths: List[str],
+    *,
+    max_liking_users: int = 0,
+    max_likes_per_user: int = 100,
+    min_likes_per_user: int = 2,
+    negative_posts_sample: int = 100_000,
+    embedding_dim: int = 384,
+    logger: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Estimate memory required AFTER filtering is applied.
+    
+    This is a smarter estimation that accounts for filtering parameters:
+    - max_liking_users: caps the number of users included
+    - max_likes_per_user: caps likes per user
+    - min_likes_per_user: filters out users with too few likes
+    - negative_posts_sample: determines size of negative posts sample
+    
+    The estimation logic:
+    1. Estimate raw likes rows and unique users from metadata
+    2. Apply user cap to estimate filtered users
+    3. Multiply by max_likes_per_user to estimate max likes
+    4. Estimate liked posts (conservatively assume high like-to-post ratio)
+    5. Add negative posts sample
+    
+    Args:
+        likes_paths: Paths to likes parquet files
+        posts_paths: Paths to posts parquet files
+        max_liking_users: Cap on number of liking users (0 = no cap)
+        max_likes_per_user: Max likes to keep per user
+        min_likes_per_user: Min likes required per user
+        negative_posts_sample: Number of negative posts to sample
+        embedding_dim: Embedding dimension (for posts memory)
+        logger: Optional logger
+        
+    Returns:
+        Dict with detailed memory estimates
+    """
+    def _log(msg: str):
+        if logger:
+            logger.info(msg)
+    
+    # Get raw stats without loading data
+    likes_raw = estimate_parquet_memory(likes_paths, embedding_expansion_dim=0)
+    posts_raw = estimate_parquet_memory(posts_paths, embedding_expansion_dim=embedding_dim)
+    
+    raw_likes_rows = likes_raw['total_rows']
+    raw_posts_rows = posts_raw['total_rows']
+    
+    if raw_likes_rows == 0:
+        return {
+            'estimated_total_gb': 0,
+            'likes_estimated_gb': 0,
+            'posts_estimated_gb': 0,
+            'error': 'No likes data found',
+        }
+    
+    # Estimate unique users from raw data
+    # Heuristic: assume average of 5-20 likes per user in raw data
+    # This is a conservative estimate (fewer users = more memory per user scenario)
+    avg_likes_per_user_estimate = 10
+    estimated_raw_users = max(1, raw_likes_rows // avg_likes_per_user_estimate)
+    
+    # Apply user cap
+    if max_liking_users > 0:
+        estimated_users = min(max_liking_users, estimated_raw_users)
+    else:
+        estimated_users = estimated_raw_users
+    
+    # Estimate likes after filtering
+    # Users that pass min_likes filter will have between min_likes_per_user and max_likes_per_user
+    # Conservative estimate: use max_likes_per_user
+    estimated_likes = estimated_users * max_likes_per_user
+    
+    # But don't exceed raw likes
+    estimated_likes = min(estimated_likes, raw_likes_rows)
+    
+    # Estimate liked posts
+    # Assume each liked post is liked by ~2 users on average (some overlap)
+    estimated_liked_posts = min(estimated_likes // 2, raw_posts_rows)
+    
+    # Total posts = liked posts + negative sample
+    estimated_posts = estimated_liked_posts + negative_posts_sample
+    estimated_posts = min(estimated_posts, raw_posts_rows + negative_posts_sample)
+    
+    # Calculate memory
+    likes_bytes_per_row = likes_raw.get('bytes_per_row', 100)  # did, subject_uri, timestamp
+    posts_bytes_per_row = posts_raw.get('bytes_per_row', 500)  # includes expanded embeddings
+    
+    # Apply overhead factor
+    overhead_factor = 1.8
+    
+    likes_estimated_bytes = int(estimated_likes * likes_bytes_per_row * overhead_factor)
+    posts_estimated_bytes = int(estimated_posts * posts_bytes_per_row * overhead_factor)
+    
+    # During processing, we may have multiple copies temporarily
+    # Account for this with a peak multiplier
+    peak_multiplier = 2.5  # Polars operations can create intermediate copies
+    
+    total_estimated_bytes = int((likes_estimated_bytes + posts_estimated_bytes) * peak_multiplier)
+    
+    result = {
+        # Raw data stats
+        'raw_likes_rows': raw_likes_rows,
+        'raw_posts_rows': raw_posts_rows,
+        'raw_likes_gb': likes_raw['estimated_gb'],
+        'raw_posts_gb': posts_raw['estimated_gb'],
+        # Estimated users
+        'estimated_raw_users': estimated_raw_users,
+        'estimated_filtered_users': estimated_users,
+        # Estimated filtered data
+        'estimated_likes_rows': estimated_likes,
+        'estimated_liked_posts': estimated_liked_posts,
+        'estimated_negative_posts': negative_posts_sample,
+        'estimated_total_posts': estimated_posts,
+        # Memory estimates
+        'likes_estimated_gb': likes_estimated_bytes / (1024**3),
+        'posts_estimated_gb': posts_estimated_bytes / (1024**3),
+        'estimated_base_gb': (likes_estimated_bytes + posts_estimated_bytes) / (1024**3),
+        'estimated_peak_gb': total_estimated_bytes / (1024**3),
+        'estimated_total_gb': total_estimated_bytes / (1024**3),
+        # Parameters used
+        'params': {
+            'max_liking_users': max_liking_users,
+            'max_likes_per_user': max_likes_per_user,
+            'min_likes_per_user': min_likes_per_user,
+            'negative_posts_sample': negative_posts_sample,
+            'embedding_dim': embedding_dim,
+        },
+    }
+    
+    _log("Smart memory estimation (accounting for filtering):")
+    _log(f"  Raw data: {raw_likes_rows:,} likes, {raw_posts_rows:,} posts")
+    _log(f"  Est. users: {estimated_raw_users:,} raw -> {estimated_users:,} after cap")
+    _log(f"  Est. filtered: {estimated_likes:,} likes, {estimated_posts:,} posts")
+    _log(f"  Memory estimate: {result['estimated_base_gb']:.2f} GB base, {result['estimated_peak_gb']:.2f} GB peak")
+    
+    return result
+
+
+def check_memory_available(
+    estimated_bytes: int,
+    *,
+    max_memory_gb: float = 0,  # 0 = use percentage of available
+    max_memory_pct: float = 0.75,  # Use at most 75% of available RAM
+    logger: Optional[Any] = None,
+) -> Tuple[bool, str]:
+    """
+    Check if estimated memory usage is safe given available system memory.
+    
+    Args:
+        estimated_bytes: Estimated memory required
+        max_memory_gb: Maximum memory in GB (0 = auto based on percentage)
+        max_memory_pct: Maximum percentage of available RAM to use
+        logger: Optional logger for output
+    
+    Returns:
+        Tuple of (is_safe: bool, message: str)
+    """
+    if psutil is None:
+        return True, "psutil not available, skipping memory check"
+    
+    mem = psutil.virtual_memory()
+    available_bytes = mem.available
+    total_bytes = mem.total
+    
+    # Determine threshold
+    if max_memory_gb > 0:
+        threshold_bytes = int(max_memory_gb * (1024**3))
+    else:
+        threshold_bytes = int(available_bytes * max_memory_pct)
+    
+    is_safe = estimated_bytes <= threshold_bytes
+    
+    msg = (
+        f"Memory check: estimated {estimated_bytes/(1024**3):.2f} GB, "
+        f"threshold {threshold_bytes/(1024**3):.2f} GB, "
+        f"available {available_bytes/(1024**3):.2f} GB / {total_bytes/(1024**3):.2f} GB total"
+    )
+    
+    if not is_safe:
+        msg = f"MEMORY LIMIT EXCEEDED: {msg}"
+    
+    if logger:
+        if is_safe:
+            logger.info(msg)
+        else:
+            logger.error(msg)
+    
+    return is_safe, msg
+
+
+def check_data_load_safe(
+    likes_paths: List[str],
+    posts_paths: List[str],
+    *,
+    embedding_dim: int = 384,
+    max_memory_gb: float = 0,
+    max_memory_pct: float = 0.75,
+    max_liking_users: int = 0,
+    max_likes_per_user: int = 100,
+    min_likes_per_user: int = 2,
+    negative_posts_sample: int = 100_000,
+    logger: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Pre-flight check before loading data. Raises MemoryError if unsafe.
+    
+    This function uses smart estimation that accounts for filtering parameters
+    to provide more accurate memory predictions.
+    
+    Args:
+        likes_paths: List of likes parquet paths
+        posts_paths: List of posts parquet paths
+        embedding_dim: Embedding dimension for memory estimation
+        max_memory_gb: Maximum memory in GB (0 = auto based on percentage)
+        max_memory_pct: Maximum percentage of available RAM
+        max_liking_users: Cap on number of liking users
+        max_likes_per_user: Max likes to keep per user
+        min_likes_per_user: Min likes required per user
+        negative_posts_sample: Number of negative posts to sample
+        logger: Optional logger
+    
+    Returns:
+        Dict with memory estimation details
+    
+    Raises:
+        MemoryError: If estimated memory exceeds limits
+    """
+    if psutil is None:
+        if logger:
+            logger.warning("psutil not available, skipping memory safety check")
+        return {'skipped': True, 'reason': 'psutil not available'}
+    
+    if logger:
+        logger.info("=" * 60)
+        logger.info("PRE-FLIGHT MEMORY CHECK")
+        logger.info("=" * 60)
+    
+    # Use smart estimation that accounts for filtering
+    estimation = estimate_filtered_data_memory(
+        likes_paths=likes_paths,
+        posts_paths=posts_paths,
+        max_liking_users=max_liking_users,
+        max_likes_per_user=max_likes_per_user,
+        min_likes_per_user=min_likes_per_user,
+        negative_posts_sample=negative_posts_sample,
+        embedding_dim=embedding_dim,
+        logger=logger,
+    )
+    
+    if 'error' in estimation:
+        if logger:
+            logger.warning(f"Memory estimation warning: {estimation['error']}")
+        return estimation
+    
+    # Also show raw (unfiltered) estimate for comparison
+    raw_likes = estimate_parquet_memory(likes_paths, embedding_expansion_dim=0)
+    raw_posts = estimate_parquet_memory(posts_paths, embedding_expansion_dim=embedding_dim)
+    raw_total_gb = raw_likes['estimated_gb'] + raw_posts['estimated_gb']
+    
+    if logger:
+        logger.info(f"  Raw data (unfiltered): ~{raw_total_gb:.2f} GB")
+        logger.info(f"  After filtering: ~{estimation['estimated_base_gb']:.2f} GB (base)")
+        logger.info(f"  Peak during processing: ~{estimation['estimated_peak_gb']:.2f} GB")
+    
+    # Use the peak estimate for safety check
+    estimated_bytes = int(estimation['estimated_peak_gb'] * (1024**3))
+    
+    is_safe, msg = check_memory_available(
+        estimated_bytes,
+        max_memory_gb=max_memory_gb,
+        max_memory_pct=max_memory_pct,
+        logger=logger,
+    )
+    
+    estimation['is_safe'] = is_safe
+    estimation['memory_check_message'] = msg
+    
+    if logger:
+        logger.info("=" * 60)
+    
+    if not is_safe:
+        raise MemoryError(
+            f"Data load would exceed memory limits. {msg}\n"
+            f"Estimated peak memory: {estimation['estimated_peak_gb']:.2f} GB\n"
+            f"Options to reduce memory:\n"
+            f"  - Use a shorter time window (--posts-start/--posts-end)\n"
+            f"  - Reduce --max-liking-users (current: {max_liking_users})\n"
+            f"  - Reduce --max-likes-per-user (current: {max_likes_per_user})\n"
+            f"  - Reduce --negative-posts-sample (current: {negative_posts_sample})\n"
+            f"  - Increase --max-memory-gb if you have more RAM available"
+        )
+    
+    return estimation
+
+
+# ----------------------------------------
 # Stage 1: Polars-based filtering for core datasets
 # ----------------------------------------
 def load_likes_core_polars(
@@ -243,6 +800,7 @@ def load_likes_core_polars(
         raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
     
     _log(f"Found {len(paths)} likes parquet files")
+    log_memory_checkpoint("likes_before_scan", logger)
     
     # Step 1: Scan likes and apply time filter
     likes_lf = pl.scan_parquet(paths)
@@ -278,6 +836,7 @@ def load_likes_core_polars(
     n_likes_initial = len(likes_df)
     n_users_initial = likes_df['did'].n_unique()
     _log(f"Scanned {n_likes_initial:,} likes from {n_users_initial:,} users")
+    log_memory_checkpoint("likes_after_collect", logger)
     
     stats = {
         'n_likes_initial': n_likes_initial,
@@ -388,6 +947,7 @@ def load_posts_core_polars(
         raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
     
     _log(f"Found {len(paths)} posts parquet files")
+    log_memory_checkpoint("posts_before_scan", logger)
     
     # Scan posts with time filter
     posts_lf = pl.scan_parquet(paths)
@@ -406,6 +966,7 @@ def load_posts_core_polars(
     posts_df = posts_lf.collect()
     n_posts_total = len(posts_df)
     _log(f"Scanned {n_posts_total:,} posts in time window")
+    log_memory_checkpoint("posts_after_collect", logger)
     
     stats = {
         'n_posts_total': n_posts_total,
@@ -450,6 +1011,7 @@ def load_posts_core_polars(
     n_combined = len(posts_combined)
     _log(f"posts_core: {n_combined:,} rows ({n_liked_posts:,} liked + {stats['n_negative_sample']:,} negative)")
     stats['n_posts_core'] = n_combined
+    log_memory_checkpoint("posts_after_combine", logger)
     
     return posts_combined, stats
 
@@ -480,6 +1042,7 @@ def expand_embeddings_polars(
     
     # Convert to pandas for embedding extraction (complex nested structure)
     _log("Expanding embeddings column...")
+    log_memory_checkpoint("embeddings_before_expand", logger)
     pdf = posts_df.to_pandas()
     
     # Find embedding dimension from first valid example
@@ -532,6 +1095,7 @@ def expand_embeddings_polars(
     
     # Convert back to polars
     result_df = pl.from_pandas(pdf)
+    log_memory_checkpoint("embeddings_after_expand", logger)
     
     return result_df, embed_dim
 
@@ -1422,6 +1986,10 @@ __all__ = [
     'parse_one_ts',
     # Data IO Green Earth Ingex GCS
     'load_raw_data_ingex',
+    # Stage 1: Memory safety checks and tracking
+    'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
+    'estimate_parquet_memory', 'estimate_filtered_data_memory',
+    'check_memory_available', 'check_data_load_safe',
     # Stage 1: Polars-based filtering for core datasets
     'load_likes_core_polars', 'load_posts_core_polars', 'expand_embeddings_polars',
     # Data IO Digital Ocean
