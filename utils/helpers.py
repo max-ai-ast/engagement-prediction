@@ -510,9 +510,14 @@ def estimate_filtered_data_memory(
     
     # === Estimate filtered data sizes ===
     
-    # Estimate unique users from raw data (heuristic: ~20 likes per user based on observed data)
-    avg_likes_per_user_estimate = 20
-    estimated_raw_users = max(1, raw_likes_rows // avg_likes_per_user_estimate)
+    # Estimate unique users from raw data
+    # Observed: ~47 likes per user on average in typical time windows
+    avg_likes_per_user_observed = 47
+    estimated_raw_users = max(1, raw_likes_rows // avg_likes_per_user_observed)
+    
+    # Calculate actual average likes per user in THIS time window
+    # This properly captures the time dimension of the data
+    avg_likes_per_user_in_window = raw_likes_rows / max(estimated_raw_users, 1)
     
     # Apply user cap
     if max_liking_users > 0:
@@ -520,15 +525,25 @@ def estimate_filtered_data_memory(
     else:
         estimated_users = estimated_raw_users
     
-    # Estimate likes after filtering (users * max_likes, capped by raw)
-    estimated_likes = min(estimated_users * max_likes_per_user, raw_likes_rows)
+    # Estimate likes after filtering:
+    # 1. Sampled users have avg_likes_per_user_in_window likes on average
+    # 2. Per-user cap limits high-frequency users
+    # 3. Min-likes filter removes low-frequency users (~5%)
     
-    # Estimate liked posts more accurately:
-    # - Each like references a post, but there's overlap (same post liked by multiple users)
-    # - Observed: with 1M likes we get ~500K unique post URIs (~50% unique)
-    # - Then match rate against posts in time window is ~60-70%
-    unique_liked_uris_estimate = int(estimated_likes * 0.5)  # ~50% of likes are unique posts
-    liked_post_match_rate = 0.65  # ~65% of liked URIs match posts in time window
+    # Expected likes per sampled user (capped at max_likes_per_user)
+    # Use min of actual average and the cap
+    expected_likes_per_user = min(avg_likes_per_user_in_window, max_likes_per_user)
+    
+    # Apply min-likes filter reduction (~5% of users filtered, ~10% of their likes)
+    min_likes_filter_retention = 0.95
+    
+    estimated_likes = int(estimated_users * expected_likes_per_user * min_likes_filter_retention)
+    
+    # Estimate liked posts:
+    # - ~50% of likes are unique posts (same post liked by multiple users)
+    # - ~75% of liked URIs match posts in the time window (observed)
+    unique_liked_uris_estimate = int(estimated_likes * 0.5)
+    liked_post_match_rate = 0.75
     estimated_liked_posts = min(int(unique_liked_uris_estimate * liked_post_match_rate), raw_posts_rows)
     
     # Total posts = liked posts + negative sample
@@ -538,15 +553,18 @@ def estimate_filtered_data_memory(
     
     # Bytes per row estimates (in-memory representation)
     # - Likes: simple struct with strings
-    # - Posts raw: includes base85-encoded embedding blob that expands ~3x in memory
-    # - Posts expanded: slim representation after embedding expansion drops the blob
+    # - Posts raw: includes base85-encoded embedding blob that expands significantly in memory
+    # - Posts expanded: keeps all columns but replaces blob with 384 float32s
     likes_bytes_per_row = 200   # did (string ~80) + subject_uri (string ~80) + timestamp (8) + overhead
     
     # Estimate actual per-row bytes from parquet metadata + expansion factor
-    # Parquet is compressed; in-memory representation is ~3-5x larger
+    # Parquet is compressed; in-memory representation is ~4x larger
     posts_bytes_per_row_parquet = posts_raw['estimated_bytes'] / max(raw_posts_rows, 1)
-    posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)  # ~4x expansion for in-memory
-    posts_bytes_per_row_expanded = 2_000 + (embedding_dim * 4)  # ~2KB base + expanded embeddings (~1.5KB)
+    posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)
+    
+    # Expanded posts still have all original columns (text, author, URIs, timestamps)
+    # Observed: ~31KB per post after expansion (embeddings are only ~1.5KB of that)
+    posts_bytes_per_row_expanded = 32_000  # ~31KB observed from actual runs
     
     # Component 1: User set during likes processing (strings in memory)
     user_set_bytes = estimated_raw_users * 80  # ~80 bytes per DID string in set
@@ -607,6 +625,8 @@ def estimate_filtered_data_memory(
         # Estimated users
         'estimated_raw_users': estimated_raw_users,
         'estimated_filtered_users': estimated_users,
+        'avg_likes_per_user_in_window': avg_likes_per_user_in_window,
+        'expected_likes_per_user': expected_likes_per_user,
         # Estimated filtered data
         'estimated_likes_rows': estimated_likes,
         'estimated_liked_posts': estimated_liked_posts,
@@ -640,9 +660,10 @@ def estimate_filtered_data_memory(
     
     _log("Memory estimation (batch processing with early embedding expansion):")
     _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
-    _log(f"  Batch size: {actual_posts_batch} files, {posts_batch_rows:,} posts/batch ({posts_bytes_per_row_raw/1024:.1f}KB raw -> {posts_bytes_per_row_expanded/1024:.1f}KB expanded)")
+    _log(f"  Avg likes/user in window: {avg_likes_per_user_in_window:.1f} (capped at {max_likes_per_user})")
     _log(f"  Est. users: {estimated_raw_users:,} raw -> {estimated_users:,} after cap")
     _log(f"  Est. output: {estimated_likes:,} likes, {estimated_liked_posts:,} liked posts + {min(negative_posts_sample, raw_posts_rows):,} negative = {estimated_posts:,} total posts")
+    _log(f"  Batch size: {actual_posts_batch} files, {posts_batch_rows:,} posts/batch ({posts_bytes_per_row_expanded/1024:.1f}KB/post expanded)")
     _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, final={result['phase_3_final_gb']:.2f}GB")
     _log(f"  Estimated peak: {result['estimated_peak_gb']:.2f} GB")
     
