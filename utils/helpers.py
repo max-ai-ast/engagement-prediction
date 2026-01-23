@@ -516,7 +516,6 @@ def estimate_filtered_data_memory(
     estimated_raw_users = max(1, raw_likes_rows // avg_likes_per_user_observed)
     
     # Calculate actual average likes per user in THIS time window
-    # This properly captures the time dimension of the data
     avg_likes_per_user_in_window = raw_likes_rows / max(estimated_raw_users, 1)
     
     # Apply user cap
@@ -525,52 +524,60 @@ def estimate_filtered_data_memory(
     else:
         estimated_users = estimated_raw_users
     
-    # Estimate likes after filtering:
-    # 1. Sampled users have avg_likes_per_user_in_window likes on average
-    # 2. Per-user cap limits high-frequency users
-    # 3. Min-likes filter removes low-frequency users (~5%)
+    # IMPORTANT: Memory estimation should focus on INTERMEDIATE sizes during processing,
+    # not final filtered output. The key insight from observations:
+    #
+    # Likes processing:
+    # - Pass 1: Scan all files to collect user DIDs (memory: user set ~200MB)
+    # - Pass 2: Collect ALL likes for sampled users before per-user cap/min-likes filter
+    #   -> This is proportional to (sampled_users / total_users) × raw_likes
+    #   -> These likes are stored in chunks with significant overhead (~4KB/row)
+    #
+    # Posts processing:
+    # - Batch through files, extracting liked posts + reservoir sampling negatives
+    # - Final output is relatively small (liked posts + negative sample)
     
-    # Expected likes per sampled user (capped at max_likes_per_user)
-    # Use min of actual average and the cap
+    # Calculate INTERMEDIATE likes (before per-user cap and min-likes filter)
+    # This is what actually consumes memory during Pass 2
+    user_sampling_ratio = estimated_users / max(estimated_raw_users, 1)
+    intermediate_likes = int(raw_likes_rows * user_sampling_ratio)
+    
+    # Estimate final likes after filtering (for output size)
+    # Per-user cap: users with > max_likes_per_user get truncated
+    # Min-likes filter: users with < min_likes_per_user get removed
+    # Observed: very aggressive filtering, especially with power-law distributions
     expected_likes_per_user = min(avg_likes_per_user_in_window, max_likes_per_user)
+    estimated_likes = int(estimated_users * expected_likes_per_user * 0.95)  # 5% loss to min-likes
     
-    # Apply min-likes filter reduction (~5% of users filtered, ~10% of their likes)
-    min_likes_filter_retention = 0.95
-    
-    estimated_likes = int(estimated_users * expected_likes_per_user * min_likes_filter_retention)
-    
-    # Estimate liked posts:
-    # - ~50% of likes are unique posts (same post liked by multiple users)
-    # - ~75% of liked URIs match posts in the time window (observed)
+    # Estimate liked posts for final output
     unique_liked_uris_estimate = int(estimated_likes * 0.5)
     liked_post_match_rate = 0.75
     estimated_liked_posts = min(int(unique_liked_uris_estimate * liked_post_match_rate), raw_posts_rows)
     
-    # Total posts = liked posts + negative sample
+    # Total posts = liked posts + negative sample (this is final output)
     estimated_posts = estimated_liked_posts + min(negative_posts_sample, raw_posts_rows)
     
     # === Memory estimation with incremental processing ===
     
     # Bytes per row estimates (in-memory representation)
-    # - Likes: simple struct with strings
-    # - Posts raw: includes base85-encoded embedding blob that expands significantly in memory
-    # - Posts expanded: keeps all columns but replaces blob with 384 float32s
-    likes_bytes_per_row = 200   # did (string ~80) + subject_uri (string ~80) + timestamp (8) + overhead
+    # IMPORTANT: These are based on observed actual memory usage, not theoretical sizes
     
-    # Estimate actual per-row bytes from parquet metadata + expansion factor
-    # Parquet is compressed; in-memory representation is ~4x larger
+    # Likes during chunk accumulation have significant overhead (~4KB per row observed)
+    # This includes Polars DataFrame overhead per chunk, string storage, etc.
+    likes_bytes_per_row_intermediate = 4000  # During Pass 2 chunk accumulation
+    likes_bytes_per_row_final = 200  # After combining into single DataFrame
+    
+    # Posts: use parquet metadata to estimate, with 4x expansion for in-memory
     posts_bytes_per_row_parquet = posts_raw['estimated_bytes'] / max(raw_posts_rows, 1)
     posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)
     
-    # Expanded posts still have all original columns (text, author, URIs, timestamps)
-    # Observed: ~31KB per post after expansion (embeddings are only ~1.5KB of that)
-    posts_bytes_per_row_expanded = 32_000  # ~31KB observed from actual runs
+    # Expanded posts: ~31KB per post observed (text, author, embeddings as float32s, etc.)
+    posts_bytes_per_row_expanded = 32_000
     
-    # Component 1: User set during likes processing (strings in memory)
+    # Component 1: User set during Pass 1 (strings in memory)
     user_set_bytes = estimated_raw_users * 80  # ~80 bytes per DID string in set
     
     # Component 2: Working memory per batch of files
-    # We process files in batches, capped at actual file count
     batch_size = 20  # Files per batch
     actual_likes_batch = min(batch_size, n_likes_files)
     actual_posts_batch = min(batch_size, n_posts_files)
@@ -581,35 +588,47 @@ def estimate_filtered_data_memory(
     likes_batch_rows = int(avg_likes_per_file * actual_likes_batch)
     posts_batch_rows = int(avg_posts_per_file * actual_posts_batch)
     
-    likes_batch_bytes = int(likes_batch_rows * likes_bytes_per_row * 1.5)  # 1.5x for Polars overhead
+    likes_batch_bytes = int(likes_batch_rows * likes_bytes_per_row_intermediate * 1.5)
     posts_batch_bytes = int(posts_batch_rows * posts_bytes_per_row_raw * 1.5)
     
-    # Component 3: Output data (filtered results)
-    likes_output_bytes = int(estimated_likes * likes_bytes_per_row)
-    # After early expansion, posts are stored with expanded embeddings (much smaller)
+    # Component 3: Intermediate likes storage during Pass 2
+    # This is the BIG memory consumer - we accumulate ALL likes for sampled users
+    # before filtering, and each chunk has significant overhead
+    likes_intermediate_bytes = int(intermediate_likes * likes_bytes_per_row_intermediate)
+    
+    # Component 4: Final output data (after filtering)
+    likes_output_bytes = int(estimated_likes * likes_bytes_per_row_final)
     posts_output_bytes = int(estimated_posts * posts_bytes_per_row_expanded)
     
-    # Component 4: Negative reservoir (with expanded embeddings after early expansion)
-    negative_reservoir_bytes = int(negative_posts_sample * posts_bytes_per_row_expanded)
+    # Component 5: Negative reservoir (100k posts with expanded embeddings)
+    negative_reservoir_bytes = int(min(negative_posts_sample, raw_posts_rows) * posts_bytes_per_row_expanded)
     
-    # Component 5: Embedding expansion working memory (per-batch, not full dataset)
-    # With early expansion, we only expand one batch at a time
-    # Working memory = raw batch + expanded batch (temporary duplication)
-    expansion_working_bytes = int(posts_batch_rows * (posts_bytes_per_row_raw + posts_bytes_per_row_expanded) * 1.5)
+    # Phase 1: Likes loading (Pass 1 + Pass 2)
+    # - Pass 1: user_set_bytes (scanning for unique users)
+    # - Pass 2: accumulating all likes for sampled users in chunks
+    # Peak is at end of Pass 2 when all intermediate likes are in memory
+    phase_1_likes = user_set_bytes + likes_intermediate_bytes
     
-    # Peak memory during different phases (with early expansion optimization)
-    phase_1_likes = user_set_bytes + likes_batch_bytes + likes_output_bytes
-    # Phase 2: batch loading + accumulated expanded posts + reservoir
-    phase_2_posts = (likes_output_bytes + posts_batch_bytes + 
-                     posts_output_bytes + negative_reservoir_bytes + expansion_working_bytes)
-    # Phase 3: final output (already expanded during loading)
+    # Phase 2: Posts loading with early expansion
+    # After likes processing, we have ~likes_intermediate_bytes still in memory
+    # (not freed until GC), plus we're accumulating:
+    # - Liked posts (small: ~estimated_liked_posts × 32KB)
+    # - Negative reservoir (capped at negative_posts_sample × 32KB)
+    # - One raw batch being processed
+    phase_2_posts = (likes_intermediate_bytes +  # Likes still in memory
+                     posts_batch_bytes +          # Current batch being processed
+                     negative_reservoir_bytes)    # Negative sample (expanded)
+    
+    # Phase 3: Final output (likes filtered, posts combined)
+    # Most intermediate likes memory should be freed at this point
     phase_3_final = likes_output_bytes + posts_output_bytes
     
     peak_bytes = max(phase_1_likes, phase_2_posts, phase_3_final)
     
     # Add Python/Polars baseline overhead (~0.7 GB typical for this pipeline)
+    # Use a modest 10% buffer since our estimates are now based on observed behavior
     baseline_overhead_bytes = int(0.7 * (1024**3))
-    peak_bytes = int(peak_bytes * 1.2) + baseline_overhead_bytes  # 20% buffer
+    peak_bytes = int(peak_bytes * 1.1) + baseline_overhead_bytes  # 10% buffer
     
     result = {
         # Raw data stats
@@ -620,25 +639,26 @@ def estimate_filtered_data_memory(
         'n_likes_files': n_likes_files,
         'n_posts_files': n_posts_files,
         # Per-row estimates (KB)
-        'posts_bytes_per_row_raw_kb': posts_bytes_per_row_raw / 1024,
+        'likes_bytes_per_row_intermediate_kb': likes_bytes_per_row_intermediate / 1024,
         'posts_bytes_per_row_expanded_kb': posts_bytes_per_row_expanded / 1024,
         # Estimated users
         'estimated_raw_users': estimated_raw_users,
         'estimated_filtered_users': estimated_users,
         'avg_likes_per_user_in_window': avg_likes_per_user_in_window,
-        'expected_likes_per_user': expected_likes_per_user,
-        # Estimated filtered data
-        'estimated_likes_rows': estimated_likes,
+        'user_sampling_ratio': user_sampling_ratio,
+        # Estimated data sizes
+        'intermediate_likes': intermediate_likes,  # Before per-user cap/min-likes filter
+        'estimated_likes_rows': estimated_likes,   # After filtering (final output)
         'estimated_liked_posts': estimated_liked_posts,
         'estimated_negative_posts': min(negative_posts_sample, raw_posts_rows),
         'estimated_total_posts': estimated_posts,
         # Memory breakdown (GB)
         'mem_user_set_gb': user_set_bytes / (1024**3),
-        'mem_likes_batch_gb': likes_batch_bytes / (1024**3),
+        'mem_likes_intermediate_gb': likes_intermediate_bytes / (1024**3),
         'mem_posts_batch_gb': posts_batch_bytes / (1024**3),
+        'mem_negative_reservoir_gb': negative_reservoir_bytes / (1024**3),
         'mem_likes_output_gb': likes_output_bytes / (1024**3),
         'mem_posts_output_gb': posts_output_bytes / (1024**3),
-        'mem_expansion_working_gb': expansion_working_bytes / (1024**3),
         # Phase peaks
         'phase_1_likes_gb': phase_1_likes / (1024**3),
         'phase_2_posts_gb': phase_2_posts / (1024**3),
@@ -660,10 +680,9 @@ def estimate_filtered_data_memory(
     
     _log("Memory estimation (batch processing with early embedding expansion):")
     _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
-    _log(f"  Avg likes/user in window: {avg_likes_per_user_in_window:.1f} (capped at {max_likes_per_user})")
-    _log(f"  Est. users: {estimated_raw_users:,} raw -> {estimated_users:,} after cap")
-    _log(f"  Est. output: {estimated_likes:,} likes, {estimated_liked_posts:,} liked posts + {min(negative_posts_sample, raw_posts_rows):,} negative = {estimated_posts:,} total posts")
-    _log(f"  Batch size: {actual_posts_batch} files, {posts_batch_rows:,} posts/batch ({posts_bytes_per_row_expanded/1024:.1f}KB/post expanded)")
+    _log(f"  User sampling: {estimated_users:,} / {estimated_raw_users:,} users ({user_sampling_ratio*100:.1f}%)")
+    _log(f"  Intermediate likes (before cap/filter): {intermediate_likes:,} ({likes_bytes_per_row_intermediate/1024:.1f}KB/row)")
+    _log(f"  Negative reservoir: {min(negative_posts_sample, raw_posts_rows):,} posts ({posts_bytes_per_row_expanded/1024:.1f}KB/post)")
     _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, final={result['phase_3_final_gb']:.2f}GB")
     _log(f"  Estimated peak: {result['estimated_peak_gb']:.2f} GB")
     
