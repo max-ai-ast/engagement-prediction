@@ -1,0 +1,85 @@
+# Data Sweep Configuration
+# ========================
+# This config defines a hyperparameter sweep to understand how data filtering
+# parameters affect N (sample sizes) and memory consumption.
+#
+# Usage:
+#   python scripts/run_data_sweep.py --config configs/data_sweep.yml
+#   python scripts/run_data_sweep.py --config configs/data_sweep.yml --dry-run
+#
+# The sweep runs Stage 1 (get_data) only, measuring attrition and memory.
+
+sweep:
+  name: "data_filtering_sweep"
+  description: "Measure N and memory impact of data filtering hyperparameters"
+  
+  # ClearML project for all sweep experiments
+  project: "Engagement Prediction"
+  
+  # Tags applied to all experiments in this sweep
+  tags:
+    - "data-sweep"
+    - "memory-analysis"
+    - "attrition-analysis"
+
+# Fixed parameters for all experiments
+fixed:
+  data_source: "greenearth"
+  gcs_bucket: "greenearth-471522-ingex-extract-stage"
+  
+  # Fixed start dates (likes and posts aligned)
+  posts_start: "2026-01-01"
+  likes_start: "2026-01-01"
+  
+  # Other fixed params
+  min_likes_per_user: 2
+  cap_random_seed: 42
+  embedding_model: "all_MiniLM_L6_v2"
+  
+  # Memory check: skip enforcement but still estimate
+  # This lets us see actual memory usage vs estimates
+  skip_memory_check: true
+  
+  # Only run Stage 1 to measure data filtering effects
+  stop_after: "get_data"
+
+# Parameters to sweep (grid search over all combinations)
+sweep_params:
+  # End dates: 7, 14, 21 days from Jan 1st
+  # (both posts_end and likes_end will be set to these values)
+  data_window_days:
+    - 7    # 2026-01-08
+    - 14   # 2026-01-15
+    - 21   # 2026-01-22
+  
+  # Number of users to sample
+  max_liking_users:
+    - 10000
+    - 50000
+    - 100000
+    - 250000
+  
+  # Likes per user cap
+  max_likes_per_user:
+    - 100
+    - 500
+  
+  # Negative posts sample size
+  negative_posts_sample:
+    - 10000
+    - 50000
+    - 100000
+
+# Execution settings
+execution:
+  # Run experiments sequentially (one at a time)
+  mode: "sequential"
+  
+  # Delay between experiments (seconds) - allows memory to settle
+  delay_between_runs: 10
+  
+  # Continue on failure (skip failed experiments, continue sweep)
+  continue_on_failure: true
+  
+  # Output directory for sweep results
+  output_base: "outputs/sweeps"

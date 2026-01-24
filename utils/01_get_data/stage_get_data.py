@@ -268,22 +268,138 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     with open(out_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
 
-    # Log to experiment tracker
+    # Log to experiment tracker - comprehensive metrics for sweep analysis
     n_likes = len(likes_core_df)
     n_posts = len(posts_core_df)
+    
+    # Primary outputs
     context.tracker.log_single_value(name="get_data/n_likes_core", value=n_likes)
     context.tracker.log_single_value(name="get_data/n_posts_core", value=n_posts)
     context.tracker.log_single_value(name="get_data/embedding_dim", value=embed_dim)
     
+    # Likes pipeline attrition metrics
     if 'likes' in all_stats:
+        likes_stats = all_stats['likes']
+        
+        # Initial counts
         context.tracker.log_single_value(
             name="get_data/n_users_initial", 
-            value=all_stats['likes'].get('n_users_initial', 0)
+            value=likes_stats.get('n_users_initial', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_users_final", 
-            value=all_stats['likes'].get('n_users_final', 0)
+            name="get_data/n_likes_initial", 
+            value=likes_stats.get('n_likes_initial', 0)
         )
+        
+        # After each filtering stage
+        context.tracker.log_single_value(
+            name="get_data/n_users_eligible",
+            value=likes_stats.get('n_users_eligible_for_sampling', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_users_sampled",
+            value=likes_stats.get('n_users_sampled', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_likes_after_user_sample",
+            value=likes_stats.get('n_likes_after_user_sample', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_likes_after_cap",
+            value=likes_stats.get('n_likes_after_per_user_cap', 0)
+        )
+        
+        # Final counts (before and after join)
+        context.tracker.log_single_value(
+            name="get_data/n_users_final", 
+            value=likes_stats.get('n_users_final', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_likes_final",
+            value=likes_stats.get('n_likes_final', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_users_final_after_join",
+            value=likes_stats.get('n_users_final_after_join', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_likes_final_after_join",
+            value=likes_stats.get('n_likes_final_after_join', 0)
+        )
+        
+        # Attrition percentages (for easy comparison)
+        n_users_initial = likes_stats.get('n_users_initial', 0)
+        n_users_final = likes_stats.get('n_users_final_after_join', 0)
+        n_likes_initial = likes_stats.get('n_likes_initial', 0)
+        n_likes_final = likes_stats.get('n_likes_final_after_join', 0)
+        
+        if n_users_initial > 0:
+            context.tracker.log_single_value(
+                name="get_data/user_retention_pct",
+                value=100.0 * n_users_final / n_users_initial
+            )
+        if n_likes_initial > 0:
+            context.tracker.log_single_value(
+                name="get_data/likes_retention_pct",
+                value=100.0 * n_likes_final / n_likes_initial
+            )
+    
+    # Posts pipeline metrics
+    if 'posts' in all_stats:
+        posts_stats = all_stats['posts']
+        context.tracker.log_single_value(
+            name="get_data/n_posts_total",
+            value=posts_stats.get('n_posts_total', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_liked_posts",
+            value=posts_stats.get('n_liked_posts', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/n_random_sample",
+            value=posts_stats.get('n_random_sample', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/liked_post_match_rate",
+            value=posts_stats.get('liked_post_match_rate', 0)
+        )
+    
+    # Memory metrics (critical for sweep analysis)
+    if 'memory_actual' in all_stats:
+        mem_stats = all_stats['memory_actual']
+        context.tracker.log_single_value(
+            name="get_data/memory_peak_gb",
+            value=mem_stats.get('peak_process_gb', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/memory_start_gb",
+            value=mem_stats.get('start_process_gb', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/memory_end_gb",
+            value=mem_stats.get('end_process_gb', 0)
+        )
+        context.tracker.log_single_value(
+            name="get_data/memory_growth_gb",
+            value=mem_stats.get('growth_gb', 0)
+        )
+    
+    # Memory estimate vs actual (for estimator accuracy tracking)
+    if 'memory_estimate' in all_stats:
+        est_stats = all_stats['memory_estimate']
+        context.tracker.log_single_value(
+            name="get_data/memory_estimated_peak_gb",
+            value=est_stats.get('estimated_peak_gb', 0)
+        )
+        
+        # Estimation accuracy
+        actual_peak = all_stats.get('memory_actual', {}).get('peak_process_gb', 0)
+        estimated_peak = est_stats.get('estimated_peak_gb', 0)
+        if estimated_peak > 0:
+            context.tracker.log_single_value(
+                name="get_data/memory_estimate_accuracy_pct",
+                value=100.0 * actual_peak / estimated_peak
+            )
 
     runtime = time.time() - t0
     
