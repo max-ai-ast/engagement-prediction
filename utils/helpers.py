@@ -515,13 +515,30 @@ def sample_bytes_per_row(
         for path in sample_paths:
             df = pl.read_parquet(path)
             
-            if expand_embeddings and 'embeddings' in df.columns:
+            if expand_embeddings and 'embeddings' in df.columns and len(df) > 0:
                 # Expand embedding column to match actual processing
-                # This mirrors what happens in the actual data loading
-                df = df.with_columns([
-                    pl.col('embeddings').list.get(i).alias(f'emb_{i}')
-                    for i in range(embedding_dim)
-                ]).drop('embeddings')
+                # First, detect the actual embedding dimension from the data
+                # (don't assume embedding_dim - it might differ from actual data)
+                try:
+                    # Get the first non-null embedding to determine actual dimension
+                    first_embedding = df.filter(pl.col('embeddings').is_not_null()).select('embeddings').head(1)
+                    if len(first_embedding) > 0:
+                        actual_dim = len(first_embedding['embeddings'][0])
+                        # Use the smaller of actual_dim and embedding_dim to avoid out-of-bounds
+                        dim_to_use = min(actual_dim, embedding_dim) if actual_dim > 0 else 0
+                        
+                        if dim_to_use > 0:
+                            df = df.with_columns([
+                                pl.col('embeddings').list.get(i).alias(f'emb_{i}')
+                                for i in range(dim_to_use)
+                            ]).drop('embeddings')
+                except Exception as embed_err:
+                    # If embedding expansion fails, just drop the column and continue
+                    # The memory estimate will be slightly off but still useful
+                    if logger:
+                        logger.debug(f"Could not expand embeddings during sampling: {embed_err}")
+                    if 'embeddings' in df.columns:
+                        df = df.drop('embeddings')
             
             total_rows += len(df)
             dfs.append(df)

@@ -55,22 +55,56 @@ def load_sweep_config(config_path: str) -> Dict[str, Any]:
         config = yaml.safe_load(f)
     
     # Validate required sections
-    required = ['sweep', 'fixed', 'sweep_params']
-    for section in required:
-        if section not in config:
-            raise ValueError(f"Config missing required section: {section}")
+    if 'sweep' not in config:
+        raise ValueError("Config missing required section: sweep")
+    if 'fixed' not in config:
+        raise ValueError("Config missing required section: fixed")
+    
+    # Must have either sweep_params (grid search) or experiments (explicit list)
+    if 'sweep_params' not in config and 'experiments' not in config:
+        raise ValueError("Config must have either 'sweep_params' (grid search) or 'experiments' (explicit list)")
     
     return config
 
 
-def generate_experiment_grid(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Generate all parameter combinations from the sweep config."""
-    sweep_params = config['sweep_params'].copy()  # Don't mutate original
+def generate_experiment_grid(config: Dict[str, Any]) -> List[tuple]:
+    """
+    Generate experiments from the sweep config.
+    
+    Supports two modes:
+    1. Grid search: 'sweep_params' defines parameter grid (all combinations)
+    2. Explicit list: 'experiments' defines ordered list of specific experiments
+    
+    Returns:
+        List of (experiment_name, params_dict) tuples
+    """
     fixed_params = config.get('fixed', {})
     
+    # Mode 2: Explicit experiment list (preserves order, allows custom names)
+    if 'experiments' in config:
+        experiments = []
+        for exp_def in config['experiments']:
+            exp_name = exp_def.get('name', f"exp_{len(experiments)+1:03d}")
+            exp_params = dict(fixed_params)
+            exp_params.update(exp_def.get('params', {}))
+            
+            # Handle data_window_days -> posts_end, likes_end conversion
+            if 'data_window_days' in exp_params:
+                days = exp_params.pop('data_window_days')
+                start_date_str = fixed_params.get('posts_start', '2026-01-01')
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+                end_date = start_date + timedelta(days=days)
+                end_date_str = end_date.strftime('%Y-%m-%d')
+                exp_params['posts_end'] = end_date_str
+                exp_params['likes_end'] = end_date_str
+            
+            experiments.append((exp_name, exp_params))
+        return experiments
+    
+    # Mode 1: Grid search over sweep_params
+    sweep_params = config.get('sweep_params', {}).copy()
+    
     # Handle special case: data_window_days -> posts_end, likes_end (ALIGNED)
-    # This is a "coupled" parameter where both posts_end and likes_end 
-    # should be set to the same value for each experiment
     data_window_days = sweep_params.pop('data_window_days', None)
     
     # Generate all combinations of independent parameters
@@ -78,13 +112,12 @@ def generate_experiment_grid(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     param_values = [sweep_params[name] for name in param_names]
     
     experiments = []
+    index = 1
     
     if data_window_days:
-        # Convert days to end dates based on start date
         start_date_str = fixed_params.get('posts_start', '2026-01-01')
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
         
-        # For each data window, generate all combinations of other params
         for days in data_window_days:
             end_date = start_date + timedelta(days=days)
             end_date_str = end_date.strftime('%Y-%m-%d')
@@ -94,23 +127,26 @@ def generate_experiment_grid(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     exp_params = dict(fixed_params)
                     for name, value in zip(param_names, values):
                         exp_params[name] = value
-                    # Set BOTH posts_end and likes_end to the same value
                     exp_params['posts_end'] = end_date_str
                     exp_params['likes_end'] = end_date_str
-                    experiments.append(exp_params)
+                    exp_name = generate_experiment_name(exp_params, index)
+                    experiments.append((exp_name, exp_params))
+                    index += 1
             else:
-                # Only data_window_days is being swept
                 exp_params = dict(fixed_params)
                 exp_params['posts_end'] = end_date_str
                 exp_params['likes_end'] = end_date_str
-                experiments.append(exp_params)
+                exp_name = generate_experiment_name(exp_params, index)
+                experiments.append((exp_name, exp_params))
+                index += 1
     else:
-        # No data_window_days, just sweep other params
         for values in itertools.product(*param_values):
             exp_params = dict(fixed_params)
             for name, value in zip(param_names, values):
                 exp_params[name] = value
-            experiments.append(exp_params)
+            exp_name = generate_experiment_name(exp_params, index)
+            experiments.append((exp_name, exp_params))
+            index += 1
     
     return experiments
 
@@ -122,6 +158,7 @@ def generate_experiment_name(params: Dict[str, Any], index: int) -> str:
     max_users = params.get('max_liking_users', 0)
     max_likes = params.get('max_likes_per_user', 0)
     neg_sample = params.get('negative_posts_sample', 0)
+    min_likes = params.get('min_likes_per_user', 2)
     
     # Calculate days from start
     posts_start = params.get('posts_start', '2026-01-01')
@@ -132,7 +169,10 @@ def generate_experiment_name(params: Dict[str, Any], index: int) -> str:
     except (ValueError, TypeError):
         days = '?'
     
-    return f"sweep_{index:03d}_days{days}_users{max_users//1000}k_likes{max_likes}_neg{neg_sample//1000}k"
+    # Include min_likes in name if not default (2)
+    min_likes_suffix = f"_min{min_likes}" if min_likes != 2 else ""
+    
+    return f"sweep_{index:03d}_days{days}_users{max_users//1000}k_likes{max_likes}_neg{neg_sample//1000}k{min_likes_suffix}"
 
 
 def build_cli_args(params: Dict[str, Any], experiment_name: str, tags: List[str]) -> List[str]:
@@ -248,7 +288,7 @@ def run_sweep(
     continue_on_failure = execution.get('continue_on_failure', True)
     output_base = Path(execution.get('output_base', 'outputs/sweeps'))
     
-    # Generate experiment grid
+    # Generate experiment list (returns list of (name, params) tuples)
     experiments = generate_experiment_grid(config)
     
     print(f"\n{'#'*60}")
@@ -278,9 +318,7 @@ def run_sweep(
     
     results = []
     
-    for i, exp_params in enumerate(experiments):
-        exp_name = generate_experiment_name(exp_params, i + 1)
-        
+    for i, (exp_name, exp_params) in enumerate(experiments):
         # Skip if already completed
         if exp_name in completed_names:
             print(f"\n[SKIP] {exp_name} (already completed)")

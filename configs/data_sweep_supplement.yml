@@ -1,0 +1,146 @@
+# Supplementary Data Sweep Configuration
+# ======================================
+# Minimal supplement to the main sweep, adding only high-value data points:
+#
+# 1. Larger max_liking_users (500k) - critical for understanding scaling
+# 2. One intermediate point (150k) - improves curve fitting between 100k-250k
+# 3. Larger max_likes_per_user (1000) - tests if this parameter matters at scale
+#
+# Experiments ordered SAFEST to RISKIEST (smallest to largest memory footprint).
+#
+# Main sweep: 72 experiments
+# Supplement: 12 experiments  
+# Total: 84 data points
+#
+# Usage:
+#   python scripts/run_data_sweep.py --config configs/data_sweep_supplement.yml --dry-run
+#   python scripts/run_data_sweep.py --config configs/data_sweep_supplement.yml
+
+sweep:
+  name: "data_filtering_sweep_supplement"
+  description: "Targeted supplement for memory scaling analysis"
+  
+  project: "Engagement Prediction"
+  
+  tags:
+    - "data-sweep"
+    - "memory-analysis"
+    - "supplement"
+
+# Instead of grid search, define explicit experiments ordered safest→riskiest
+# This gives us precise control over execution order and parameter combinations
+
+experiments:
+  # ============================================================
+  # Group 1: 150k users (intermediate point, moderate risk)
+  # ============================================================
+  - name: "sup_01_150k_users_100_likes"
+    params:
+      data_window_days: 14
+      max_liking_users: 150000
+      max_likes_per_user: 100
+      negative_posts_sample: 50000
+  
+  - name: "sup_02_150k_users_500_likes"
+    params:
+      data_window_days: 14
+      max_liking_users: 150000
+      max_likes_per_user: 500
+      negative_posts_sample: 50000
+  
+  - name: "sup_03_150k_users_1000_likes"
+    params:
+      data_window_days: 14
+      max_liking_users: 150000
+      max_likes_per_user: 1000
+      negative_posts_sample: 50000
+
+  # ============================================================
+  # Group 2: 500k users with small likes cap (higher risk, bounded by cap)
+  # ============================================================
+  - name: "sup_04_500k_users_100_likes_7d"
+    params:
+      data_window_days: 7
+      max_liking_users: 500000
+      max_likes_per_user: 100
+      negative_posts_sample: 50000
+  
+  - name: "sup_05_500k_users_100_likes_14d"
+    params:
+      data_window_days: 14
+      max_liking_users: 500000
+      max_likes_per_user: 100
+      negative_posts_sample: 50000
+  
+  - name: "sup_06_500k_users_100_likes_21d"
+    params:
+      data_window_days: 21
+      max_liking_users: 500000
+      max_likes_per_user: 100
+      negative_posts_sample: 50000
+
+  # ============================================================
+  # Group 3: 500k users with medium likes cap (high risk)
+  # ============================================================
+  - name: "sup_07_500k_users_500_likes_7d"
+    params:
+      data_window_days: 7
+      max_liking_users: 500000
+      max_likes_per_user: 500
+      negative_posts_sample: 50000
+  
+  - name: "sup_08_500k_users_500_likes_14d"
+    params:
+      data_window_days: 14
+      max_liking_users: 500000
+      max_likes_per_user: 500
+      negative_posts_sample: 50000
+  
+  - name: "sup_09_500k_users_500_likes_21d"
+    params:
+      data_window_days: 21
+      max_liking_users: 500000
+      max_likes_per_user: 500
+      negative_posts_sample: 50000
+
+  # ============================================================
+  # Group 4: 500k users with large likes cap (highest risk)
+  # ============================================================
+  - name: "sup_10_500k_users_1000_likes_7d"
+    params:
+      data_window_days: 7
+      max_liking_users: 500000
+      max_likes_per_user: 1000
+      negative_posts_sample: 50000
+  
+  - name: "sup_11_500k_users_1000_likes_14d"
+    params:
+      data_window_days: 14
+      max_liking_users: 500000
+      max_likes_per_user: 1000
+      negative_posts_sample: 50000
+  
+  - name: "sup_12_500k_users_1000_likes_21d"
+    params:
+      data_window_days: 21
+      max_liking_users: 500000
+      max_likes_per_user: 1000
+      negative_posts_sample: 50000
+
+# Fixed parameters for all experiments
+fixed:
+  data_source: "greenearth"
+  gcs_bucket: "greenearth-471522-ingex-extract-stage"
+  posts_start: "2026-01-01"
+  likes_start: "2026-01-01"
+  min_likes_per_user: 2
+  cap_random_seed: 42
+  embedding_model: "all_MiniLM_L6_v2"
+  skip_memory_check: true
+  stop_after: "get_data"
+
+execution:
+  mode: "sequential"
+  delay_between_runs: 10
+  continue_on_failure: true
+  output_base: "outputs/sweeps"
