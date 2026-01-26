@@ -5,6 +5,7 @@ import polars as pl
 import pytest
 
 from utils.helpers import (
+    calc_time_weighted_exp_mov_avg,
     find_join_key,
     find_text_column,
     parse_one_ts,
@@ -136,3 +137,48 @@ def test_validate_dataframe_schema_rejects_unexpected_columns_when_strict_polars
 
     with pytest.raises(ValueError, match="Unexpected columns"):
         validate_dataframe_schema(df, schema, allow_extra_columns=False)
+
+
+def test_calc_time_weighted_exp_mov_avg_varied_steps_multiple_groups():
+    data = pl.DataFrame(
+        {
+            "user_id": ["u1", "u1", "u1", "u2", "u2", "u2"],
+            "ts": [
+                datetime(2024, 1, 1, 0, 0),
+                datetime(2024, 1, 1, 1, 0),
+                datetime(2024, 1, 1, 4, 0),
+                datetime(2024, 1, 1, 0, 0),
+                datetime(2024, 1, 1, 2, 0),
+                datetime(2024, 1, 1, 2, 30),
+            ],
+            "x": [10.0, 20.0, 30.0, 100.0, 50.0, 0.0],
+            "y": [1.0, 3.0, 5.0, 2.0, 4.0, 8.0],
+        }
+    ).lazy()
+
+    result = (
+        calc_time_weighted_exp_mov_avg(
+            data,
+            value_cols=["x", "y"],
+            group_cols=["user_id"],
+            time_col="ts",
+            tau_hours=2,
+        )
+        .collect()
+        .sort(["user_id"])
+    )
+
+    expected = pl.DataFrame(
+        {
+            "user_id": ["u1", "u2"],
+            # Pre-computed manual weights for tau=2h:
+            # u1,t1 dt: 1h, 3h -> weights [e^-2, (1-e^-0.5)e^-1.5, 1-e^-1.5]
+            # u2,t2 dt: 2h, 0.5h -> weights [e^-1.25, (1-e^-1)e^-0.25, 1-e^-0.25]
+            "weighted_x": [26.415345566149576, 53.265278996579745],
+            "weighted_y": [4.2830691132299155, 4.311787273994],
+        }
+    ).sort(["user_id"])
+
+    assert result["user_id"].to_list() == expected["user_id"].to_list()
+    assert result["weighted_x"].to_list() == pytest.approx(expected["weighted_x"].to_list())
+    assert result["weighted_y"].to_list() == pytest.approx(expected["weighted_y"].to_list())
