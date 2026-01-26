@@ -550,8 +550,55 @@ def get_actual_feature_columns(posts_emb_df: pd.DataFrame) -> Tuple[List[str], L
 
 
 # ----------------------------------------
-# User feature construction (mean/multi_centroid/topic_mixture)
+# User feature construction (mean/multi_centroid/topic_mixture/exp mov avg)
 # ----------------------------------------
+def calc_time_weighted_exp_mov_avg(
+    lf: pl.LazyFrame,
+    value_cols: list[str],
+    group_cols: list[str],
+    time_col: str,
+    tau_hours: int,
+) -> pl.LazyFrame:
+    """
+    Summarizes all value_cols with a time-weighted exponential moving average, grouped by group_cols.
+    https://en.wikipedia.org/wiki/Exponential_smoothing#Time_constant
+    Tau is the configurable time constant, in hours.
+    """
+    lf = (
+        lf
+        .sort(group_cols + [time_col])
+        .with_columns(
+            pl.col(time_col).shift().over(group_cols).alias("prev_ts")
+        )
+        .with_columns(
+            (pl.col(time_col) - pl.col("prev_ts"))
+            .dt.total_hours(fractional=True)
+            .alias("time_diff")
+        )
+        .with_columns(
+            (-pl.col("time_diff") / pl.lit(tau_hours)).exp().alias("one_minus_alpha_i")
+        )
+        .with_columns(
+            (pl.lit(1.0) - pl.col("one_minus_alpha_i")).fill_null(1.0).alias("alpha_i")
+        )
+        .with_columns(
+            pl.col("one_minus_alpha_i")
+            .shift(-1)
+            .cum_prod(reverse=True)
+            .over(group_cols)
+            .fill_null(1.0)
+            .alias("cumprod_one_minus_alpha")
+        )
+        .with_columns(
+            (pl.col("alpha_i") * pl.col("cumprod_one_minus_alpha")).alias("weight")
+        )
+    )
+    return lf.group_by(group_cols).agg([
+        (pl.col("weight") * pl.col(c)).sum().alias(f"weighted_{c}")
+        for c in value_cols
+    ])
+
+
 try:
     from sklearn.cluster import MiniBatchKMeans as _MBK  # type: ignore
 except Exception:  # pragma: no cover
