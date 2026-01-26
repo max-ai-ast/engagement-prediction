@@ -301,6 +301,14 @@ def load_and_combine_data_digital_ocean(datasets: Dict[str, List[Path]], drop_un
     return posts_df, likes_df, metadata_df
 
 
+def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
+    # Load the most recent *.parquet found in the given directory
+    candidates = sorted(prior_path.glob(f"{prefix}*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
+    return pl.scan_parquet(candidates[0])
+
+
 # ----------------------------------------
 # Join/text detection
 # ----------------------------------------

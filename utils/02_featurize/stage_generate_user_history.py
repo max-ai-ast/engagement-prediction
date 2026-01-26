@@ -18,15 +18,7 @@ import polars as pl
 import time
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
-from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema
-
-
-def _load_likes_core_lf_from_prior(prior_path: Path) -> pl.LazyFrame:
-    # Load the most recent likes_core_*.parquet found in the given directory
-    candidates = sorted(prior_path.glob('likes_core_*.parquet'), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError(f"No likes_core_*.parquet found under {prior_path}")
-    return pl.scan_parquet(candidates[0])
+from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior
 
 
 # TODO: Add an "end_window_lookback"?
@@ -109,7 +101,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     log_operation_start('Load raw data from prior stage', 'STAGE_02_FEATURIZE', logger)
     t0 = time.time()
-    likes_core_lf: pl.LazyFrame = _load_likes_core_lf_from_prior(prior_path)
+    likes_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_path, "likes_core_")
     validate_dataframe_schema(likes_core_lf, {"did": str, "inserted_at": pl.Datetime, "subject_uri": str})
 
     log_operation_start('Aggregate likes into user history store', 'STAGE_02_FEATURIZE', logger)
