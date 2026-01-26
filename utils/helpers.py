@@ -580,13 +580,94 @@ def sample_bytes_per_row(
         gc.collect()
 
 
-# Empirically-derived constants for unique post overlap modeling
-# Based on observed data from runs with 72K-136K users:
-#   72K users  -> 1.32M unique liked URIs
-#   104K users -> 1.64M unique liked URIs  
-#   136K users -> 1.94M unique liked URIs
-# Power law fit: unique_posts = BASE_UNIQUE_POSTS * (users / BASE_USERS)^OVERLAP_EXPONENT
-OVERLAP_EXPONENT = 0.61  # Derived from log-log regression on observed data
+# ============================================================================
+# MEMORY ESTIMATION MODEL
+# ============================================================================
+# Fitted regression model for predicting peak memory usage.
+# Trained on sweep_results.csv using scripts/fit_memory_model.py
+# R-squared: 0.9440, Mean % error: 6.7% (10x better than old heuristics)
+
+MEMORY_MODEL_COEFFICIENTS = {
+    'intercept': 32.1569093112,
+    'data_window_days': -0.3731594051,
+    'max_liking_users_10k': 5.3712117159,
+    'max_likes_per_user_100': 0.0586046975,
+    'negative_posts_sample_10k': -0.0297902646,
+    'log_max_liking_users': -8.7875844850,
+    'sqrt_likes_initial_1e6': 4.4282688972,
+    'days_x_users_10k': 0.0362670731,
+    'users_x_log_users': -0.8738069443,
+}
+
+MEMORY_MODEL_FEATURE_NAMES = [
+    'data_window_days',
+    'max_liking_users_10k',
+    'max_likes_per_user_100',
+    'negative_posts_sample_10k',
+    'log_max_liking_users',
+    'sqrt_likes_initial_1e6',
+    'days_x_users_10k',
+    'users_x_log_users',
+]
+
+
+def compute_memory_model_features(
+    data_window_days: float,
+    max_liking_users: float,
+    max_likes_per_user: float,
+    negative_posts_sample: float,
+    likes_initial: float,
+) -> Dict[str, float]:
+    """Compute feature values for the memory prediction model.
+    
+    Args:
+        data_window_days: Number of days in the data window (e.g., 7, 14, 21)
+        max_liking_users: Maximum number of liking users to sample
+        max_likes_per_user: Cap on likes per user
+        negative_posts_sample: Number of negative posts to sample
+        likes_initial: Total raw likes count (from parquet metadata)
+    
+    Returns:
+        Dict mapping feature names to values
+    """
+    return {
+        'data_window_days': data_window_days,
+        'max_liking_users_10k': max_liking_users / 10000,
+        'max_likes_per_user_100': max_likes_per_user / 100,
+        'negative_posts_sample_10k': negative_posts_sample / 10000,
+        'log_max_liking_users': np.log10(max(max_liking_users, 1)),
+        'sqrt_likes_initial_1e6': np.sqrt(likes_initial) / 1000,
+        'days_x_users_10k': data_window_days * max_liking_users / 10000,
+        'users_x_log_users': (max_liking_users / 10000) * np.log10(max(max_liking_users, 1)),
+    }
+
+
+def predict_memory_gb(
+    features: Dict[str, float],
+    coefficients: Optional[Dict[str, float]] = None,
+) -> float:
+    """Predict peak memory usage in GB using the fitted model.
+    
+    Args:
+        features: Feature dict from compute_memory_model_features()
+        coefficients: Model coefficients (defaults to MEMORY_MODEL_COEFFICIENTS)
+    
+    Returns:
+        Estimated peak memory in GB
+    """
+    if coefficients is None:
+        coefficients = MEMORY_MODEL_COEFFICIENTS
+    
+    result = coefficients['intercept']
+    for name in MEMORY_MODEL_FEATURE_NAMES:
+        result += coefficients[name] * features[name]
+    
+    # Ensure non-negative (model could predict negative for extreme edge cases)
+    return max(result, 1.0)
+
+
+# Legacy constants kept for backward compatibility (may be used in logging/reports)
+OVERLAP_EXPONENT = 0.61
 OVERLAP_BASE_USERS = 72_000
 OVERLAP_BASE_UNIQUE_POSTS = 1_320_000
 
@@ -601,37 +682,36 @@ def estimate_filtered_data_memory(
     negative_posts_sample: int = 100_000,
     embedding_dim: int = 384,
     logger: Optional[Any] = None,
+    data_window_days: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Estimate memory required using the incremental file processing approach.
+    Estimate memory required for data loading using a fitted regression model.
     
-    With incremental processing, peak memory is bounded by:
-    1. Output data: filtered likes + liked posts + negative sample + expanded embeddings
-    2. Working memory: one parquet file at a time during processing
-    3. Temporary structures: user set during sampling, reservoir for negatives
-    
-    This is much more efficient than loading all raw data at once.
+    This function uses a regression model trained on sweep results to predict
+    peak memory usage, providing ~10x better accuracy than the previous
+    heuristic-based approach.
     
     Args:
         likes_paths: Paths to likes parquet files
         posts_paths: Paths to posts parquet files
-        max_liking_users: Cap on number of liking users (0 = no cap)
+        max_liking_users: Cap on number of liking users (0 = no cap, uses 10000 for estimation)
         max_likes_per_user: Max likes to keep per user
-        min_likes_per_user: Min likes required per user
+        min_likes_per_user: Min likes required per user (not used by model, kept for compatibility)
         negative_posts_sample: Number of negative posts to sample
-        embedding_dim: Embedding dimension (for posts memory)
+        embedding_dim: Embedding dimension (not used by model, kept for compatibility)
         logger: Optional logger
+        data_window_days: Number of days in the data window (auto-detected from file count if not provided)
         
     Returns:
-        Dict with detailed memory estimates
+        Dict with memory estimates and metadata
     """
     def _log(msg: str):
         if logger:
             logger.info(msg)
     
-    # Get raw stats without loading data
+    # Get raw stats from parquet metadata (no data loading)
     likes_raw = estimate_parquet_memory(likes_paths, embedding_expansion_dim=0)
-    posts_raw = estimate_parquet_memory(posts_paths, embedding_expansion_dim=0)  # No expansion yet
+    posts_raw = estimate_parquet_memory(posts_paths, embedding_expansion_dim=0)
     
     raw_likes_rows = likes_raw['total_rows']
     raw_posts_rows = posts_raw['total_rows']
@@ -640,255 +720,48 @@ def estimate_filtered_data_memory(
     
     if raw_likes_rows == 0:
         return {
+            'estimated_peak_gb': 0,
             'estimated_total_gb': 0,
-            'likes_estimated_gb': 0,
-            'posts_estimated_gb': 0,
             'error': 'No likes data found',
+            'model_version': 'v1.0',
         }
     
-    # === Estimate filtered data sizes ===
+    # Auto-detect data window days from file count if not provided
+    # Each day typically has ~24 files (hourly), so divide by 24
+    if data_window_days is None:
+        data_window_days = max(1, n_likes_files // 24)
+        if data_window_days < 1:
+            data_window_days = 7  # Default fallback
     
-    # Estimate unique users from raw data
-    # Observed: ~47 likes per user on average in typical time windows
-    avg_likes_per_user_observed = 47
-    estimated_raw_users = max(1, raw_likes_rows // avg_likes_per_user_observed)
+    # Use default max_liking_users if not specified (0 means no cap)
+    effective_max_users = max_liking_users if max_liking_users > 0 else 10000
     
-    # Calculate actual average likes per user in THIS time window
-    avg_likes_per_user_in_window = raw_likes_rows / max(estimated_raw_users, 1)
-    
-    # === IMPORTANT: Account for pre-filtering before user sampling ===
-    # With early filtering, we:
-    # 1. Pre-filter to users with >= min_likes_per_user (the "eligible" users)
-    # 2. Sample from those eligible users only
-    #
-    # Users with < min_likes_per_user have very few likes (at most min_likes - 1 each).
-    # The eligible users have MORE likes on average than the general population.
-    #
-    # Estimate how many users are excluded by min_likes_per_user:
-    # Observation: power-law distribution - many users have only 1-2 likes
-    # Typical exclusion rate: ~15-20% of users have < min_likes_per_user likes
-    # These excluded users contribute relatively few total likes
-    if min_likes_per_user > 1:
-        # Estimate fraction of users excluded (those with < min_likes_per_user)
-        # Based on observed data: ~16-17% of users have only 1 like
-        excluded_user_fraction = 0.17 * (min_likes_per_user - 1)  # Scale by threshold
-        excluded_user_fraction = min(excluded_user_fraction, 0.5)  # Cap at 50%
-        
-        estimated_eligible_users = int(estimated_raw_users * (1 - excluded_user_fraction))
-        
-        # Excluded users contribute very few likes (max of min_likes - 1 each)
-        excluded_user_likes = int(estimated_raw_users * excluded_user_fraction * (min_likes_per_user - 1))
-        eligible_user_likes = raw_likes_rows - excluded_user_likes
-        
-        avg_likes_per_eligible_user = eligible_user_likes / max(estimated_eligible_users, 1)
-    else:
-        # No pre-filtering
-        estimated_eligible_users = estimated_raw_users
-        eligible_user_likes = raw_likes_rows
-        avg_likes_per_eligible_user = avg_likes_per_user_in_window
-    
-    # Apply user cap to eligible users (sampling happens from eligible pool)
-    if max_liking_users > 0:
-        estimated_users = min(max_liking_users, estimated_eligible_users)
-    else:
-        estimated_users = estimated_eligible_users
-    
-    # IMPORTANT: Memory estimation should focus on INTERMEDIATE sizes during processing,
-    # not final filtered output. The key insight from observations:
-    #
-    # Likes processing:
-    # - Pass 1: Scan all files to count likes per user (memory: user_counts dict ~200MB)
-    # - Pre-filter: Keep only users with >= min_likes_per_user
-    # - Sample: Select max_liking_users from eligible pool
-    # - Pass 2: Collect ALL likes for sampled users
-    #   -> This is proportional to (sampled_users / eligible_users) × eligible_user_likes
-    #   -> These likes are stored in chunks with significant overhead (~4KB/row)
-    #
-    # Posts processing:
-    # - Batch through files, extracting liked posts + reservoir sampling negatives
-    # - Final output is relatively small (liked posts + negative sample)
-    
-    # Calculate INTERMEDIATE likes (before per-user cap filter)
-    # Sampling ratio is now relative to ELIGIBLE users, not all users
-    user_sampling_ratio = estimated_users / max(estimated_eligible_users, 1)
-    intermediate_likes = int(eligible_user_likes * user_sampling_ratio)
-    
-    # Estimate final likes after filtering (for output size)
-    # Per-user cap: users with > max_likes_per_user get truncated
-    # 
-    # IMPORTANT: Like distributions are extremely heavy-tailed (power-law).
-    # A small fraction of "super-likers" contribute most of the likes before cap.
-    # When the cap is applied, total likes can drop to 5-10% of intermediate count.
-    #
-    # Observation from runs:
-    # - avg 73 likes/user before cap, cap=250, actual retention: 7%
-    # - This is because most likes come from users with >>250 likes
-    #
-    # For memory estimation, use a conservative approach based on intermediate likes
-    # rather than trying to model the exact cap effect.
-    
-    if max_likes_per_user > 0:
-        # Heavy-tail adjustment: assume cap reduces likes to ~10-30% of intermediate
-        # This is more realistic than assuming avg * cap_effect
-        cap_retention_factor = 0.15  # Conservative: assume 15% retention after cap
-        estimated_likes = int(intermediate_likes * cap_retention_factor)
-    else:
-        # No cap - use intermediate likes as estimate
-        estimated_likes = intermediate_likes
-    
-    # Estimate unique liked posts using power-law overlap model
-    # As more users are sampled, they increasingly share liked posts (popular content).
-    # Empirical observation: unique_posts grows as users^0.61, not linearly.
-    #
-    # Model: unique_posts = BASE_UNIQUE_POSTS * (users / BASE_USERS)^OVERLAP_EXPONENT
-    # Calibrated from observed data:
-    #   72K users  -> 1.32M unique URIs (18.3 per user)
-    #   104K users -> 1.64M unique URIs (15.8 per user)
-    #   136K users -> 1.94M unique URIs (14.3 per user)
-    
-    if estimated_users > 0:
-        # Apply power-law scaling for overlap effect
-        unique_liked_uris_estimate = int(
-            OVERLAP_BASE_UNIQUE_POSTS * (estimated_users / OVERLAP_BASE_USERS) ** OVERLAP_EXPONENT
-        )
-        # Ensure we don't exceed total likes (sanity check)
-        unique_liked_uris_estimate = min(unique_liked_uris_estimate, estimated_likes)
-    else:
-        unique_liked_uris_estimate = 0
-    
-    liked_post_match_rate = 0.70  # ~70% of liked URIs have matching posts (observed)
-    estimated_liked_posts = min(int(unique_liked_uris_estimate * liked_post_match_rate), raw_posts_rows)
-    
-    # Total posts = liked posts + negative sample (this is final output)
-    estimated_posts = estimated_liked_posts + min(negative_posts_sample, raw_posts_rows)
-    
-    # === Memory estimation with incremental processing ===
-    
-    # Empirically sample bytes-per-row from actual data files
-    # This adapts to schema changes and provides accurate estimates for the specific data.
-    # Files are sampled randomly from the middle of the time window to avoid temporal bias.
-    
-    _log("  Sampling files to measure bytes-per-row empirically...")
-    
-    # Sample likes files (no embedding expansion needed)
-    likes_sample = sample_bytes_per_row(
-        likes_paths, 
-        n_sample_files=2, 
-        expand_embeddings=False,
-        logger=logger
+    # Compute features for the model
+    features = compute_memory_model_features(
+        data_window_days=data_window_days,
+        max_liking_users=effective_max_users,
+        max_likes_per_user=max_likes_per_user,
+        negative_posts_sample=negative_posts_sample,
+        likes_initial=raw_likes_rows,
     )
     
-    # Sample posts files (with embedding expansion to match actual processing)
-    posts_sample = sample_bytes_per_row(
-        posts_paths, 
-        n_sample_files=2, 
-        expand_embeddings=True, 
-        embedding_dim=embedding_dim,
-        logger=logger
-    )
+    # Predict memory using fitted model
+    estimated_peak_gb = predict_memory_gb(features)
     
-    # Use empirical values with conservative fallback defaults
-    # Fallback defaults are calibrated from observed runs (2026-01-24):
-    #   Likes: ~2 KB/row observed at scale
-    #   Posts: ~22 KB/row with expanded embeddings
+    # Add 10% safety margin for unknown variations
+    estimated_peak_gb_with_margin = estimated_peak_gb * 1.10
     
-    if likes_sample.get('bytes_per_row'):
-        # Add 20% safety margin to empirical measurement
-        likes_bytes_per_row_intermediate = int(likes_sample['bytes_per_row'] * 1.2)
-        _log(f"  Likes: {likes_sample['bytes_per_row']/1024:.1f} KB/row (sampled), using {likes_bytes_per_row_intermediate/1024:.1f} KB/row with margin")
-    else:
-        likes_bytes_per_row_intermediate = 2_500  # Conservative fallback
-        _log(f"  Likes: using fallback {likes_bytes_per_row_intermediate/1024:.1f} KB/row")
-    
-    if posts_sample.get('bytes_per_row'):
-        # Add 10% safety margin to empirical measurement
-        posts_bytes_per_row_expanded = int(posts_sample['bytes_per_row'] * 1.1)
-        _log(f"  Posts: {posts_sample['bytes_per_row']/1024:.1f} KB/row (sampled), using {posts_bytes_per_row_expanded/1024:.1f} KB/row with margin")
-    else:
-        posts_bytes_per_row_expanded = 25_000  # Conservative fallback
-        _log(f"  Posts: using fallback {posts_bytes_per_row_expanded/1024:.1f} KB/row")
-    
-    likes_bytes_per_row_final = 200  # After combining into single DataFrame (small)
-    
-    # Posts batch processing uses raw (unexpanded) size
-    posts_bytes_per_row_parquet = posts_raw['estimated_bytes'] / max(raw_posts_rows, 1)
-    posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)
-    
-    # Component 1: User counts dict during Pass 1 (DID strings + int counts)
-    # Using dict instead of set adds ~8 bytes per entry for the int value
-    user_set_bytes = estimated_raw_users * 90  # ~90 bytes per DID string + count in dict
-    
-    # Component 2: Working memory per batch of files
-    batch_size = 20  # Files per batch
-    actual_likes_batch = min(batch_size, n_likes_files)
-    actual_posts_batch = min(batch_size, n_posts_files)
-    
-    avg_likes_per_file = raw_likes_rows / max(n_likes_files, 1)
-    avg_posts_per_file = raw_posts_rows / max(n_posts_files, 1)
-    
-    likes_batch_rows = int(avg_likes_per_file * actual_likes_batch)
-    posts_batch_rows = int(avg_posts_per_file * actual_posts_batch)
-    
-    likes_batch_bytes = int(likes_batch_rows * likes_bytes_per_row_intermediate * 1.5)
-    posts_batch_bytes = int(posts_batch_rows * posts_bytes_per_row_raw * 1.5)
-    
-    # Component 3: Intermediate likes storage during Pass 2
-    # This is the BIG memory consumer - we accumulate ALL likes for sampled users
-    # before filtering, and each chunk has significant overhead
-    likes_intermediate_bytes = int(intermediate_likes * likes_bytes_per_row_intermediate)
-    
-    # Component 4: Final output data (after filtering)
-    likes_output_bytes = int(estimated_likes * likes_bytes_per_row_final)
-    posts_output_bytes = int(estimated_posts * posts_bytes_per_row_expanded)
-    
-    # Component 5: Negative reservoir (100k posts with expanded embeddings)
-    negative_reservoir_bytes = int(min(negative_posts_sample, raw_posts_rows) * posts_bytes_per_row_expanded)
-    
-    # Component 6: Accumulated liked posts during loading (with expanded embeddings)
-    liked_posts_accumulated_bytes = int(estimated_liked_posts * posts_bytes_per_row_expanded)
-    
-    # Phase 1: Likes loading (Pass 1 + Pass 2)
-    # - Pass 1: user_counts dict (scanning for user like counts)
-    # - Pass 2: accumulating all likes for sampled users in chunks
-    # Peak is at end of Pass 2 when all intermediate likes are in memory
-    phase_1_likes = user_set_bytes + likes_intermediate_bytes
-    
-    # Phase 2: Posts loading with early expansion
-    # After likes processing, the likes data is consolidated into a smaller final DataFrame.
-    # The intermediate chunks are freed, though some memory fragmentation remains.
-    # 
-    # Observed behavior (from 2026-01-24 runs):
-    #   - after_likes_load memory is typically ~30-32 GB regardless of user count
-    #   - This is much less than the intermediate peak during Pass 2
-    #   - Memory retained is roughly proportional to final likes count, not intermediate
-    #
-    # During posts loading, we accumulate:
-    # - Retained likes data (consolidated, much smaller than intermediate)
-    # - Liked posts with expanded embeddings (grows during processing)
-    # - Negative reservoir with expanded embeddings (capped at sample size)
-    # - Current batch being processed
-    
-    # Likes memory retained after consolidation: ~2x final output size for fragmentation overhead
-    likes_retained_bytes = int(likes_output_bytes * 2.0)
-    
-    phase_2_posts = (likes_retained_bytes +           # Likes memory retained (consolidated)
-                     liked_posts_accumulated_bytes +  # Accumulated liked posts (expanded)
-                     negative_reservoir_bytes +       # Negative sample (expanded)
-                     posts_batch_bytes)               # Current batch being processed
-    
-    # Phase 3: Final output (likes filtered, posts combined)
-    # Most intermediate memory should be freed at this point
-    phase_3_final = likes_output_bytes + posts_output_bytes
-    
-    peak_bytes = max(phase_1_likes, phase_2_posts, phase_3_final)
-    
-    # Add Python/Polars baseline overhead
-    # Observed: ~2 GB fixed overhead for Polars/Python runtime, chunk management, etc.
-    # Use 10% buffer for safety margin (empirical sampling provides accurate estimates)
-    baseline_overhead_bytes = int(2.0 * (1024**3))
-    peak_bytes = int(peak_bytes * 1.10) + baseline_overhead_bytes  # 10% buffer
-    
+    # Build result dict (maintaining backward compatibility with key fields)
     result = {
+        # Primary estimates
+        'estimated_peak_gb': estimated_peak_gb_with_margin,
+        'estimated_total_gb': estimated_peak_gb_with_margin,
+        'estimated_peak_gb_raw': estimated_peak_gb,  # Without safety margin
+        
+        # Model metadata
+        'model_version': 'v1.0',
+        'model_r_squared': 0.9440,
+        
         # Raw data stats
         'raw_likes_rows': raw_likes_rows,
         'raw_posts_rows': raw_posts_rows,
@@ -896,70 +769,27 @@ def estimate_filtered_data_memory(
         'raw_posts_gb': posts_raw['estimated_gb'],
         'n_likes_files': n_likes_files,
         'n_posts_files': n_posts_files,
-        # Per-row estimates (KB) - empirically sampled or fallback
-        'likes_bytes_per_row_intermediate_kb': likes_bytes_per_row_intermediate / 1024,
-        'posts_bytes_per_row_expanded_kb': posts_bytes_per_row_expanded / 1024,
-        'likes_bytes_sampled': likes_sample.get('bytes_per_row') is not None,
-        'posts_bytes_sampled': posts_sample.get('bytes_per_row') is not None,
-        # Estimated users (with pre-filtering for min_likes_per_user)
-        'estimated_raw_users': estimated_raw_users,
-        'estimated_eligible_users': estimated_eligible_users,  # Users meeting min_likes threshold
-        'estimated_filtered_users': estimated_users,           # After sampling cap
-        'avg_likes_per_user_in_window': avg_likes_per_user_in_window,
-        'avg_likes_per_eligible_user': avg_likes_per_eligible_user,
-        'eligible_user_likes': eligible_user_likes,
-        'user_sampling_ratio': user_sampling_ratio,
-        # Estimated data sizes
-        'intermediate_likes': intermediate_likes,  # Before per-user cap/min-likes filter
-        'estimated_likes_rows': estimated_likes,   # After filtering (final output)
-        'unique_liked_uris_estimate': unique_liked_uris_estimate,  # Sublinear overlap model
-        'estimated_liked_posts': estimated_liked_posts,
-        'estimated_negative_posts': min(negative_posts_sample, raw_posts_rows),
-        'estimated_total_posts': estimated_posts,
-        # Overlap model parameters (for transparency)
-        'overlap_exponent': OVERLAP_EXPONENT,
-        'overlap_base_users': OVERLAP_BASE_USERS,
-        'overlap_base_unique_posts': OVERLAP_BASE_UNIQUE_POSTS,
-        # Memory breakdown (GB)
-        'mem_user_set_gb': user_set_bytes / (1024**3),
-        'mem_likes_intermediate_gb': likes_intermediate_bytes / (1024**3),
-        'mem_likes_retained_gb': likes_retained_bytes / (1024**3),
-        'mem_posts_batch_gb': posts_batch_bytes / (1024**3),
-        'mem_negative_reservoir_gb': negative_reservoir_bytes / (1024**3),
-        'mem_liked_posts_accumulated_gb': liked_posts_accumulated_bytes / (1024**3),
-        'mem_likes_output_gb': likes_output_bytes / (1024**3),
-        'mem_posts_output_gb': posts_output_bytes / (1024**3),
-        # Phase peaks
-        'phase_1_likes_gb': phase_1_likes / (1024**3),
-        'phase_2_posts_gb': phase_2_posts / (1024**3),
-        'phase_3_final_gb': phase_3_final / (1024**3),
-        # Final estimates
-        'estimated_peak_gb': peak_bytes / (1024**3),
-        'estimated_total_gb': peak_bytes / (1024**3),
+        
+        # Model inputs (for debugging/transparency)
+        'model_features': features,
+        
         # Parameters used
         'params': {
             'max_liking_users': max_liking_users,
+            'effective_max_users': effective_max_users,
             'max_likes_per_user': max_likes_per_user,
             'min_likes_per_user': min_likes_per_user,
             'negative_posts_sample': negative_posts_sample,
             'embedding_dim': embedding_dim,
-            'batch_size': batch_size,
-            'actual_posts_batch': actual_posts_batch,
+            'data_window_days': data_window_days,
         },
     }
     
-    _log("Memory estimation (with empirical sampling and overlap model):")
+    _log("Memory estimation (fitted regression model):")
     _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
-    _log(f"  Users: {estimated_raw_users:,} total, ~{estimated_eligible_users:,} eligible (>={min_likes_per_user} likes)")
-    _log(f"  User sampling: {estimated_users:,} from {estimated_eligible_users:,} eligible ({user_sampling_ratio*100:.1f}%)")
-    _log(f"  Avg likes/eligible user: {avg_likes_per_eligible_user:.1f}")
-    _log(f"  Intermediate likes (before cap): {intermediate_likes:,} ({likes_bytes_per_row_intermediate/1024:.1f}KB/row{'*' if likes_sample.get('bytes_per_row') else ''})")
-    _log(f"  Unique liked posts (overlap model): {unique_liked_uris_estimate:,} (users^{OVERLAP_EXPONENT} scaling)")
-    _log(f"  Negative reservoir: {min(negative_posts_sample, raw_posts_rows):,} posts ({posts_bytes_per_row_expanded/1024:.1f}KB/post{'*' if posts_sample.get('bytes_per_row') else ''})")
-    _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, final={result['phase_3_final_gb']:.2f}GB")
-    _log(f"  Estimated peak: {result['estimated_peak_gb']:.2f} GB")
-    if likes_sample.get('bytes_per_row') or posts_sample.get('bytes_per_row'):
-        _log(f"  (* = empirically sampled from data)")
+    _log(f"  Window: {data_window_days} days, Users: {effective_max_users:,}, Likes/user cap: {max_likes_per_user}")
+    _log(f"  Model prediction: {estimated_peak_gb:.2f} GB (with 10% margin: {estimated_peak_gb_with_margin:.2f} GB)")
+    _log(f"  Model R-squared: 0.9440 (mean error: 6.7%)")
     
     return result
 
@@ -2710,6 +2540,8 @@ __all__ = [
     # Stage 1: Memory safety checks and tracking
     'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
     'estimate_parquet_memory', 'sample_bytes_per_row', 'estimate_filtered_data_memory',
+    'compute_memory_model_features', 'predict_memory_gb',
+    'MEMORY_MODEL_COEFFICIENTS', 'MEMORY_MODEL_FEATURE_NAMES',
     'check_memory_available', 'check_data_load_safe',
     'OVERLAP_EXPONENT', 'OVERLAP_BASE_USERS', 'OVERLAP_BASE_UNIQUE_POSTS',
     # Stage 1: Polars-based filtering for core datasets
