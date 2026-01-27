@@ -45,12 +45,12 @@ DEFAULTS: Dict[str, Any] = {
     "image_mode": "auto",
     "max_posts_per_author": 3,  # Legacy: used in stage 2 featurize
     "max_liked_posts_per_user": 100,  # Legacy: used in stage 2 featurize
-    "max_liking_users": 0,  # 0 = no limit; sample this many unique liking users
+    "max_liking_users": None,  # None = no limit; sample this many unique liking users
     "max_likes_per_user": 100,  # Stage 1: random cap on likes per user (NOT recency-based)
     "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
     "negative_posts_sample": 100000,  # Stage 1: random posts for negative cases
     "cap_random_seed": 42,
-    "max_memory_gb": 0,  # Stage 1: max memory in GB (0 = auto based on percentage)
+    "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "output_dir": None,
     "run_name": None,
@@ -60,7 +60,7 @@ DEFAULTS: Dict[str, Any] = {
     "relevel_method": "uniform",
     "relevel_strategy": "uniform_mixture_balanced",
     "relevel_alpha": 0.35,
-    "relevel_min_users_per_topic": 0,
+    "relevel_min_users_per_topic": None,
     "val_ratio": 0.2,
     "holdout_ratio": 0.2,
     "random_seed": 42,
@@ -88,7 +88,7 @@ DEFAULTS: Dict[str, Any] = {
     "no_save_model": False,
     # Stage 6 (eval)
     "eval_batch_size": 8192,
-    "eval_max_users": 0,
+    "eval_max_users": None,
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
@@ -533,7 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--max-liked-posts-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on liked posts per user during ingestion")
     _add_arg_with_default(p_all, "--max-liking-users", type=int, default=argparse.SUPPRESS,
-                          help_text="Cap on total liking users to sample (0 = no limit)")
+                          help_text="Cap on total liking users to sample (None = no limit)")
     _add_arg_with_default(p_all, "--max-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
     _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
@@ -541,7 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
     _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
-                          help_text="Maximum memory to use in GB (0 = auto based on available RAM)")
+                          help_text="Maximum memory to use in GB (None = auto based on available RAM)")
     _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum percentage of available RAM to use (default: 0.75)")
     p_all.add_argument("--skip-memory-check", action="store_true", default=False,
@@ -620,7 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
     _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
-                          help_text="0 = all eligible users for evaluation")
+                          help_text="None = all eligible users for evaluation")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")

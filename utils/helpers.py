@@ -548,7 +548,7 @@ def estimate_filtered_data_memory(
     likes_paths: List[str],
     posts_paths: List[str],
     *,
-    max_liking_users: int = 0,
+    max_liking_users: Optional[int] = None,
     max_likes_per_user: int = 100,
     min_likes_per_user: int = 2,
     negative_posts_sample: int = 100_000,
@@ -565,7 +565,7 @@ def estimate_filtered_data_memory(
     Args:
         likes_paths: Paths to likes parquet files
         posts_paths: Paths to posts parquet files
-        max_liking_users: Cap on number of liking users (0 = no cap, uses 10000 for estimation)
+        max_liking_users: Cap on number of liking users (None = no cap, uses 10000 for estimation)
         max_likes_per_user: Max likes to keep per user
         min_likes_per_user: Min likes required per user (not used by model, kept for compatibility)
         negative_posts_sample: Number of negative posts to sample
@@ -604,8 +604,8 @@ def estimate_filtered_data_memory(
         if data_window_days < 1:
             data_window_days = 7  # Default fallback
     
-    # Use default max_liking_users if not specified (0 means no cap)
-    effective_max_users = max_liking_users if max_liking_users > 0 else 10000
+    # Use default max_liking_users if not specified (None means no cap)
+    effective_max_users = max_liking_users if max_liking_users is not None else 10000
     
     # Compute features for the model
     features = compute_memory_model_features(
@@ -668,7 +668,7 @@ def estimate_filtered_data_memory(
 def check_memory_available(
     estimated_bytes: int,
     *,
-    max_memory_gb: float = 0,  # 0 = use percentage of available
+    max_memory_gb: Optional[float] = None,  # None = use percentage of available
     max_memory_pct: float = 0.75,  # Use at most 75% of available RAM
     logger: Optional[Any] = None,
 ) -> Tuple[bool, str]:
@@ -677,7 +677,7 @@ def check_memory_available(
     
     Args:
         estimated_bytes: Estimated memory required
-        max_memory_gb: Maximum memory in GB (0 = auto based on percentage)
+        max_memory_gb: Maximum memory in GB (None = auto based on percentage)
         max_memory_pct: Maximum percentage of available RAM to use
         logger: Optional logger for output
     
@@ -692,7 +692,7 @@ def check_memory_available(
     total_bytes = mem.total
     
     # Determine threshold
-    if max_memory_gb > 0:
+    if max_memory_gb is not None:
         threshold_bytes = int(max_memory_gb * (1024**3))
     else:
         threshold_bytes = int(available_bytes * max_memory_pct)
@@ -722,9 +722,9 @@ def check_data_load_safe(
     posts_paths: List[str],
     *,
     embedding_dim: int = 384,
-    max_memory_gb: float = 0,
+    max_memory_gb: Optional[float] = None,
     max_memory_pct: float = 0.75,
-    max_liking_users: int = 0,
+    max_liking_users: Optional[int] = None,
     max_likes_per_user: int = 100,
     min_likes_per_user: int = 2,
     negative_posts_sample: int = 100_000,
@@ -741,7 +741,7 @@ def check_data_load_safe(
         likes_paths: List of likes parquet paths
         posts_paths: List of posts parquet paths
         embedding_dim: Embedding dimension for memory estimation
-        max_memory_gb: Maximum memory in GB (0 = auto based on percentage)
+        max_memory_gb: Maximum memory in GB (None = auto based on percentage)
         max_memory_pct: Maximum percentage of available RAM
         max_liking_users: Cap on number of liking users
         max_likes_per_user: Max likes to keep per user
@@ -836,7 +836,7 @@ def load_likes_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
     *,
-    max_liking_users: int = 0,
+    max_liking_users: Optional[int] = None,
     max_likes_per_user: int = 100,
     min_likes_per_user: int = 2,
     random_seed: int = 42,
@@ -968,7 +968,7 @@ def load_likes_core_polars(
     # ===== Sample users if cap is set =====
     rng = np.random.RandomState(random_seed)
     
-    if max_liking_users > 0 and len(eligible_users) > max_liking_users:
+    if max_liking_users is not None and len(eligible_users) > max_liking_users:
         user_list = list(eligible_users)
         sampled_indices = rng.choice(len(user_list), size=max_liking_users, replace=False)
         sampled_user_set = {user_list[i] for i in sampled_indices}
