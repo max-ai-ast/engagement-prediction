@@ -970,17 +970,20 @@ def load_likes_core_polars(
     if max_likes_per_user > 0 and n_after_user_sample > 0:
         n_before_cap = n_after_user_sample
         
-        # Add random order per user, then keep top-K
+        # Add deterministic pseudo-random order per user, then keep top-K
         likes_lf = likes_lf.with_columns(
-            pl.lit(1).cum_count().over('did').shuffle(seed=random_seed).alias('_rand_order')
+            pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
+        )
+        likes_lf = likes_lf.with_columns(
+            pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
         )
         likes_lf = likes_lf.filter(pl.col('_rand_order') <= max_likes_per_user)
-        likes_lf = likes_lf.drop('_rand_order')
+        likes_lf = likes_lf.drop(['_rand_key', '_rand_order'])
         
         counts_after_cap_df = (
             likes_lf.group_by('did')
             .agg(pl.len().alias('count'))
-            .collect(streaming=True)
+            .collect(engine="streaming")
         )
         n_after_cap = int(counts_after_cap_df['count'].sum()) if counts_after_cap_df.height > 0 else 0
         pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
