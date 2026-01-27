@@ -887,8 +887,7 @@ def load_likes_core_polars(
     # ===== PASS 1: Count likes per user (streaming) =====
     _log("Pass 1: Counting likes per user (streaming)...")
     user_counts_df = (
-        base_lf.select('did')
-        .group_by('did')
+        base_lf.group_by('did')
         .agg(pl.len().alias('like_count'))
         .collect(engine="streaming")
     )
@@ -943,7 +942,7 @@ def load_likes_core_polars(
     counts_pre_cap_df = (
         likes_lf.group_by('did')
         .agg(pl.len().alias('like_count'))
-        .collect(streaming=True)
+        .collect(engine='streaming')
     )
     
     n_after_user_sample = int(counts_pre_cap_df['like_count'].sum()) if counts_pre_cap_df.height > 0 else 0
