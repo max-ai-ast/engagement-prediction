@@ -916,12 +916,13 @@ def load_likes_core_polars(
     else:
         eligible_users_df = user_counts_df.select('did')
         stats['n_users_eligible_for_sampling'] = n_users_initial
-    
+
     # ===== Sample users if cap is set =====
     if max_liking_users is not None and eligible_users_df.height > max_liking_users:
         sampled_users_df = (
-            eligible_users_df.select('did')
-            .sample(n=max_liking_users, with_replacement=False, seed=random_seed)
+            eligible_users_df.with_columns(
+                pl.col('did').hash(seed=random_seed).alias('_rand_key')
+            ).sort('_rand_key').head(max_liking_users).select('did')
         )
         _log(
             f"Sampled {max_liking_users:,} liking users "
