@@ -561,7 +561,7 @@ def _run_greenearth_pipeline(
         logger=logger,
     )
     all_stats['likes'] = likes_stats
-    return likes_core_lf, likes_stats
+    # return likes_core_lf, likes_stats
     
     mem_tracker.checkpoint("after_likes_load")
     
@@ -569,7 +569,7 @@ def _run_greenearth_pipeline(
     log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
     liked_post_uris = (
         likes_core_lf.select(pl.col('subject_uri').unique())
-        .collect(streaming=True)['subject_uri']
+        .collect(engine="streaming")['subject_uri']
     )
     logger.info(f"Extracted {len(liked_post_uris):,} unique liked post URIs")
     
