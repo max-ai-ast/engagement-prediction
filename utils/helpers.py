@@ -786,12 +786,10 @@ def check_data_load_safe(
 
 
 def _apply_time_filter(
-    all_paths: List[str], 
+    lf: pl.LazyFrame, 
     start_str: Optional[str], 
     end_str: Optional[str]
 ) -> pl.LazyFrame:
-    lf = pl.scan_parquet(all_paths)
-    
     start_dt = parse_one_ts(start_str)
     end_dt = parse_one_ts(end_str)
 
@@ -845,7 +843,8 @@ def load_likes_core_polars(
     logger.info(f"Found {len(paths)} likes parquet files")
     log_memory_checkpoint("likes_before_scan", logger)
     
-    base_lf = _apply_time_filter(paths, start_str, end_str)
+    raw_lf = pl.scan_parquet(paths)
+    base_lf = _apply_time_filter(raw_lf, start_str, end_str)
 
     # ===== PASS 1: Count likes per user (streaming) =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
@@ -1041,7 +1040,8 @@ def load_posts_core_polars(
         batch_end = min(batch_start + BATCH_SIZE, len(paths))
         batch_paths = paths[batch_start:batch_end]
         
-        lf = _apply_time_filter(batch_paths, start_str, end_str)
+        raw_lf = pl.scan_parquet(batch_paths)
+        lf = _apply_time_filter(raw_lf, start_str, end_str)
         batch_df = lf.collect()
         n_batch = len(batch_df)
         n_posts_total += n_batch
