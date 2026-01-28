@@ -193,6 +193,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'record_text': str,
         'reply_parent_uri': str,
         'reply_root_uri': str,
+        'is_liked': bool,
     }
     # Add embedding columns dynamically
     for i in range(embed_dim):
@@ -555,8 +556,9 @@ def _run_greenearth_pipeline(
     
     # Step 2: Extract liked post URIs
     log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
-    liked_post_uris = set(likes_core_df['subject_uri'].unique().to_list())
-    logger.info(f"Extracted {len(liked_post_uris):,} unique liked post URIs")
+    # liked_post_uris = set(likes_core_df['subject_uri'].unique().to_list())
+    liked_post_uris_df: pl.DataFrame = likes_core_df.select(pl.col('subject_uri').unique())
+    # logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
     
     mem_tracker.checkpoint("after_uri_extraction")
     
@@ -567,7 +569,7 @@ def _run_greenearth_pipeline(
     posts_core_df, posts_stats, embed_dim = load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
-        liked_post_uris=liked_post_uris,
+        liked_post_uris_df=liked_post_uris_df,
         paths=posts_paths,
         negative_posts_sample=negative_posts_sample,
         embedding_model=embedding_model,

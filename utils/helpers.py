@@ -978,7 +978,7 @@ def load_likes_core_polars(
 def load_posts_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
-    liked_post_uris: Set[str],
+    liked_post_uris_df: pl.DataFrame,
     paths: List[str],
     *,
     negative_posts_sample: int,
@@ -1018,148 +1018,55 @@ def load_posts_core_polars(
     
     logger.info(f"Found {len(paths)} posts parquet files")
     log_memory_checkpoint("posts_before_scan", logger)
+
+    raw_lf = pl.scan_parquet(paths)
+    posts_lf = raw_lf
+    # posts_lf = _apply_time_filter(raw_lf, start_str, end_str)
+
+    # get the total number of posts and calc threshold
+    n_posts_total = posts_lf.select(pl.count()).collect().item()
+    fraction_to_sample = negative_posts_sample / n_posts_total
+    threshold_hash = int(fraction_to_sample * (2**64 - 1))
     
-    # Batch size for processing
-    BATCH_SIZE = 20
-    
-    # Initialize random state
-    rng = np.random.RandomState(random_seed)
-    
-    # Accumulators - these store EXPANDED data (small memory footprint)
-    liked_posts_expanded: List[pl.DataFrame] = []
-    random_sample_expanded: List[pl.DataFrame] = []  # True random sample (independent of like status)
-    random_sample_uris: Set[str] = set()  # Track URIs in random sample to avoid duplicates
-    n_posts_seen_for_reservoir = 0
-    n_posts_total = 0
-    n_liked_posts = 0
-    embed_dim = 0  # Will be set on first successful expansion
-    
-    logger.info(f"Processing {len(paths)} files in batches of {BATCH_SIZE} with early embedding expansion...")
-    
-    for batch_start in range(0, len(paths), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(paths))
-        batch_paths = paths[batch_start:batch_end]
-        
-        raw_lf = pl.scan_parquet(batch_paths)
-        lf = _apply_time_filter(raw_lf, start_str, end_str)
-        batch_df = lf.collect()
-        n_batch = len(batch_df)
-        n_posts_total += n_batch
-        
-        if n_batch == 0:
-            continue
-        
-        # Check for at_uri column
-        if 'at_uri' not in batch_df.columns:
-            logger.info(f"  Warning: Batch {batch_end} missing 'at_uri' column, skipping")
-            continue
-        
-        # === Reservoir sampling for random sample (INDEPENDENT of like status) ===
-        # IMPORTANT: This samples from ALL posts, not just non-liked posts.
-        # This ensures the random sample is statistically independent and can be
-        # used for unbiased population statistics.
-        if negative_posts_sample > 0 and n_batch > 0:
-            current_reservoir_size = sum(len(r) for r in random_sample_expanded)
-            
-            if current_reservoir_size < negative_posts_sample:
-                # Reservoir not full - add what we need
-                space_remaining = negative_posts_sample - current_reservoir_size
-                if n_batch <= space_remaining:
-                    sample_to_add = batch_df
-                else:
-                    sample_to_add = batch_df.sample(n=space_remaining, seed=rng.randint(0, 2**31))
-                
-                # EARLY EXPANSION for random sample
-                sample_expanded, sample_embed_dim = _expand_embeddings_chunk(
-                    sample_to_add, embedding_model, logger=None
-                )
-                if sample_embed_dim > 0:
-                    embed_dim = sample_embed_dim
-                sample_expanded = sample_expanded.with_columns(pl.lit(True).alias('in_random_sample'))
-                random_sample_expanded.append(sample_expanded)
-                # Track URIs to avoid duplicates when combining with liked posts
-                random_sample_uris.update(sample_expanded['at_uri'].to_list())
-            else:
-                # Reservoir full - probabilistic replacement (reservoir sampling algorithm)
-                n_posts_seen_for_reservoir += n_batch
-                replace_prob = min(1.0, n_batch / n_posts_seen_for_reservoir)
-                
-                if rng.random() < replace_prob * 0.3:  # ~30% chance per qualifying batch
-                    # Replace one chunk with a sample from this batch
-                    if random_sample_expanded:
-                        replace_idx = rng.randint(0, len(random_sample_expanded))
-                        old_chunk = random_sample_expanded[replace_idx]
-                        sample_size = min(n_batch, len(old_chunk))
-                        replacement = batch_df.sample(n=sample_size, seed=rng.randint(0, 2**31))
-                        replacement_expanded, _ = _expand_embeddings_chunk(
-                            replacement, embedding_model, logger=None
-                        )
-                        replacement_expanded = replacement_expanded.with_columns(pl.lit(True).alias('in_random_sample'))
-                        # Update URI tracking
-                        random_sample_uris -= set(old_chunk['at_uri'].to_list())
-                        random_sample_uris.update(replacement_expanded['at_uri'].to_list())
-                        random_sample_expanded[replace_idx] = replacement_expanded
-        
-        # === Extract liked posts from this batch ===
-        # Only add liked posts that are NOT already in the random sample
-        # This avoids duplicates while preserving the random sample's statistical properties
-        batch_liked = batch_df.filter(
-            pl.col('at_uri').is_in(liked_post_uris) & 
-            ~pl.col('at_uri').is_in(random_sample_uris)
+    # get posts: sampled via hash, or in liked_post_uris:
+    negs_and_likes_df = (
+        posts_lf
+        .with_columns(
+            pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
         )
-        
-        if len(batch_liked) > 0:
-            # EARLY EXPANSION: Expand embeddings and drop raw blob
-            batch_liked_expanded, batch_embed_dim = _expand_embeddings_chunk(
-                batch_liked, embedding_model, logger=None  # Quiet for per-batch
-            )
-            if batch_embed_dim > 0:
-                embed_dim = batch_embed_dim
-            batch_liked_expanded = batch_liked_expanded.with_columns(pl.lit(False).alias('in_random_sample'))
-            liked_posts_expanded.append(batch_liked_expanded)
-            n_liked_posts += len(batch_liked_expanded)
-        
-        # Free batch data
-        del batch_df
-        
-        n_random_current = sum(len(r) for r in random_sample_expanded)
-        logger.info(f"  Processed {batch_end}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked (expanded), {n_random_current:,} random sample reservoir")
-        log_memory_checkpoint(f"posts_batch_{batch_end}", logger)
-    
-    logger.info(f"Extracted {len(liked_post_uris):,} unique liked post IDs")
-    
-    # Combine random sample (already expanded)
-    if random_sample_expanded:
-        random_sample_df = pl.concat(random_sample_expanded)
-        # Trim to exact sample size if we collected more
-        if len(random_sample_df) > negative_posts_sample:
-            random_sample_df = random_sample_df.sample(n=negative_posts_sample, seed=random_seed)
-            # Update URI set after trimming
-            random_sample_uris = set(random_sample_df['at_uri'].to_list())
-        n_random_sample = len(random_sample_df)
-        # Count how many liked posts happen to be in the random sample
-        n_liked_in_random = random_sample_df.filter(pl.col('at_uri').is_in(liked_post_uris)).height
-        logger.info(f"Random sample: {n_random_sample:,} posts ({n_liked_in_random:,} are also liked)")
-    else:
-        random_sample_df = None
-        n_random_sample = 0
-        n_liked_in_random = 0
-    
-    del random_sample_expanded
-    
-    # Combine liked posts not in random sample (already expanded)
-    if liked_posts_expanded:
-        liked_only_df = pl.concat(liked_posts_expanded)
-        n_liked_only = len(liked_only_df)
-    else:
-        liked_only_df = None
-        n_liked_only = 0
-    
-    del liked_posts_expanded
-    
+        .join(
+            liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
+            left_on="at_uri",
+            right_on="subject_uri",
+            how="left",
+        )
+        .with_columns(
+            (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
+            pl.col("_is_liked").fill_null(False).alias("is_liked"),
+        )
+        .filter(pl.col("in_random_sample") | pl.col("is_liked"))
+        .drop(["_is_liked", "_hash_key"])
+        .collect(engine="streaming")
+    )
+
+    # calculate metrics
+    n_posts_core = negs_and_likes_df.height
+    n_liked_only = negs_and_likes_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
+    n_liked_in_random = negs_and_likes_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
+    n_random_sample = negs_and_likes_df.filter(pl.col("in_random_sample")).height
+
+    logger.info(f"All posts in raw data: {n_posts_total:,}")
+    logger.info(f"All negatives and likes: {n_posts_core:,}")
+    logger.info(f"Liked only: {n_liked_only:,}")
+    logger.info(f"Liked in random sample: {n_liked_in_random:,}")
+    logger.info(f"Random sample total: {n_random_sample:,}")
+
+    # # expand embeddings
+    final_df, embed_dim = _expand_embeddings_chunk(negs_and_likes_df, embedding_model, logger)
+
     # Total liked posts = those only in liked set + those also in random sample
     n_total_liked_posts = n_liked_only + n_liked_in_random
-    liked_post_match_rate = 100.0 * n_total_liked_posts / len(liked_post_uris) if liked_post_uris else 0
+    liked_post_match_rate = 100.0 * n_total_liked_posts / liked_post_uris_df.height
     logger.info(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
     
     stats = {
@@ -1171,38 +1078,26 @@ def load_posts_core_polars(
         'n_random_sample': n_random_sample,
     }
     
-    # Combine liked-only and random sample posts
-    if liked_only_df is not None and random_sample_df is not None:
-        posts_combined = pl.concat([liked_only_df, random_sample_df])
-    elif liked_only_df is not None:
-        posts_combined = liked_only_df
-    elif random_sample_df is not None:
-        posts_combined = random_sample_df
-    else:
-        posts_combined = pl.DataFrame()
-    
-    n_combined = len(posts_combined)
-    logger.info(f"posts_core: {n_combined:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
+    logger.info(f"posts_core: {n_posts_core:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
     logger.info(f"Embeddings already expanded during loading (dim={embed_dim})")
     
     # Clean up temporary columns and normalize types
-    if len(posts_combined) > 0:
-        # Drop record_created_at_dt (only needed for filtering, not in final output)
-        if 'record_created_at_dt' in posts_combined.columns:
-            posts_combined = posts_combined.drop('record_created_at_dt')
-        
-        # Convert record_created_at to datetime if it exists and is not already datetime
-        if 'record_created_at' in posts_combined.columns:
-            if posts_combined['record_created_at'].dtype != pl.Datetime:
-                posts_combined = posts_combined.with_columns(
-                    pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
-                )
+    # Drop record_created_at_dt (only needed for filtering, not in final output)
+    if 'record_created_at_dt' in final_df.columns:
+        final_df = final_df.drop('record_created_at_dt')
     
-    stats['n_posts_core'] = n_combined
+    # Convert record_created_at to datetime if it exists and is not already datetime
+    if 'record_created_at' in final_df.columns:
+        if final_df['record_created_at'].dtype != pl.Datetime:
+            final_df = final_df.with_columns(
+                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            )
+    
+    stats['n_posts_core'] = n_posts_core
     stats['embedding_dim'] = embed_dim
     log_memory_checkpoint("posts_after_combine", logger)
     
-    return posts_combined, stats, embed_dim
+    return final_df, stats, embed_dim
 
 
 def _expand_embeddings_chunk(
