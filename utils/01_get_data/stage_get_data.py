@@ -165,7 +165,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     t0 = time.time()
 
     # Use Polars-based filtering pipeline for GreenEarth Ingex data
-    likes_core_df, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
+    likes_core_lf, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
         args, logger, context
     )
 
@@ -178,7 +178,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'subject_uri': str,
         'record_created_at': 'datetime',
     }
-    validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
+    validate_dataframe_schema(likes_core_lf, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
     
     # Validate posts_core schema (dynamic embedding columns + all extra columns)
@@ -208,10 +208,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     
-    likes_core_df.write_parquet(likes_core_path)
+    likes_core_lf.sink_parquet(likes_core_path)
     posts_core_df.write_parquet(posts_core_path)
     
-    logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
+    logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_lf):,} rows)")
     logger.info(f"Saved posts_core: {posts_core_path} ({len(posts_core_df):,} rows)")
 
     # Summary
@@ -247,7 +247,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'embedding_model': embedding_model,
         },
         'outputs': {
-            'likes_core_rows': len(likes_core_df),
+            'likes_core_rows': len(likes_core_lf),
             'posts_core_rows': len(posts_core_df),
             'embedding_dim': embed_dim,
         },
@@ -258,7 +258,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Log to experiment tracker - comprehensive metrics for sweep analysis
     # Metric names use readable format: "Category - Metric Name" for better CSV exports
-    n_likes = len(likes_core_df)
+    n_likes = len(likes_core_lf)
     n_posts = len(posts_core_df)
     
     # Primary outputs
@@ -539,7 +539,7 @@ def _run_greenearth_pipeline(
     
     # Step 1: Load and filter likes
     log_operation_start('Load and filter likes data', 'STAGE_01_GET_DATA', logger)
-    likes_core_df, likes_stats = load_likes_core_polars(
+    likes_core_lf, likes_stats = load_likes_core_polars(
         gcs_bucket=gcs_bucket,
         start_str=likes_start,
         end_str=likes_end,
@@ -556,7 +556,7 @@ def _run_greenearth_pipeline(
     
     # Step 2: Extract liked post URIs
     log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
-    liked_post_uris = set(likes_core_df['subject_uri'].unique().to_list())
+    liked_post_uris = set(likes_core_lf['subject_uri'].unique().to_list())
     logger.info(f"Extracted {len(liked_post_uris):,} unique liked post URIs")
     
     mem_tracker.checkpoint("after_uri_extraction")
@@ -591,8 +591,8 @@ def _run_greenearth_pipeline(
     logger.info(f"Found {len(existing_post_uris):,} unique post URIs in posts_core")
     
     # Filter likes to only those with matching posts
-    n_likes_before_join_filter = len(likes_core_df)
-    likes_core_df = likes_core_df.filter(
+    n_likes_before_join_filter = len(likes_core_lf)
+    likes_core_df = likes_core_lf.filter(
         pl.col('subject_uri').is_in(existing_post_uris)
     )
     n_likes_after_join_filter = len(likes_core_df)
