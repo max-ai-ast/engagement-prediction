@@ -785,21 +785,43 @@ def check_data_load_safe(
     return estimation
 
 
+def _apply_time_filter(
+    all_paths: List[str], 
+    start_str: Optional[str], 
+    end_str: Optional[str]
+) -> pl.LazyFrame:
+    lf = pl.scan_parquet(all_paths)
+    
+    start_dt = parse_one_ts(start_str)
+    end_dt = parse_one_ts(end_str)
+
+    # Apply time filter based on record_created_at (when the event occurred)
+    if 'record_created_at' in lf.collect_schema().names():
+        lf = lf.with_columns(
+            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
+        )
+        if start_dt is not None:
+            lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
+        if end_dt is not None:
+            lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
+    
+    return lf
+
+
 # ----------------------------------------
 # Stage 1: Polars-based filtering for core datasets
 # ----------------------------------------
 def load_likes_core_polars(
-    gcs_bucket: str,
     start_str: Optional[str],
     end_str: Optional[str],
     paths: List[str],
     *,
     max_liking_users: Optional[int] = None,
-    max_likes_per_user: int = 100,
-    min_likes_per_user: int = 2,
-    random_seed: int = 42,
+    max_likes_per_user: int,
+    min_likes_per_user: int,
+    random_seed: int,
     logger: logging.Logger,
-) -> Tuple[pl.LazyFrame, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     """
     Load and filter likes data using a streaming Polars pipeline.
     
@@ -817,50 +839,14 @@ def load_likes_core_polars(
     Returns:
         Tuple of (likes_lf: pl.LazyFrame, stats: Dict with filtering statistics)
     """
-    start_dt = parse_one_ts(start_str)
-    end_dt = parse_one_ts(end_str)
-    
     if not paths:
         raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
     
     logger.info(f"Found {len(paths)} likes parquet files")
     log_memory_checkpoint("likes_before_scan", logger)
     
-    # Helper to normalize column names and apply time filter
-    def _prepare_lf(all_paths: List[str]) -> pl.LazyFrame:
-        lf = pl.scan_parquet(all_paths)
-        schema = lf.collect_schema()
-        
-        # Normalize column names
-        col_mapping = {}
-        for col in schema.names():
-            lower = col.lower()
-            if lower == 'did':
-                col_mapping[col] = 'did'
-            elif lower == 'subjecturi':
-                col_mapping[col] = 'subject_uri'
-            elif lower == 'recordcreatedat':
-                col_mapping[col] = 'record_created_at'
-            elif lower == 'insertedat':
-                col_mapping[col] = 'inserted_at'
-        
-        if col_mapping:
-            lf = lf.rename(col_mapping)
-        
-        # Apply time filter based on record_created_at (when the event occurred)
-        if 'record_created_at' in lf.collect_schema().names():
-            lf = lf.with_columns(
-                pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
-            )
-            if start_dt is not None:
-                lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
-            if end_dt is not None:
-                lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
-        
-        return lf
-    
-    base_lf = _prepare_lf(paths)
-    
+    base_lf = _apply_time_filter(paths, start_str, end_str)
+
     # ===== PASS 1: Count likes per user (streaming) =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
     user_counts_df = (
@@ -987,19 +973,18 @@ def load_likes_core_polars(
     
     log_memory_checkpoint("likes_final", logger)
     
-    return likes_lf, stats
+    return likes_lf.collect(), stats
 
 
 def load_posts_core_polars(
-    gcs_bucket: str,
     start_str: Optional[str],
     end_str: Optional[str],
     liked_post_uris: Set[str],
     paths: List[str],
     *,
-    negative_posts_sample: int = 100000,
-    embedding_model: str = 'all_MiniLM_L6_v2',
-    random_seed: int = 42,
+    negative_posts_sample: int,
+    embedding_model: str,
+    random_seed: int,
     logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
     """
@@ -1029,9 +1014,6 @@ def load_posts_core_polars(
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
     """
-    start_dt = parse_one_ts(start_str)
-    end_dt = parse_one_ts(end_str)
-    
     if not paths:
         raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
     
@@ -1040,21 +1022,6 @@ def load_posts_core_polars(
     
     # Batch size for processing
     BATCH_SIZE = 20
-    
-    # Helper to prepare batch with time filter based on record_created_at (when the event occurred)
-    def _prepare_batch_lf(batch_paths: List[str]) -> pl.LazyFrame:
-        lf = pl.scan_parquet(batch_paths)
-        
-        if 'record_created_at' in lf.collect_schema().names():
-            lf = lf.with_columns(
-                pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
-            )
-            if start_dt is not None:
-                lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
-            if end_dt is not None:
-                lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
-        
-        return lf
     
     # Initialize random state
     rng = np.random.RandomState(random_seed)
@@ -1074,7 +1041,7 @@ def load_posts_core_polars(
         batch_end = min(batch_start + BATCH_SIZE, len(paths))
         batch_paths = paths[batch_start:batch_end]
         
-        lf = _prepare_batch_lf(batch_paths)
+        lf = _apply_time_filter(batch_paths, start_str, end_str)
         batch_df = lf.collect()
         n_batch = len(batch_df)
         n_posts_total += n_batch
