@@ -1821,8 +1821,7 @@ def validate_dataframe_schema(
                     return dtype in polars_string or dtype == pl.Object
 
             if isinstance(expected, type):
-                # Handle bool explicitly (bool is a special case - it's not a subclass of itself in the traditional sense)
-                if expected is bool or expected is np.bool_:
+                if issubclass(expected, (bool, np.bool_)):
                     return dtype == pl.Boolean
                 if issubclass(expected, (int, np.integer)):
                     return dtype in polars_integer
