@@ -1036,26 +1036,15 @@ def load_posts_core_polars(
     logger.info(f"n_posts_total: {n_posts_total:,}")
     fraction_to_sample = negative_posts_sample / n_posts_total
     threshold_hash = int(fraction_to_sample * (2**64 - 1))
+
+    cols_with_emb = ["at_uri", "embeddings", "record_created_at", "did", "record_text"]
+    cols_no_emb = cols_with_emb.copy()
+    cols_no_emb.remove("embeddings")
     
     # get posts: sampled via hash, or in liked_post_uris:
-    emb_str = (
-        pl.col("embeddings")
-        .list.eval(
-            pl.when(pl.element().struct.field("key") == embedding_model)
-              .then(pl.element().struct.field("value"))
-        )
-        .list.drop_nulls()
-        .list.get(0)
-    )
-
-    emb_vec = emb_str.map_elements(
-        lambda s: embedding_loads(s, decompress=True) if s is not None else None,
-        return_dtype=pl.List(pl.Float32),
-    )
-
     negs_and_likes_lf = (
         posts_lf
-        .select(['at_uri', 'embeddings', 'record_created_at', 'did', 'record_text'])
+        .select(cols_with_emb)
         .with_columns(
             pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
         )
@@ -1071,18 +1060,23 @@ def load_posts_core_polars(
         )
         .filter(pl.col("in_random_sample") | pl.col("is_liked"))
         .drop(["_is_liked", "_hash_key"])
-        .with_columns(emb_vec.alias("_emb_vec"))
-        .with_columns(
-            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(384)]
-        ).drop(["embeddings", "_emb_vec"])
     )
+
+    # get embedding dim
+    embed_dim = get_embed_dim(posts_lf, embedding_model)
+    logger.info(f"Detected embedding dimension: {embed_dim}")
+
+    # expand embeddings into columns
+    negs_and_likes_lf = expand_embeddings_polars(negs_and_likes_lf, embedding_model, embed_dim)
+
+    # write out
     negs_and_likes_lf.sink_parquet("negs_and_likes.parquet", compression="zstd", engine="streaming", row_group_size=128)
     log_memory_checkpoint("posts_after_sink_parquet", logger)
 
     negs_and_likes_df = (
         pl
         .scan_parquet("negs_and_likes.parquet")
-        .select(["is_liked", "in_random_sample", "at_uri", "record_created_at", "did", "record_text"])
+        .select(cols_no_emb + ['is_liked', 'in_random_sample'])
         .collect(engine="streaming")
     )
 
@@ -1097,9 +1091,6 @@ def load_posts_core_polars(
     logger.info(f"Liked only: {n_liked_only:,}")
     logger.info(f"Liked in random sample: {n_liked_in_random:,}")
     logger.info(f"Random sample total: {n_random_sample:,}")
-
-    # # expand embeddings
-    final_df, embed_dim = _expand_embeddings_chunk(negs_and_likes_df, embedding_model, logger)
 
     # Total liked posts = those only in liked set + those also in random sample
     n_total_liked_posts = n_liked_only + n_liked_in_random
@@ -1118,174 +1109,59 @@ def load_posts_core_polars(
     logger.info(f"posts_core: {n_posts_core:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
     logger.info(f"Embeddings already expanded during loading (dim={embed_dim})")
     
-    # Clean up temporary columns and normalize types
-    # Drop record_created_at_dt (only needed for filtering, not in final output)
-    if 'record_created_at_dt' in final_df.columns:
-        final_df = final_df.drop('record_created_at_dt')
-    
-    # Convert record_created_at to datetime if it exists and is not already datetime
-    if 'record_created_at' in final_df.columns:
-        if final_df['record_created_at'].dtype != pl.Datetime:
-            final_df = final_df.with_columns(
-                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
-            )
-    
     stats['n_posts_core'] = n_posts_core
     stats['embedding_dim'] = embed_dim
     log_memory_checkpoint("posts_after_combine", logger)
     
-    return final_df, stats, embed_dim
-
-
-def _expand_embeddings_chunk(
-    posts_df: pl.DataFrame,
-    embedding_model: str,
-    logger: Optional[Any] = None,
-) -> Tuple[pl.DataFrame, int]:
-    """
-    Expand embeddings for a chunk of posts and drop the raw blob.
-    
-    This is an internal helper for early embedding expansion during batch loading.
-    Returns (expanded_df without embeddings column, embedding_dim).
-    """
-    if 'embeddings' not in posts_df.columns or len(posts_df) == 0:
-        return posts_df, 0
-    
-    # Convert to pandas for embedding extraction
-    pdf = posts_df.to_pandas()
-    
-    # Find embedding dimension from first valid example
-    embed_dim = None
-    for emb_list in pdf['embeddings']:
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                sample_emb = embedding_loads(emb_str, decompress=True)
-                embed_dim = len(sample_emb)
-                break
-            except Exception:
-                continue
-    
-    if embed_dim is None:
-        # No valid embeddings - just drop the column
-        if 'embeddings' in posts_df.columns:
-            posts_df = posts_df.drop('embeddings')
-        return posts_df, 0
-    
-    # Extract embeddings for all rows
-    n_rows = len(pdf)
-    emb_array = np.zeros((n_rows, embed_dim), dtype=np.float32)
-    
-    for i, emb_list in enumerate(pdf['embeddings']):
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                emb_array[i] = embedding_loads(emb_str, decompress=True)
-            except Exception:
-                continue
-    
-    # Create embedding column names
-    emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
-    
-    # Add embedding columns to dataframe
-    emb_df = pd.DataFrame(emb_array, columns=emb_col_names)
-    pdf = pd.concat([pdf.reset_index(drop=True), emb_df], axis=1)
-    
-    # Drop the original embeddings column (the large raw blob)
-    pdf = pdf.drop(columns=['embeddings'])
-    
-    # Convert back to polars
-    result_df = pl.from_pandas(pdf)
-    
-    return result_df, embed_dim
-
-
-def expand_embeddings_polars(
-    posts_df: pl.DataFrame,
-    embedding_model: str = 'all_MiniLM_L6_v2',
-    *,
-    logger: logging.Logger,
-) -> Tuple[pl.DataFrame, int]:
-    """
-    Expand the 'embeddings' column into separate post_emb_* columns.
-    
-    The embeddings column contains a list of dicts like:
-    [{'key': 'all_MiniLM_L6_v2', 'value': '<base85-encoded>'}, ...]
-    
-    Returns:
-        Tuple of (posts_df with expanded embeddings, embedding_dim)
-    """
-    if 'embeddings' not in posts_df.columns:
-        logger.info("No 'embeddings' column found, skipping expansion")
-        return posts_df, 0
-    
-    # Convert to pandas for embedding extraction (complex nested structure)
-    logger.info("Expanding embeddings column...")
-    log_memory_checkpoint("embeddings_before_expand", logger)
-    pdf = posts_df.to_pandas()
-    
-    # Find embedding dimension from first valid example
-    embed_dim = None
-    for emb_list in pdf['embeddings']:
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                sample_emb = embedding_loads(emb_str, decompress=True)
-                embed_dim = len(sample_emb)
-                break
-            except Exception:
-                continue
-    
-    if embed_dim is None:
-        logger.info(f"No valid embeddings found for model {embedding_model}")
-        return posts_df, 0
-    
-    logger.info(f"Embedding dimension: {embed_dim}")
-    
-    # Extract embeddings for all rows
-    n_rows = len(pdf)
-    emb_array = np.zeros((n_rows, embed_dim), dtype=np.float32)
-    n_valid = 0
-    
-    for i, emb_list in enumerate(pdf['embeddings']):
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                emb_array[i] = embedding_loads(emb_str, decompress=True)
-                n_valid += 1
-            except Exception:
-                continue
-    
-    logger.info(f"Expanded {n_valid:,}/{n_rows:,} embeddings ({100*n_valid/n_rows:.1f}%)")
-    
-    # Create embedding column names
-    emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
-    
-    # Add embedding columns to dataframe
-    emb_df = pd.DataFrame(emb_array, columns=emb_col_names)
-    pdf = pd.concat([pdf.reset_index(drop=True), emb_df], axis=1)
-    
-    # Drop the original embeddings column (too large for parquet)
-    pdf = pdf.drop(columns=['embeddings'])
-    
-    # Convert back to polars
-    result_df = pl.from_pandas(pdf)
-    log_memory_checkpoint("embeddings_after_expand", logger)
-    
-    return result_df, embed_dim
+    return negs_and_likes_df, stats, embed_dim
 
 
 # ----------------------------------------
 # Embeddings helpers
 # ----------------------------------------
+def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    emb_str = (
+        pl.col("embeddings")
+        .list.eval(
+            pl.when(pl.element().struct.field("key") == embedding_model)
+              .then(pl.element().struct.field("value"))
+        )
+        .list.drop_nulls()
+        .list.get(0)
+    )
+    emb_vec = emb_str.map_elements(
+        lambda s: embedding_loads(s, decompress=True) if s is not None else None,
+        return_dtype=pl.List(pl.Float32),
+    )
+    return lf.with_columns(emb_vec.alias("_emb_vec"))
+
+
+def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
+    lf_with_emb = _get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
+    )
+
+
+def expand_embeddings_polars(
+    lf: pl.LazyFrame,
+    embedding_model: str,
+    embed_dim: int
+) -> pl.LazyFrame:
+    lf = _get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf
+        .with_columns(
+            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(embed_dim)]
+        ).drop(["embeddings", "_emb_vec"])
+    )
+
+
 def get_embed_col_names(dim: int) -> List[str]:
     """Generate embedding column names for given dimension."""
     return [f"post_emb_{i}" for i in range(dim)]
@@ -1313,16 +1189,6 @@ def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
                 raise
 
     return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
-
-
-def extract_encoded_embedding_ingex(emb_list: Optional[list[dict]], model_name: str) -> Optional[str]:
-    """Extract base85-encoded embedding string from Ingex embeddings list for given model name."""
-    if emb_list is None:
-        return None
-    for emb_dict in emb_list:
-        if emb_dict['key'] == model_name:
-            return emb_dict['value']
-    return None
 
 
 # ----------------------------------------

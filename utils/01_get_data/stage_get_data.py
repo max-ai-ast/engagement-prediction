@@ -181,21 +181,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
     
-    # Validate posts_core schema (dynamic embedding columns + all extra columns)
+    # Validate posts_core schema
     posts_schema = {
         'at_uri': str,
         'in_random_sample': bool,
-        # Extra columns from source data
         'did': str,
-        'record_created_at': 'datetime',
+        'record_created_at': 'str',
         'record_text': str,
         'is_liked': bool,
     }
-    # Add embedding columns dynamically
-    for i in range(embed_dim):
-        posts_schema[f'post_emb_{i}'] = float
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
-    
     logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim})")
 
     # Save outputs as parquet
