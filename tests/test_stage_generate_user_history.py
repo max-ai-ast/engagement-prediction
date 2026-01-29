@@ -20,7 +20,7 @@ def _load_stage_module():
 
 
 def _collect_sorted(lf: pl.LazyFrame) -> pl.DataFrame:
-    return lf.collect().sort(["did", "inserted_at_bucket", "subject_uri"])
+    return lf.collect().sort(["did", "record_created_at_bucket", "subject_uri"])
 
 
 def test_generate_user_history_expands_buckets_and_uniques():
@@ -28,7 +28,7 @@ def test_generate_user_history_expands_buckets_and_uniques():
     likes_core_lf = pl.DataFrame(
         {
             "did": ["u1", "u1", "u2"],
-            "inserted_at": [
+            "record_created_at": [
                 datetime(2024, 1, 1, 0, 5),
                 datetime(2024, 1, 1, 0, 45),
                 datetime(2024, 1, 1, 10, 10),
@@ -50,7 +50,7 @@ def test_generate_user_history_expands_buckets_and_uniques():
     expected = pl.DataFrame(
         {
             "did": ["u1", "u1", "u2", "u2"],
-            "inserted_at_bucket": [
+            "record_created_at_bucket": [
                 datetime(2024, 1, 1, 1, 0),
                 datetime(2024, 1, 1, 2, 0),
                 datetime(2024, 1, 1, 11, 0),
@@ -58,7 +58,7 @@ def test_generate_user_history_expands_buckets_and_uniques():
             ],
             "subject_uri": ["s1", "s1", "s2", "s2"],
         }
-    ).sort(["did", "inserted_at_bucket", "subject_uri"])
+    ).sort(["did", "record_created_at_bucket", "subject_uri"])
 
     assert_frame_equal(out, expected)
 
@@ -68,7 +68,7 @@ def test_generate_user_history_sampling_caps_to_max():
     likes_core_lf = pl.DataFrame(
         {
             "did": ["u1", "u1", "u1"],
-            "inserted_at": [
+            "record_created_at": [
                 datetime(2024, 1, 1, 0, 1),
                 datetime(2024, 1, 1, 0, 2),
                 datetime(2024, 1, 1, 0, 3),
@@ -96,7 +96,7 @@ def test_generate_user_history_sampling_handles_small_groups():
     likes_core_lf = pl.DataFrame(
         {
             "did": ["u1"],
-            "inserted_at": [datetime(2024, 1, 1, 0, 1)],
+            "record_created_at": [datetime(2024, 1, 1, 0, 1)],
             "subject_uri": ["s1"],
         }
     ).lazy()
@@ -120,7 +120,7 @@ def test_generate_user_history_zero_lookback_returns_null_bucket():
     likes_core_lf = pl.DataFrame(
         {
             "did": ["u1"],
-            "inserted_at": [datetime(2024, 1, 1, 0, 1)],
+            "record_created_at": [datetime(2024, 1, 1, 0, 1)],
             "subject_uri": ["s1"],
         }
     ).lazy()
@@ -136,4 +136,4 @@ def test_generate_user_history_zero_lookback_returns_null_bucket():
     )
 
     assert out.height == 1
-    assert out["inserted_at_bucket"][0] is None
+    assert out["record_created_at_bucket"][0] is None
