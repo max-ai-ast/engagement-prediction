@@ -31,6 +31,7 @@ import multiprocessing as mp
 from google.cloud import storage
 import re
 import polars as pl
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -972,7 +973,16 @@ def load_likes_core_polars(
     
     log_memory_checkpoint("likes_final", logger)
     
-    return likes_lf.collect(), stats
+    return likes_lf.collect(engine="streaming"), stats
+
+
+def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
+    dot = lf.show_graph(plan_stage='physical', engine='streaming', raw_output=True)
+    if dot is not None:
+        Path("plan.dot").write_text(dot)
+    else:
+        print("\n\nNo DOT output generated!!!\n\n")
+    subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
 
 
 def load_posts_core_polars(
@@ -1019,18 +1029,33 @@ def load_posts_core_polars(
     logger.info(f"Found {len(paths)} posts parquet files")
     log_memory_checkpoint("posts_before_scan", logger)
 
-    raw_lf = pl.scan_parquet(paths)
-    posts_lf = raw_lf
-    # posts_lf = _apply_time_filter(raw_lf, start_str, end_str)
+    posts_lf = pl.scan_parquet(paths)
 
     # get the total number of posts and calc threshold
     n_posts_total = posts_lf.select(pl.count()).collect().item()
+    logger.info(f"n_posts_total: {n_posts_total:,}")
     fraction_to_sample = negative_posts_sample / n_posts_total
     threshold_hash = int(fraction_to_sample * (2**64 - 1))
     
     # get posts: sampled via hash, or in liked_post_uris:
-    negs_and_likes_df = (
+    emb_str = (
+        pl.col("embeddings")
+        .list.eval(
+            pl.when(pl.element().struct.field("key") == embedding_model)
+              .then(pl.element().struct.field("value"))
+        )
+        .list.drop_nulls()
+        .list.get(0)
+    )
+
+    emb_vec = emb_str.map_elements(
+        lambda s: embedding_loads(s, decompress=True) if s is not None else None,
+        return_dtype=pl.List(pl.Float32),
+    )
+
+    negs_and_likes_lf = (
         posts_lf
+        .select(['at_uri', 'embeddings', 'record_created_at', 'did', 'record_text'])
         .with_columns(
             pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
         )
@@ -1046,6 +1071,18 @@ def load_posts_core_polars(
         )
         .filter(pl.col("in_random_sample") | pl.col("is_liked"))
         .drop(["_is_liked", "_hash_key"])
+        .with_columns(emb_vec.alias("_emb_vec"))
+        .with_columns(
+            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(384)]
+        ).drop(["embeddings", "_emb_vec"])
+    )
+    negs_and_likes_lf.sink_parquet("negs_and_likes.parquet", compression="zstd", engine="streaming", row_group_size=128)
+    log_memory_checkpoint("posts_after_sink_parquet", logger)
+
+    negs_and_likes_df = (
+        pl
+        .scan_parquet("negs_and_likes.parquet")
+        .select(["is_liked", "in_random_sample", "at_uri", "record_created_at", "did", "record_text"])
         .collect(engine="streaming")
     )
 

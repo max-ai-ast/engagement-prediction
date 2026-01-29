@@ -136,7 +136,7 @@ import json
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
 from utils.helpers import (
@@ -187,12 +187,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'in_random_sample': bool,
         # Extra columns from source data
         'did': str,
-        'embed_quote_uri': str,
-        'inserted_at': str,
         'record_created_at': 'datetime',
         'record_text': str,
-        'reply_parent_uri': str,
-        'reply_root_uri': str,
         'is_liked': bool,
     }
     # Add embedding columns dynamically
@@ -510,31 +506,31 @@ def _run_greenearth_pipeline(
         end=posts_end_dt,
     )
     
-    # Smart memory check that accounts for filtering parameters
-    memory_estimate = check_data_load_safe(
-        likes_paths=likes_paths,
-        posts_paths=posts_paths,
-        embedding_dim=384,  # Standard MiniLM dimension
-        max_memory_gb=max_memory_gb,
-        max_memory_pct=max_memory_pct,
-        max_liking_users=max_liking_users,
-        max_likes_per_user=max_likes_per_user,
-        min_likes_per_user=min_likes_per_user,
-        negative_posts_sample=negative_posts_sample,
-        skip_safety_check=skip_memory_check,
-        logger=logger,
-    )
-    all_stats['memory_estimate'] = memory_estimate
-    
-    # Log additional warning if skip_memory_check is set
-    if skip_memory_check:
+    memory_estimate = None
+    if not skip_memory_check:
+        # Smart memory check that accounts for filtering parameters
+        memory_estimate = check_data_load_safe(
+            likes_paths=likes_paths,
+            posts_paths=posts_paths,
+            embedding_dim=384,  # Standard MiniLM dimension
+            max_memory_gb=max_memory_gb,
+            max_memory_pct=max_memory_pct,
+            max_liking_users=max_liking_users,
+            max_likes_per_user=max_likes_per_user,
+            min_likes_per_user=min_likes_per_user,
+            negative_posts_sample=negative_posts_sample,
+            skip_safety_check=skip_memory_check,
+            logger=logger,
+        )
+        all_stats['memory_estimate'] = memory_estimate
+        logger.info("Memory check passed, proceeding with data load")
+    else:
+        # Log additional warning if skip_memory_check is set
         logger.warning("=" * 60)
         logger.warning("SKIPPING MEMORY SAFETY CHECK (--skip-memory-check flag set)")
-        logger.warning(f"Estimated peak: {memory_estimate.get('estimated_peak_gb', 0):.2f} GB")
         logger.warning("Proceeding anyway - monitor memory usage carefully, OOM may occur!")
         logger.warning("=" * 60)
-    else:
-        logger.info("Memory check passed, proceeding with data load")
+        
     
     mem_tracker.checkpoint("after_memory_check")
     
@@ -659,7 +655,7 @@ def _run_greenearth_pipeline(
 
 def _log_data_attrition_report(
     all_stats: Dict[str, Any],
-    memory_estimate: Dict[str, Any],
+    memory_estimate: Optional[Dict[str, Any]],
     args: argparse.Namespace,
     logger,
 ) -> None:
@@ -725,7 +721,6 @@ def _log_data_attrition_report(
     
     # Memory stats
     peak_actual = memory_actual.get('peak_process_gb', 0)
-    peak_estimated = memory_estimate.get('estimated_peak_gb', 0) if memory_estimate else 0
     mem_after_likes = mem_checkpoints.get('after_likes_load', {}).get('process_gb', 0)
     mem_after_posts = mem_checkpoints.get('after_posts_load_and_expansion', {}).get('process_gb', 0)
     
@@ -871,7 +866,8 @@ def _log_data_attrition_report(
     logger.info(sep2)
     
     # Peak memory comparison
-    if peak_estimated > 0:
+    if memory_estimate and memory_estimate.get('estimated_peak_gb', 0) > 0:
+        peak_estimated = memory_estimate.get('estimated_peak_gb', 0) if memory_estimate else 0
         accuracy = pct(peak_actual, peak_estimated)
         logger.info(f"Peak process memory: {peak_actual:.2f} GB (estimated: {peak_estimated:.2f} GB, accuracy: {accuracy:.1f}%)")
     else:
