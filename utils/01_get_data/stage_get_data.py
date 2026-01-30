@@ -1,128 +1,91 @@
 #!/usr/bin/env python3
 
 """
-Stage 1: Get and filter data using memory-efficient incremental processing.
+Stage 1: Get and filter data using streaming Polars + hash-based sampling.
 
-This stage implements a two-pass filtering pipeline to produce core datasets:
+This stage produces two core datasets:
 - likes_core.parquet: filtered likes (user sampling, per-user caps, min-likes)
-- posts_core.parquet: liked posts + random negative sample, with expanded embeddings
+- posts_core.parquet: liked posts + hash-based random sample, with expanded embeddings
 
 ================================================================================
 FILTERING SEQUENCE
 ================================================================================
 
-PHASE 1: Likes Processing (load_likes_core_polars in helpers.py)
+PHASE 0: Inputs and safety check
 -------------------------------------------------------------------------
-Pass 1 - Count likes per user:
-  - Scan all likes parquet files in batches (20 files at a time)
-  - Build a Dict[user_did, like_count] to track likes per user
-  - Apply time-range filter (--likes-start / --likes-end)
+  - List GCS parquet files in the requested time ranges.
+  - Optional memory safety check (check_data_load_safe) before loading.
 
-Pre-filter for minimum likes:
-  - Exclude users with fewer than --min-likes-per-user from the eligible pool
-  - This happens BEFORE sampling, ensuring we don't waste sample slots on users
-    who would later be filtered out
+PHASE 1: Likes Processing (_load_likes_core_polars)
+-------------------------------------------------------------------------
+Pass 1 - Count likes per user (streaming):
+  - Scan all likes parquet files (no batching) and apply --likes-start/--likes-end.
+  - Count total likes and per-user like counts.
+  - Pre-filter users with fewer than --min-likes-per-user.
+  - If --max-liking-users is set, hash-sample eligible users
+    using --cap-random-seed (deterministic).
 
-Sample users (if --max-liking-users is set):
-  - Randomly sample from the eligible user pool (not all users)
-  - Uses --cap-random-seed for reproducibility
-
-Pass 2 - Collect likes for sampled users:
-  - Scan files again, keeping only likes from sampled users
-  - Accumulates likes incrementally to bound memory usage
+Pass 2 - Filter likes to sampled users (streaming):
+  - Semi-join likes to the sampled user list.
 
 Per-user random cap (--max-likes-per-user):
-  - For each user, randomly select up to the cap limit
-  - IMPORTANT: Random selection, NOT recency-based, to avoid the model learning
-    spurious time patterns (e.g., "recent likes predict engagement")
+  - For each user, hash-rank subject_uri with the seed and keep top-K.
+  - This is random but deterministic and avoids recency bias.
 
-Final min-likes verification:
-  - Re-check that users still meet --min-likes-per-user after the per-user cap
-  - Handles edge cases where capping reduced a user below the threshold
+Finalization:
+  - Keep did, subject_uri, record_created_at (convert to UTC datetime if needed).
+  - Collect a final in-memory likes_core_df for downstream steps and stats.
 
-PHASE 2: Posts Processing (load_posts_core_polars in helpers.py)
+PHASE 2: Posts Processing (_load_posts_core_polars)
 -------------------------------------------------------------------------
 Extract liked post URIs:
-  - Get unique subject_uri values from the filtered likes
+  - Get unique subject_uri values from likes_core_df.
 
-Process posts in batches with early embedding expansion:
-  - Scan posts parquet files in batches (20 files at a time)
-  - Apply time-range filter (--posts-start / --posts-end)
-  - For each batch:
-    a) Reservoir sampling for random sample (from ALL posts, independent of like status)
-    b) Extract liked posts NOT already in the random sample
-    c) Expand embeddings immediately (float list -> individual columns)
-    d) Drop the raw embedding blob to free memory
-    e) Accumulate only the slim expanded data
+Process posts with early embedding expansion (single scan):
+  - Scan all posts parquet files (no batching) and apply --posts-start/--posts-end.
+  - Count total posts to compute a hash threshold for --negative-posts-sample.
+  - Hash-sample posts by at_uri (seeded) and left-join liked URIs.
+  - Keep posts that are in the random sample OR are liked.
+  - Expand embeddings into columns and drop the raw embedding blob.
+  - Write posts_core parquet (with embeddings), then read back a slim
+    posts_core_df (without embeddings) for downstream use.
 
-POST-JOIN MIN-LIKES VERIFICATION:
-  - After Phase 2, re-check min-likes threshold based on likes that have matching posts
-  - Since like-post joining isn't perfect (some posts may be missing, deleted, or outside
-    time range), users who met the threshold in Phase 1 may drop below it after the join
-  - Filter out likes for posts that don't exist in posts_core
-  - Remove users who no longer meet --min-likes-per-user after the join filter
-  - This ensures all users in the final dataset have at least min-likes with valid posts
-
-Reservoir sampling for random sample (--negative-posts-sample):
-  - Maintain a reservoir of posts sampled from ALL posts (not filtered by like status)
-  - This ensures the random sample is STATISTICALLY INDEPENDENT of like status
-  - Can be used for unbiased population statistics and as negative examples
-  - Early embedding expansion reduces memory footprint
-  - Some posts in the random sample may also be liked (this is expected and correct)
-
-Combine outputs:
-  - Concatenate liked-only posts + random sample
-  - Add 'in_random_sample' flag:
-    * True = post was collected via reservoir sampling (proper random sample)
-    * False = post was collected only because it was liked
-  - To identify liked posts: join with likes_core on subject_uri = at_uri
+PHASE 3: Post-join min-likes verification (_run_greenearth_pipeline)
+-------------------------------------------------------------------------
+  - Filter likes to posts that exist in posts_core (by subject_uri -> at_uri).
+  - Re-apply --min-likes-per-user after the join; drop users who fall below.
+  - Update stats to reflect join losses and final counts.
 
 ================================================================================
 DESIGN RATIONALE
 ================================================================================
 
-Two-pass processing:
-  Memory usage is bounded regardless of total data size. Pass 1 only stores
-  user DIDs and counts; Pass 2 only stores likes for sampled users.
+Streaming Polars scans:
+  Keeps memory bounded without materializing full tables.
 
 Pre-filtering before sampling:
-  Without this, sampling 100k users might yield only 67k after min-likes filter.
-  Pre-filtering ensures the full sample budget is used on valid users.
+  Ensures the user cap is spent on users who already meet min-likes.
 
-Random capping (not recency-based):
-  If we kept only the N most recent likes per user, the model could learn that
-  "recency = engagement" rather than content-based patterns. Random selection
-  prevents this temporal leakage.
+Hash-based sampling/capping:
+  Deterministic and avoids recency bias in per-user caps.
 
 Early embedding expansion:
-  Raw embeddings are ~150KB/post (serialized float lists). Expanded columns are
-  ~2KB/post. Expanding per-batch reduces peak memory by ~98%.
+  Converts large list blobs into per-dimension columns, reducing peak memory.
 
 Statistically independent random sample:
-  The random sample is drawn from ALL posts, not filtered by like status. This
-  is critical for:
-  1. Unbiased population statistics (e.g., computing base rates)
-  2. Proper negative sampling (liked posts appearing in random sample is correct
-     behavior - it reflects the true probability of a random post being liked)
-  3. Downstream analyses that require a representative sample
-  
-  Note: Some posts in the random sample will also be liked by our users. This is
-  expected and correct - excluding liked posts would bias the sample toward less
-  engaging content.
-
-Reservoir sampling algorithm:
-  Ensures the random sample is representative of the full time range, not
-  biased toward early or late files in the scan order.
+  The random sample is drawn from ALL posts, independent of like status.
+  Some liked posts will appear in the random sample; this is expected.
 
 ================================================================================
 OUTPUTS
 ================================================================================
 
 Under <run_dir>/01_get_data/<timestamp>/:
-  - likes_core.parquet: did, subject_uri, record_created_at
-  - posts_core.parquet: post columns + post_emb_0..N + in_random_sample flag
+  - likes_core_*.parquet: did, subject_uri, record_created_at
+  - posts_core_*.parquet: post columns + post_emb_0..N + is_liked + in_random_sample
   - summary.json: full filtering statistics and parameters
   - stage.log: detailed execution log with memory checkpoints
+  - stage_info.txt: human-readable run summary
 
 Using the outputs:
   - Random sample (for population stats): filter posts_core where in_random_sample=True
@@ -166,10 +129,11 @@ from utils.memory_helpers import (
 # For parsing GCS Ingex filenames
 TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
 
+
 def _parse_ts_from_name_ingex_gcs(
-        blob_name: str, 
-        blob_prefix: str
-    ) -> Optional[datetime]:
+    blob_name: str, 
+    blob_prefix: str
+) -> Optional[datetime]:
     """Parse timestamp from GCS blob name based on Ingex naming convention."""
     pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
     m = pattern.match(blob_name)
@@ -180,11 +144,11 @@ def _parse_ts_from_name_ingex_gcs(
 
 
 def _list_files_in_range_ingex_gcs(
-        gcs_bucket: str, 
-        blob_prefix: str, 
-        start: Optional[datetime], 
-        end: Optional[datetime],
-        ) -> list[str]:
+    gcs_bucket: str, 
+    blob_prefix: str, 
+    start: Optional[datetime], 
+    end: Optional[datetime],
+) -> list[str]:
     """List GCS blob URIs within specified time range based on Ingex naming convention."""
     client = storage.Client()
     blobs = client.list_blobs(gcs_bucket)
@@ -207,16 +171,15 @@ def _get_sampled_users_with_min_likes(
     max_liking_users: Optional[int],
     random_seed: int
 ) -> Tuple[pl.DataFrame, int, int, int]:
-    
-    # ===== Count likes per user =====
+    # get totals
     likes_summary_df = likes_lf.select(
         pl.col('did').n_unique().alias('user_count'),
         pl.len().alias('like_count')
     ).collect(engine="streaming")
-
     n_users_initial = likes_summary_df["user_count"][0]
     n_likes_initial = likes_summary_df["like_count"][0]
 
+    # ===== Count likes per user =====
     user_counts_lf = (
         likes_lf.group_by('did')
         .agg(pl.len().alias('like_count'))
@@ -226,14 +189,13 @@ def _get_sampled_users_with_min_likes(
         user_counts_lf = user_counts_lf.filter(
             pl.col('like_count') >= min_likes_per_user
         )
-
+    # get count of eligible users
     n_users_eligible = (
         user_counts_lf
         .select(pl.len().alias('n'))
         .collect(engine="streaming")
         .item()
     )
-
     # ===== Sample users if cap is set =====
     if max_liking_users is not None and n_users_eligible > max_liking_users:
         fraction_to_sample = max_liking_users / n_users_eligible
@@ -244,10 +206,9 @@ def _get_sampled_users_with_min_likes(
                 pl.col("did").hash(seed=random_seed).alias("_hash_key"),
             ).filter(
                 pl.col("_hash_key") <= threshold_hash
-            ).select("did")
+            )
         )
-
-    return user_counts_lf.collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
+    return user_counts_lf.select("did").collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
 
 
 def _load_likes_core_polars(
@@ -272,11 +233,8 @@ def _load_likes_core_polars(
     5. Apply per-user random caps (NOT recency-based)
     6. Verify min-likes threshold (handles edge cases from per-user caps)
     
-    This avoids materializing the full likes table in memory and returns a
-    LazyFrame suitable for streaming writes (sink_parquet).
-    
     Returns:
-        Tuple of (likes_lf: pl.LazyFrame, stats: Dict with filtering statistics)
+        Tuple of (likes_lf: pl.DataFrame, stats: Dict with filtering statistics)
     """
     if not paths:
         raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
@@ -352,45 +310,34 @@ def _load_likes_core_polars(
     
     # ===== Apply per-user random cap (NOT recency-based) =====
     if max_likes_per_user > 0 and n_after_user_sample > 0:
-        n_before_cap = n_after_user_sample
-        
         # Add deterministic pseudo-random order per user, then keep top-K
         likes_lf = likes_lf.with_columns(
             pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
-        )
-        likes_lf = likes_lf.with_columns(
+        ).with_columns(
             pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
+        ).filter(
+            pl.col('_rand_order') <= max_likes_per_user
+        ).drop(
+            ['_rand_key', '_rand_order']
         )
-        likes_lf = likes_lf.filter(pl.col('_rand_order') <= max_likes_per_user)
-        likes_lf = likes_lf.drop(['_rand_key', '_rand_order'])
-        
-        # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
-        n_after_cap = int(
-            counts_pre_cap_df
-            .select(pl.col('like_count').clip(upper_bound=max_likes_per_user).sum())
-            .item()
-        )
-        pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
-        logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
-        stats['n_likes_after_per_user_cap'] = n_after_cap
-    else:
-        stats['n_likes_after_per_user_cap'] = n_after_user_sample
     
-    # Select output columns
-    output_cols = ['did', 'subject_uri', 'record_created_at']
-    likes_lf = likes_lf.select(output_cols)
-    
+    likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).collect(engine="streaming")
+
+    # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
+    n_after_cap = likes_df.height
+    pct_retained = 100.0 * n_after_cap / n_after_user_sample if n_after_user_sample > 0 else 0
+    logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
+    stats['n_likes_after_per_user_cap'] = n_after_cap
+
     # Convert record_created_at to datetime if it exists and is not already datetime
-    schema = likes_lf.collect_schema()
+    schema = likes_df.schema
     if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
-        likes_lf = likes_lf.with_columns(
+        likes_df = likes_df.with_columns(
             pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
         )
-    
-    likes_df = likes_lf.collect(engine="streaming")
 
-    stats['n_likes_final'] = len(likes_df)
-    stats['n_users_final'] = likes_df['did'].n_unique() if len(likes_df) > 0 else 0
+    stats['n_likes_final'] = n_after_cap
+    stats['n_users_final'] = likes_df['did'].n_unique() if n_after_cap > 0 else 0
 
     log_memory_checkpoint("likes_final", logger)
     
