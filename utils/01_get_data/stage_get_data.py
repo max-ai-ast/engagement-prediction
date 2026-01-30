@@ -408,7 +408,7 @@ def _load_posts_core_polars(
     posts_lf = apply_time_filter(posts_lf, start_str, end_str)
 
     # get the total number of posts and calc threshold
-    n_posts_total = posts_lf.select(pl.count()).collect().item()
+    n_posts_total = posts_lf.select(pl.len()).collect().item()
     logger.info(f"n_posts_total: {n_posts_total:,}")
     threshold_hash = _compute_random_sample_threshold(n_posts_total, negative_posts_sample)
 
@@ -525,8 +525,15 @@ def _load_posts_core_polars(
 
 
 def _compute_random_sample_threshold(n_posts_total: int, negative_posts_sample: int) -> int:
-    fraction_to_sample = negative_posts_sample / n_posts_total
-    return int(fraction_to_sample * (2**64 - 1))
+    if n_posts_total <= 0:
+        return 0
+    max_hash = 2**64 - 1
+    if negative_posts_sample >= n_posts_total:
+        return max_hash
+    if negative_posts_sample <= 0:
+        return 0
+    # Use integer math to avoid float rounding issues at large ranges.
+    return (negative_posts_sample * max_hash) // n_posts_total
 
 
 def _build_posts_candidate_lf(
