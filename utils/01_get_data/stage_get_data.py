@@ -137,6 +137,7 @@ import argparse
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional
+import polars as pl
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
 from utils.helpers import (
@@ -164,9 +165,44 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     t0 = time.time()
 
+    # Get input parameters
+    gcs_bucket = args.gcs_bucket
+    posts_start = args.posts_start
+    posts_end = args.posts_end
+    likes_start = args.likes_start
+    likes_end = args.likes_end
+    max_liking_users = args.max_liking_users
+    if max_liking_users is not None:
+        max_liking_users = int(max_liking_users)
+    max_likes_per_user = int(args.max_likes_per_user)
+    min_likes_per_user = int(args.min_likes_per_user)
+    negative_posts_sample = int(args.negative_posts_sample)
+    cap_random_seed = int(args.cap_random_seed)
+    embedding_model = args.embedding_model
+    skip_memory_check = bool(args.skip_memory_check)
+    max_memory_gb = args.max_memory_gb
+    if max_memory_gb is not None:
+        max_memory_gb = float(max_memory_gb)
+    max_memory_pct = float(args.max_memory_pct)
+
     # Use Polars-based filtering pipeline for GreenEarth Ingex data
-    likes_core_df, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
-        args, logger, context, out_dir
+    likes_core_df, posts_core_df, posts_core_path, embed_dim, all_stats = _run_greenearth_pipeline(
+        logger=logger, 
+        out_dir=out_dir,
+        gcs_bucket=gcs_bucket,
+        likes_start=likes_start,
+        likes_end=likes_end,
+        posts_start=posts_start,
+        posts_end=posts_end,
+        skip_memory_check=skip_memory_check,
+        max_memory_gb=max_memory_gb,
+        max_memory_pct=max_memory_pct,
+        max_liking_users=max_liking_users,
+        max_likes_per_user=max_likes_per_user,
+        min_likes_per_user=min_likes_per_user,
+        negative_posts_sample=negative_posts_sample,
+        cap_random_seed=cap_random_seed,
+        embedding_model=embedding_model
     )
 
     # Validate output schemas before saving
@@ -181,32 +217,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
 
-    # Save likes as parquet
+    # Save likes as parquet (posts are saved in load_posts_core_polars() in helpers.py)
     log_operation_start('Save likes core dataset as parquet', 'STAGE_01_GET_DATA', logger)
     ts_name = out_dir.name
-    
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
     likes_core_df.write_parquet(likes_core_path)
     logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
-    posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
 
     # Summary
     log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
-    
-    # Get parameters for summary
-    gcs_bucket = args.gcs_bucket
-    posts_start = args.posts_start
-    posts_end = args.posts_end
-    likes_start = args.likes_start
-    likes_end = args.likes_end
-    max_liking_users = args.max_liking_users
-    if max_liking_users is not None:
-        max_liking_users = int(max_liking_users)
-    max_likes_per_user = int(args.max_likes_per_user)
-    min_likes_per_user = int(args.min_likes_per_user)
-    negative_posts_sample = int(args.negative_posts_sample)
-    cap_random_seed = int(args.cap_random_seed)
-    embedding_model = args.embedding_model
     
     summary = {
         'gcs_bucket': gcs_bucket,
@@ -425,10 +444,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _run_greenearth_pipeline(
-    args: argparse.Namespace,
     logger,
-    context: Context,
     out_dir: Path,
+    gcs_bucket: str,
+    likes_start: str,
+    likes_end: str,
+    posts_start: str,
+    posts_end: str,
+    skip_memory_check: bool,
+    max_memory_gb: Optional[float],
+    max_memory_pct: float,
+    max_liking_users: Optional[int],
+    max_likes_per_user: int,
+    min_likes_per_user: int,
+    negative_posts_sample: int,
+    cap_random_seed: int,
+    embedding_model: str
 ):
     """
     Run the new Polars-based filtering pipeline for GreenEarth Ingex data.
@@ -436,28 +467,6 @@ def _run_greenearth_pipeline(
     Returns:
         Tuple of (likes_core_df, posts_core_df, embed_dim, stats_dict)
     """
-    import polars as pl
-    
-    gcs_bucket = args.gcs_bucket
-    posts_start = args.posts_start
-    posts_end = args.posts_end
-    likes_start = args.likes_start
-    likes_end = args.likes_end
-    
-    max_liking_users = args.max_liking_users
-    if max_liking_users is not None:
-        max_liking_users = int(max_liking_users)
-    max_likes_per_user = int(args.max_likes_per_user)
-    min_likes_per_user = int(args.min_likes_per_user)
-    negative_posts_sample = int(args.negative_posts_sample)
-    cap_random_seed = int(args.cap_random_seed)
-    embedding_model = args.embedding_model
-    max_memory_gb = args.max_memory_gb
-    if max_memory_gb is not None:
-        max_memory_gb = float(max_memory_gb)
-    max_memory_pct = float(args.max_memory_pct)
-    skip_memory_check = bool(args.skip_memory_check)
-    
     all_stats = {}
     
     # Initialize memory tracker for actual memory monitoring
@@ -542,7 +551,7 @@ def _run_greenearth_pipeline(
     # This loads posts, filters to liked + negative sample, and expands embeddings per-batch
     # Early expansion dramatically reduces memory by dropping raw embedding blobs immediately
     log_operation_start('Load posts with early embedding expansion', 'STAGE_01_GET_DATA', logger)
-    posts_core_df, posts_stats, embed_dim = load_posts_core_polars(
+    posts_core_df, posts_stats, embed_dim, posts_core_path = load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
         liked_post_uris_df=liked_post_uris_df,
@@ -629,15 +638,19 @@ def _run_greenearth_pipeline(
             logger.info(f"Memory estimation accuracy: actual peak {actual_peak:.3f} GB vs estimated {estimated_peak:.2f} GB ({accuracy_pct:.1f}%)")
     
     # Log comprehensive attrition report
-    _log_data_attrition_report(all_stats, memory_estimate, args, logger)
+
+    max_liking_users_for_report = max_liking_users if max_liking_users is not None else 0
+    _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_liking_users_for_report, logger)
     
-    return likes_core_df, posts_core_df, embed_dim, all_stats
+    return likes_core_df, posts_core_df, posts_core_path, embed_dim, all_stats
 
 
 def _log_data_attrition_report(
     all_stats: Dict[str, Any],
     memory_estimate: Optional[Dict[str, Any]],
-    args: argparse.Namespace,
+    min_likes_per_user: int,
+    max_likes_per_user: int,
+    max_liking_users: int,
     logger,
 ) -> None:
     """
@@ -660,12 +673,6 @@ def _log_data_attrition_report(
         if n is None:
             return '-'
         return f"{n:,}"
-    
-    # Get parameters for display
-    min_likes = int(args.min_likes_per_user)
-    max_likes = int(args.max_likes_per_user)
-    max_users = int(args.max_liking_users) if args.max_liking_users is not None else 0
-    neg_sample = int(args.negative_posts_sample)
     
     # Build memory checkpoint lookup
     mem_checkpoints = {}
@@ -727,15 +734,15 @@ def _log_data_attrition_report(
     # 2. Min-likes pre-filter
     if n_users_excluded_min > 0:
         excluded_pct = pct(n_users_excluded_min, n_users_initial)
-        logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes_per_user) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
         logger.info(f"{'   - Excluded users':<45} {'-' + fmt(n_users_excluded_min):>12} {f'({excluded_pct:.1f}%)':>15} {'':>10}")
     else:
-        logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes_per_user) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
     
     # 3. User sampling
-    if max_users > 0 and n_users_eligible > 0:
+    if max_liking_users > 0 and n_users_eligible > 0:
         sample_pct = pct(n_users_sampled, n_users_eligible)
-        logger.info(f"{'3. User sampling (' + fmt(max_users) + ')':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'3. User sampling (' + fmt(max_liking_users) + ')':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
         logger.info(f"{'   - Retained':<45} {f'{sample_pct:.1f}%':>12} {'':>15} {'':>10}")
     else:
         logger.info(f"{'3. User sampling (no cap)':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
@@ -749,7 +756,7 @@ def _log_data_attrition_report(
     # 5. Per-user cap
     if n_likes_after_user_sample > 0:
         cap_pct = pct(n_likes_after_cap, n_likes_after_user_sample)
-        logger.info(f"{'5. Per-user cap (' + str(max_likes) + ')':<45} {'(n/a)':>12} {fmt(n_likes_after_cap):>15} {'':>10}")
+        logger.info(f"{'5. Per-user cap (' + str(max_likes_per_user) + ')':<45} {'(n/a)':>12} {fmt(n_likes_after_cap):>15} {'':>10}")
         logger.info(f"{'   - Retained':<45} {'':>12} {f'({cap_pct:.1f}%)':>15} {'':>10}")
     
     # 6. Min-likes verification
@@ -798,7 +805,7 @@ def _log_data_attrition_report(
     if n_users_removed_join > 0:
         join_users_pct = pct(n_users_removed_join, n_users_before_join_verify)
         logger.info(f"{'After min-likes re-verify':<45} {fmt(n_users_final_join):>12} {fmt(n_likes_final_join):>15}")
-        logger.info(f"{'  - Users removed (<' + str(min_likes) + ' joinable)':<45} {'-' + fmt(n_users_removed_join) + f' ({join_users_pct:.1f}%)':>12} {'':>15}")
+        logger.info(f"{'  - Users removed (<' + str(min_likes_per_user) + ' joinable)':<45} {'-' + fmt(n_users_removed_join) + f' ({join_users_pct:.1f}%)':>12} {'':>15}")
     
     logger.info(sep2)
     
