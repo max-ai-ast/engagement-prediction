@@ -803,12 +803,61 @@ def _apply_time_filter(
 # ----------------------------------------
 # Stage 1: Polars-based filtering for core datasets
 # ----------------------------------------
+def get_sampled_users_with_min_likes(
+    likes_lf: pl.LazyFrame,
+    min_likes_per_user: int,
+    max_liking_users: Optional[int],
+    random_seed: int
+) -> Tuple[pl.DataFrame, int, int, int]:
+    
+    # ===== Count likes per user =====
+    likes_summary_df = likes_lf.select(
+        pl.col('did').n_unique().alias('user_count'),
+        pl.len().alias('like_count')
+    ).collect(engine="streaming")
+
+    n_users_initial = likes_summary_df["user_count"][0]
+    n_likes_initial = likes_summary_df["like_count"][0]
+
+    user_counts_lf = (
+        likes_lf.group_by('did')
+        .agg(pl.len().alias('like_count'))
+    )
+    # ===== Pre-filter users by min_likes_per_user before sampling =====
+    if min_likes_per_user > 0:
+        user_counts_lf = user_counts_lf.filter(
+            pl.col('like_count') >= min_likes_per_user
+        )
+
+    n_users_eligible = (
+        user_counts_lf
+        .select(pl.len().alias('n'))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    # ===== Sample users if cap is set =====
+    if max_liking_users is not None and n_users_eligible > max_liking_users:
+        fraction_to_sample = max_liking_users / n_users_eligible
+        threshold_hash = int(fraction_to_sample * (2**64 - 1))
+        
+        user_counts_lf = (
+            user_counts_lf.with_columns(
+                pl.col("did").hash(seed=random_seed).alias("_hash_key"),
+            ).filter(
+                pl.col("_hash_key") <= threshold_hash
+            ).select("did")
+        )
+
+    return user_counts_lf.collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
+
+
 def load_likes_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
     paths: List[str],
     *,
-    max_liking_users: Optional[int] = None,
+    max_liking_users: Optional[int],
     max_likes_per_user: int,
     min_likes_per_user: int,
     random_seed: int,
@@ -840,16 +889,16 @@ def load_likes_core_polars(
     raw_lf = pl.scan_parquet(paths)
     base_lf = _apply_time_filter(raw_lf, start_str, end_str)
 
-    # ===== PASS 1: Count likes per user (streaming) =====
+    # ===== PASS 1: Filter users =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
-    user_counts_df = (
-        base_lf.group_by('did')
-        .agg(pl.len().alias('like_count'))
-        .collect(engine="streaming")
+
+    # Filter users by min likes and then sample down to max liking users
+    sampled_users_df, n_users_initial, n_likes_initial, n_users_eligible = get_sampled_users_with_min_likes(
+        base_lf, 
+        min_likes_per_user,
+        max_liking_users,
+        random_seed
     )
-    
-    n_users_initial = user_counts_df.height
-    n_likes_initial = int(user_counts_df['like_count'].sum()) if n_users_initial > 0 else 0
     logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
     log_memory_checkpoint("likes_after_pass1", logger)
     
@@ -858,35 +907,17 @@ def load_likes_core_polars(
         'n_users_initial': n_users_initial,
     }
 
-    # ===== Pre-filter users by min_likes_per_user before sampling =====
-    if min_likes_per_user > 0:
-        eligible_users_df = user_counts_df.filter(pl.col('like_count') >= min_likes_per_user)
-        n_users_eligible = eligible_users_df.height
-        n_users_filtered = n_users_initial - n_users_eligible
-        logger.info(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
-             f"excluded {n_users_filtered:,} users with too few likes")
-        stats['n_users_eligible_for_sampling'] = n_users_eligible
-        stats['n_users_excluded_min_likes'] = n_users_filtered
-    else:
-        eligible_users_df = user_counts_df.select('did')
-        stats['n_users_eligible_for_sampling'] = n_users_initial
-
-    # ===== Sample users if cap is set =====
-    if max_liking_users is not None and eligible_users_df.height > max_liking_users:
-        sampled_users_df = (
-            eligible_users_df.with_columns(
-                pl.col('did').hash(seed=random_seed).alias('_rand_key')
-            ).sort('_rand_key').head(max_liking_users).select('did')
-        )
-        logger.info(
-            f"Sampled {max_liking_users:,} liking users "
-            f"({100*max_liking_users/eligible_users_df.height:.1f}% of eligible)"
-        )
-        stats['n_users_sampled'] = max_liking_users
-    else:
-        sampled_users_df = eligible_users_df.select('did')
-        stats['n_users_sampled'] = sampled_users_df.height
-    
+    # record stats and log stuff
+    n_users_filtered = n_users_initial - n_users_eligible
+    logger.info(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
+            f"excluded {n_users_filtered:,} users with too few likes")
+    stats['n_users_eligible_for_sampling'] = n_users_eligible
+    stats['n_users_excluded_min_likes'] = n_users_filtered
+    stats['n_users_sampled'] = sampled_users_df.height
+    logger.info(
+        f"Sampled {n_users_filtered:,} liking users "
+        f"({100*n_users_filtered/n_users_eligible:.1f}% of eligible)"
+    )
     log_memory_checkpoint("likes_after_user_sample", logger)
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
