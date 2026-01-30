@@ -99,7 +99,7 @@ import json
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Callable
 import polars as pl
 import logging
 from datetime import datetime, timezone
@@ -211,6 +211,28 @@ def _get_sampled_users_with_min_likes(
     return user_counts_lf.select("did").collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
 
 
+def _apply_per_user_random_cap(
+    likes_lf: pl.LazyFrame,
+    max_likes_per_user: int,
+    random_seed: int
+) -> pl.LazyFrame:
+    if max_likes_per_user <= 0:
+        return likes_lf
+    # Add deterministic pseudo-random order per user, then keep top-K
+    return (
+        likes_lf
+        .with_columns(
+            pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
+        ).with_columns(
+            pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
+        ).filter(
+            pl.col('_rand_order') <= max_likes_per_user
+        ).drop(
+            ['_rand_key', '_rand_order']
+        )
+    )
+
+
 def _load_likes_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
@@ -310,16 +332,7 @@ def _load_likes_core_polars(
     
     # ===== Apply per-user random cap (NOT recency-based) =====
     if max_likes_per_user > 0 and n_after_user_sample > 0:
-        # Add deterministic pseudo-random order per user, then keep top-K
-        likes_lf = likes_lf.with_columns(
-            pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
-        ).with_columns(
-            pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
-        ).filter(
-            pl.col('_rand_order') <= max_likes_per_user
-        ).drop(
-            ['_rand_key', '_rand_order']
-        )
+        likes_lf = _apply_per_user_random_cap(likes_lf, max_likes_per_user, random_seed)
     
     likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).collect(engine="streaming")
 
@@ -355,6 +368,10 @@ def _load_posts_core_polars(
     random_seed: int,
     logger: logging.Logger,
     out_dir: Path,
+    expand_embeddings_fn: Optional[Callable[[pl.LazyFrame, str, int], pl.LazyFrame]] = expand_embeddings_polars,
+    get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = get_embed_dim,
+    embed_dim_override: Optional[int] = None,
+    skip_embedding_expansion: bool = False,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int, Path]:
     """
     Load posts data with a single Polars scan (no batching) and expand embeddings early.
@@ -393,40 +410,38 @@ def _load_posts_core_polars(
     # get the total number of posts and calc threshold
     n_posts_total = posts_lf.select(pl.count()).collect().item()
     logger.info(f"n_posts_total: {n_posts_total:,}")
-    fraction_to_sample = negative_posts_sample / n_posts_total
-    threshold_hash = int(fraction_to_sample * (2**64 - 1))
+    threshold_hash = _compute_random_sample_threshold(n_posts_total, negative_posts_sample)
 
     cols_with_emb = ["at_uri", "embeddings", "record_created_at", "did", "record_text"]
     cols_no_emb = cols_with_emb.copy()
     cols_no_emb.remove("embeddings")
     
     # get posts: sampled via hash, or in liked_post_uris:
-    negs_and_likes_lf = (
-        posts_lf
-        .select(cols_with_emb)
-        .with_columns(
-            pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
-        )
-        .join(
-            liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
-            left_on="at_uri",
-            right_on="subject_uri",
-            how="left",
-        )
-        .with_columns(
-            (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
-            pl.col("_is_liked").fill_null(False).alias("is_liked"),
-        )
-        .filter(pl.col("in_random_sample") | pl.col("is_liked"))
-        .drop(["_is_liked", "_hash_key"])
+    negs_and_likes_lf = _build_posts_candidate_lf(
+        posts_lf=posts_lf,
+        liked_post_uris_df=liked_post_uris_df,
+        threshold_hash=threshold_hash,
+        random_seed=random_seed,
+        cols_with_emb=cols_with_emb,
     )
 
     # get embedding dim
-    embed_dim = get_embed_dim(posts_lf, embedding_model)
+    if embed_dim_override is not None:
+        embed_dim = embed_dim_override
+    else:
+        embed_dim = get_embed_dim_fn(posts_lf, embedding_model)
     logger.info(f"Detected embedding dimension: {embed_dim}")
 
     # expand embeddings into columns
-    posts_core_lf = expand_embeddings_polars(negs_and_likes_lf, embedding_model, embed_dim)
+    if expand_embeddings_fn is None:
+        skip_embedding_expansion = True
+    posts_core_lf = _expand_posts_embeddings(
+        negs_and_likes_lf,
+        embedding_model,
+        embed_dim,
+        expand_embeddings_fn,
+        skip_embedding_expansion,
+    )
     
     # Validate posts_core_lf schema
     posts_schema_with_embs = {
@@ -437,8 +452,9 @@ def _load_posts_core_polars(
         'record_text': str,
         'is_liked': bool,
     }
-    for i in range(embed_dim):
-        posts_schema_with_embs[f'post_emb_{i}'] = float
+    if not skip_embedding_expansion:
+        for i in range(embed_dim):
+            posts_schema_with_embs[f'post_emb_{i}'] = float
     validate_dataframe_schema(posts_core_lf, posts_schema_with_embs, allow_extra_columns=False)
 
     # write out
@@ -450,7 +466,7 @@ def _load_posts_core_polars(
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     
     # low row_group_size because embeddings are very large. keeps memory low
-    posts_core_lf.sink_parquet(posts_core_path, compression="zstd", engine="streaming", row_group_size=128)
+    _write_posts_core_parquet(posts_core_lf, posts_core_path)
     log_memory_checkpoint("posts_after_sink_parquet", logger)
 
     # read back from the parquet file, withOUT embeddings
@@ -506,6 +522,62 @@ def _load_posts_core_polars(
     log_memory_checkpoint("posts_after_combine", logger)
     
     return posts_core_df, stats, embed_dim, posts_core_path
+
+
+def _compute_random_sample_threshold(n_posts_total: int, negative_posts_sample: int) -> int:
+    fraction_to_sample = negative_posts_sample / n_posts_total
+    return int(fraction_to_sample * (2**64 - 1))
+
+
+def _build_posts_candidate_lf(
+    posts_lf: pl.LazyFrame,
+    liked_post_uris_df: pl.DataFrame,
+    threshold_hash: int,
+    random_seed: int,
+    cols_with_emb: List[str],
+) -> pl.LazyFrame:
+    return (
+        posts_lf
+        .select(cols_with_emb)
+        .with_columns(
+            pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
+        )
+        .join(
+            liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
+            left_on="at_uri",
+            right_on="subject_uri",
+            how="left",
+        )
+        .with_columns(
+            (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
+            pl.col("_is_liked").fill_null(False).alias("is_liked"),
+        )
+        .filter(pl.col("in_random_sample") | pl.col("is_liked"))
+        .drop(["_is_liked", "_hash_key"])
+    )
+
+
+def _expand_posts_embeddings(
+    posts_lf: pl.LazyFrame,
+    embedding_model: str,
+    embed_dim: int,
+    expand_embeddings_fn: Optional[Callable[[pl.LazyFrame, str, int], pl.LazyFrame]],
+    skip_embedding_expansion: bool,
+) -> pl.LazyFrame:
+    if skip_embedding_expansion:
+        return posts_lf.drop("embeddings")
+    if expand_embeddings_fn is None:
+        return posts_lf
+    return expand_embeddings_fn(posts_lf, embedding_model, embed_dim)
+
+
+def _write_posts_core_parquet(posts_core_lf: pl.LazyFrame, posts_core_path: Path) -> None:
+    posts_core_lf.sink_parquet(
+        posts_core_path,
+        compression="zstd",
+        engine="streaming",
+        row_group_size=128
+    )
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -762,56 +834,18 @@ def _run_greenearth_pipeline(
     # Since like-post joining isn't perfect (some posts may be missing, deleted, or outside time range),
     # we need to re-check that users still meet min-likes threshold based on likes that have matching posts.
     log_operation_start('Re-verify min-likes after like-post join', '01_GET_DATA', logger)
-    
-    # Get set of post URIs that actually exist in posts_core
-    existing_post_uris = set(posts_core_df['at_uri'].unique().to_list())
-    logger.info(f"Found {len(existing_post_uris):,} unique post URIs in posts_core")
-    
-    # Filter likes to only those with matching posts
-    n_likes_before_join_filter = len(likes_core_df)
-    likes_core_df = likes_core_df.filter(
-        pl.col('subject_uri').is_in(existing_post_uris)
+    likes_core_df, join_stats = _filter_likes_after_post_join(
+        likes_core_df=likes_core_df,
+        posts_core_df=posts_core_df,
+        min_likes_per_user=min_likes_per_user,
+        random_seed=cap_random_seed,
+        logger=logger,
+        n_users_final_before_join=all_stats.get('likes', {}).get('n_users_final', 0),
     )
-    n_likes_after_join_filter = len(likes_core_df)
-    n_likes_removed_by_join = n_likes_before_join_filter - n_likes_after_join_filter
-    logger.info(f"After join filter: {n_likes_before_join_filter:,} -> {n_likes_after_join_filter:,} likes ({n_likes_removed_by_join:,} removed)")
-    
-    # Re-verify min-likes per user
-    n_users_removed_by_join_verify = 0
-    if min_likes_per_user > 0:
-        # Filter users by min likes
-        sampled_users_df, n_users_before_join_verify, _, n_users_after_join_verify = _get_sampled_users_with_min_likes(
-            likes_lf=likes_core_df.lazy(),
-            min_likes_per_user=min_likes_per_user,
-            max_liking_users=None,
-            random_seed=cap_random_seed
-        )
-
-        n_users_before_join_verify = all_stats['likes']['n_users_final']
-        n_users_after_join_verify = sampled_users_df.height
-        n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
-
-        if n_users_removed_by_join_verify > 0:
-            logger.info(
-                f"Min-likes verification after join: {n_users_before_join_verify:,} -> {n_users_after_join_verify:,} users "
-                f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
-            )
-            # Filter likes to only users who still meet threshold
-            valid_user_dids = set(sampled_users_df['did'].to_list())
-            likes_core_df = likes_core_df.filter(
-                pl.col('did').is_in(valid_user_dids)
-            )
-            n_likes_after_final_filter = len(likes_core_df)
-            logger.info(f"Final likes after user filter: {n_likes_after_final_filter:,} likes")
-        else:
-            logger.info(f"All {n_users_before_join_verify:,} users still meet min-likes threshold after join")
     
     # Update stats with join verification results
     if 'likes' in all_stats:
-        all_stats['likes']['n_likes_removed_by_join'] = n_likes_removed_by_join
-        all_stats['likes']['n_users_removed_by_join_verify'] = n_users_removed_by_join_verify
-        all_stats['likes']['n_likes_final_after_join'] = len(likes_core_df)
-        all_stats['likes']['n_users_final_after_join'] = likes_core_df['did'].n_unique() if all_stats['likes']['n_likes_final_after_join'] > 0 else 0
+        all_stats['likes'].update(join_stats)
     
     mem_tracker.checkpoint("after_join_verification")
     
@@ -833,6 +867,67 @@ def _run_greenearth_pipeline(
     _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_liking_users_for_report, logger)
     
     return likes_core_df, posts_core_df, posts_core_path, embed_dim, all_stats
+
+
+def _filter_likes_after_post_join(
+    likes_core_df: pl.DataFrame,
+    posts_core_df: pl.DataFrame,
+    min_likes_per_user: int,
+    random_seed: int,
+    logger: logging.Logger,
+    n_users_final_before_join: Optional[int] = None,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    # Get set of post URIs that actually exist in posts_core
+    existing_post_uris = set(posts_core_df['at_uri'].unique().to_list())
+    logger.info(f"Found {len(existing_post_uris):,} unique post URIs in posts_core")
+    
+    # Filter likes to only those with matching posts
+    n_likes_before_join_filter = len(likes_core_df)
+    likes_core_df = likes_core_df.filter(
+        pl.col('subject_uri').is_in(existing_post_uris)
+    )
+    n_likes_after_join_filter = len(likes_core_df)
+    n_likes_removed_by_join = n_likes_before_join_filter - n_likes_after_join_filter
+    logger.info(f"After join filter: {n_likes_before_join_filter:,} -> {n_likes_after_join_filter:,} likes ({n_likes_removed_by_join:,} removed)")
+    
+    # Re-verify min-likes per user
+    n_users_removed_by_join_verify = 0
+    if min_likes_per_user > 0:
+        # Filter users by min likes
+        sampled_users_df, n_users_before_join_verify, _, n_users_after_join_verify = _get_sampled_users_with_min_likes(
+            likes_lf=likes_core_df.lazy(),
+            min_likes_per_user=min_likes_per_user,
+            max_liking_users=None,
+            random_seed=random_seed
+        )
+
+        if n_users_final_before_join is not None:
+            n_users_before_join_verify = n_users_final_before_join
+        n_users_after_join_verify = sampled_users_df.height
+        n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
+
+        if n_users_removed_by_join_verify > 0:
+            logger.info(
+                f"Min-likes verification after join: {n_users_before_join_verify:,} -> {n_users_after_join_verify:,} users "
+                f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
+            )
+            # Filter likes to only users who still meet threshold
+            valid_user_dids = set(sampled_users_df['did'].to_list())
+            likes_core_df = likes_core_df.filter(
+                pl.col('did').is_in(valid_user_dids)
+            )
+            n_likes_after_final_filter = len(likes_core_df)
+            logger.info(f"Final likes after user filter: {n_likes_after_final_filter:,} likes")
+        else:
+            logger.info(f"All {n_users_before_join_verify:,} users still meet min-likes threshold after join")
+
+    stats = {
+        'n_likes_removed_by_join': n_likes_removed_by_join,
+        'n_users_removed_by_join_verify': n_users_removed_by_join_verify,
+        'n_likes_final_after_join': len(likes_core_df),
+        'n_users_final_after_join': likes_core_df['did'].n_unique() if len(likes_core_df) > 0 else 0,
+    }
+    return likes_core_df, stats
 
 
 def _log_data_attrition_report(
