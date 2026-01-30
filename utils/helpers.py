@@ -791,19 +791,12 @@ def _apply_time_filter(
     start_str: Optional[str], 
     end_str: Optional[str]
 ) -> pl.LazyFrame:
-    start_dt = parse_one_ts(start_str)
-    end_dt = parse_one_ts(end_str)
-
-    # Apply time filter based on record_created_at (when the event occurred)
-    if 'record_created_at' in lf.collect_schema().names():
-        lf = lf.with_columns(
-            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
-        )
-        if start_dt is not None:
-            lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
-        if end_dt is not None:
-            lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
-    
+    if 'record_created_at' not in lf.collect_schema().names():
+        raise ValueError("Input LazyFrame does not contain 'record_created_at' column for time filtering")
+    if start_str is not None:
+        lf = lf.filter(pl.col("record_created_at") >= start_str)
+    if end_str is not None:
+        lf = lf.filter(pl.col("record_created_at") < end_str)
     return lf
 
 
@@ -1036,6 +1029,7 @@ def load_posts_core_polars(
     log_memory_checkpoint("posts_before_scan", logger)
 
     posts_lf = pl.scan_parquet(paths)
+    posts_lf = _apply_time_filter(posts_lf, start_str, end_str)
 
     # get the total number of posts and calc threshold
     n_posts_total = posts_lf.select(pl.count()).collect().item()
@@ -1080,7 +1074,7 @@ def load_posts_core_polars(
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': 'str',
+        'record_created_at': str,
         'record_text': str,
         'is_liked': bool,
     }
@@ -1113,7 +1107,7 @@ def load_posts_core_polars(
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': 'str',
+        'record_created_at': str,
         'record_text': str,
         'is_liked': bool,
     }
