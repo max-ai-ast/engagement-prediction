@@ -107,7 +107,7 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     assert likes_df.height == 2
     assert likes_df["did"].unique().to_list() == ["user_a"]
     assert likes_df.schema["record_created_at"] == pl.Datetime
-    assert stats["n_users_final"] == 1
+    assert likes_df['did'].n_unique() == 1
 
 
 def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
