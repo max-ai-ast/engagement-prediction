@@ -84,6 +84,8 @@ except Exception:  # pragma: no cover
     SentenceTransformer = None  # type: ignore
 
 
+TIMESTAMP_COL_NAME = "record_created_at"
+
 # ----------------------------------------
 # Config
 # ----------------------------------------

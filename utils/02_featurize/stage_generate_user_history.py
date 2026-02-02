@@ -18,10 +18,7 @@ import polars as pl
 import time
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
-from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior
-
-
-TIMESTAMP_COL_NAME = "record_created_at"
+from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
 
 
 # TODO: Add an "end_window_lookback"?
