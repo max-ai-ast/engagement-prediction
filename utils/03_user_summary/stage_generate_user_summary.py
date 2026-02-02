@@ -29,10 +29,11 @@ def _generate_user_summary_from_history(
     embedding_cols = get_embed_cols_from_lf(posts_core_lf)
     
     # join user_history to posts_core to get embeddings and timestamps
-    posts_core_lf_cols = ["subject_uri", "record_created_at"] + embedding_cols
+    posts_core_lf_cols = ["at_uri", "record_created_at"] + embedding_cols
     user_history_lf = user_history_lf.join(
         posts_core_lf.select(posts_core_lf_cols),
-        on="subject_uri",
+        left_on="subject_uri",
+        right_on="at_uri",
         how="inner",
     )
 
@@ -48,7 +49,7 @@ def _generate_user_summary_from_history(
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
-    out_dir = new_stage_timestamp_dir(run_dir, '02_featurize')
+    out_dir = new_stage_timestamp_dir(run_dir, '03_user_summary')
 
     # Initialize logger
     logger = get_stage_logger('STAGE_02_FEATURIZE', log_file=out_dir / 'stage.log')
@@ -62,17 +63,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if posts_core_path is None:
         raise FileNotFoundError(f"Could not find posts_core_*.parquet in 01_get_data")
     posts_core_lf: pl.LazyFrame = load_parquet_from_prior(posts_core_path, "posts_core_")
-    validate_dataframe_schema(posts_core_lf, {})
+    # validate_dataframe_schema(posts_core_lf, {})
     
     user_history_path = select_prior_output(run_dir, '02_featurize', use_latest=context.use_latest, prior_path=context.prior_outputs.get('02_featurize'))
     if user_history_path is None:
         raise FileNotFoundError(f"Could not find user_history_*.parquet in 02_featurize")
     user_history_lf: pl.LazyFrame = load_parquet_from_prior(user_history_path, "user_history_")
-    validate_dataframe_schema(user_history_lf, {"did": str, "subject_uri": str, "record_created_at_bucket": pl.Datetime})
+    validate_dataframe_schema(user_history_lf, {"did": str, "subject_uri": str, "timestamp_bucket": pl.Datetime})
 
     log_operation_start('Aggregate likes into user history store', 'STAGE_02_FEATURIZE', logger)
     user_summary_lf: pl.LazyFrame = _generate_user_summary_from_history(posts_core_lf, user_history_lf, tau_hours)
-    validate_dataframe_schema(user_summary_lf, {})
+    # validate_dataframe_schema(user_summary_lf, {})
 
     # Write out result
     user_summary_output_path = out_dir / f"user_summary_{out_dir.name}.parquet"

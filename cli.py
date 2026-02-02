@@ -400,7 +400,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    stage_order = ['get_data', 'user_history', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'user_history', 'user_summary', 'split', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)

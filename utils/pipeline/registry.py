@@ -17,7 +17,7 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'get_data':      ("utils/01_get_data/stage_get_data.py", "01_get_data"),
     'featurize':     ("utils/02_featurize/stage_featurize.py", "02_featurize"),
     'user_history':  ("utils/02_featurize/stage_generate_user_history.py", "02_featurize"),
-    'relevel':       ("utils/03_relevel/stage_relevel_uniform.py", "03_relevel"),
+    'user_summary':  ("utils/03_user_summary/stage_generate_user_summary.py", "03_relevel"),
     # Optional alternative relevelers (caller can override file path if desired)
     'relevel_simple':("utils/03_relevel/stage_relevel_simple.py", "03_relevel"),
     'relevel_gini':  ("utils/03_relevel/stage_relevel_gini.py", "03_relevel"),
