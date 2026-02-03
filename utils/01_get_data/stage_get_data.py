@@ -121,7 +121,6 @@ from utils.helpers import (
     expand_embeddings_polars,
 )
 from utils.memory_helpers import (
-    log_memory_checkpoint,
     check_data_load_safe,
     MemoryTracker,
 )
@@ -418,7 +417,6 @@ def _load_likes_core_polars(
         raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
     
     logger.info(f"Found {len(paths)} likes parquet files")
-    log_memory_checkpoint("likes_before_scan", logger)
     
     raw_lf = pl.scan_parquet(paths)
     base_lf = apply_time_filter(raw_lf, start_str, end_str)
@@ -435,7 +433,6 @@ def _load_likes_core_polars(
         random_seed
     )
     logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
-    log_memory_checkpoint("likes_after_pass1", logger)
     
     stats: Dict[str, Any] = {
         'n_likes_initial': n_likes_initial,
@@ -452,9 +449,8 @@ def _load_likes_core_polars(
     stats['n_users_sampled'] = n_users_sampled
     logger.info(
         f"Sampled {n_users_sampled:,} liking users "
-        f"({100*n_users_sampled/n_users_initial:.1f}% of eligible)"
+        f"({100*n_users_sampled/n_users_eligible:.1f}% of eligible)"
     )
-    log_memory_checkpoint("likes_after_user_sample", logger)
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
     logger.info("Pass 2: Filtering likes to sampled users")
@@ -471,7 +467,6 @@ def _load_likes_core_polars(
     pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
     logger.info(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_user_sample'] = n_after_user_sample
-    log_memory_checkpoint("likes_after_pass2", logger)
     
     # ===== Capture like count distribution BEFORE cap (for analysis/plotting) =====
     # This shows how many likes each sampled user has before we apply the per-user cap
@@ -507,7 +502,6 @@ def _load_likes_core_polars(
         )
 
     stats['n_likes_final'] = n_after_cap
-    log_memory_checkpoint("likes_final", logger)
     
     return likes_df, stats
 
@@ -558,7 +552,6 @@ def _load_posts_core_polars(
         raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
     
     logger.info(f"Found {len(paths)} posts parquet files")
-    log_memory_checkpoint("posts_before_scan", logger)
 
     posts_lf = pl.scan_parquet(paths)
     posts_lf = apply_time_filter(posts_lf, start_str, end_str)
@@ -627,7 +620,6 @@ def _load_posts_core_polars(
         engine="streaming",
         row_group_size=128
     )
-    log_memory_checkpoint("posts_after_sink_parquet", logger)
 
     # read back from the parquet file, withOUT embeddings
     posts_core_df = (
@@ -679,7 +671,6 @@ def _load_posts_core_polars(
     
     stats['n_posts_core'] = n_posts_core
     stats['embedding_dim'] = embed_dim
-    log_memory_checkpoint("posts_after_combine", logger)
     
     return posts_core_df, stats, embed_dim, posts_core_path
 
@@ -961,7 +952,7 @@ def _run_greenearth_pipeline(
         else:
             logger.info("Memory estimation complete (ignore mode), proceeding regardless")
         
-    mem_tracker.checkpoint("after_memory_check")
+    mem_tracker.checkpoint("after_memory_check", quiet=True)
     
     # Step 1: Load and filter likes
     log_operation_start('Load and filter likes data', '01_GET_DATA', logger)
@@ -978,13 +969,13 @@ def _run_greenearth_pipeline(
     all_stats['likes'] = likes_stats
     n_users_final = likes_core_df['did'].n_unique()
     all_stats['likes']['n_users_final'] = n_users_final
-    mem_tracker.checkpoint("after_likes_load")
+    mem_tracker.checkpoint("after_likes_load", quiet=True)
     
     # Step 2: Extract liked post URIs
     log_operation_start('Extract liked post URIs', '01_GET_DATA', logger)
     liked_post_uris_df: pl.DataFrame = likes_core_df.select(pl.col('subject_uri').unique())
     logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
-    mem_tracker.checkpoint("after_uri_extraction")
+    mem_tracker.checkpoint("after_uri_extraction", quiet=True)
     
     # Step 3: Load posts with early embedding expansion
     # This loads posts, filters to liked + negative sample, and expands embeddings
@@ -1003,7 +994,7 @@ def _run_greenearth_pipeline(
     )
     all_stats['posts'] = posts_stats
     all_stats['embedding_dim'] = embed_dim
-    mem_tracker.checkpoint("after_posts_load_and_expansion")
+    mem_tracker.checkpoint("after_posts_load_and_expansion", quiet=True)
 
     # Step 4: Re-verify min-likes after like-post join
     # Since like-post joining isn't perfect (some posts may be missing, deleted, or outside time range),
@@ -1022,7 +1013,7 @@ def _run_greenearth_pipeline(
     if 'likes' in all_stats:
         all_stats['likes'].update(join_stats)
     
-    mem_tracker.checkpoint("after_join_verification")
+    mem_tracker.checkpoint("after_join_verification", quiet=True)
     
     # Memory summary: compare actual vs estimated
     memory_summary = mem_tracker.summary()

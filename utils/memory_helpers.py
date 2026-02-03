@@ -125,10 +125,19 @@ class MemoryTracker:
         self.checkpoints: List[Tuple[str, float, Dict[str, Any]]] = []
         self.start_time = time.time()
     
-    def checkpoint(self, name: str) -> Dict[str, Any]:
-        """Record a memory checkpoint."""
+    def checkpoint(self, name: str, *, quiet: bool = False) -> Dict[str, Any]:
+        """Record a memory checkpoint.
+        
+        Args:
+            name: Descriptive name for this checkpoint
+            quiet: If True, store data but skip logging the inline message.
+                   Useful when the summary will show all checkpoints anyway.
+        """
         elapsed = time.time() - self.start_time
-        stats = log_memory_checkpoint(name, self.logger)
+        if quiet:
+            stats = get_current_memory_usage()
+        else:
+            stats = log_memory_checkpoint(name, self.logger)
         self.checkpoints.append((name, elapsed, stats))
         return stats
     
@@ -144,11 +153,13 @@ class MemoryTracker:
     
     def summary(self) -> Dict[str, Any]:
         """
-        Log a summary of all memory checkpoints and return the data.
+        Return a summary of all memory checkpoints.
+        
+        Note: This method only returns data; it does not log anything.
+        The caller (e.g., _log_data_attrition_report) is responsible for
+        formatting and logging the summary as needed.
         """
         if not self.checkpoints:
-            if self.logger:
-                self.logger.info("[MEMORY SUMMARY] No checkpoints recorded")
             return {}
         
         peak_gb = self.get_peak_process_memory_gb()
@@ -170,16 +181,6 @@ class MemoryTracker:
                 for name, elapsed, stats in self.checkpoints
             ]
         }
-        
-        if self.logger:
-            self.logger.info("=" * 60)
-            self.logger.info("[MEMORY SUMMARY]")
-            self.logger.info(f"  Peak process memory: {peak_gb:.3f} GB")
-            self.logger.info(f"  Memory growth: {start_gb:.3f} GB -> {end_gb:.3f} GB (+{summary_data['growth_gb']:.3f} GB)")
-            self.logger.info("  Checkpoints:")
-            for name, elapsed, stats in self.checkpoints:
-                self.logger.info(f"    {elapsed:6.1f}s  {name}: {stats.get('process_rss_gb', 0):.3f} GB")
-            self.logger.info("=" * 60)
         
         return summary_data
 
