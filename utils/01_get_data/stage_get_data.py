@@ -14,8 +14,8 @@ FILTERING SEQUENCE
 
 PHASE 0: Inputs and safety check
 -------------------------------------------------------------------------
-  - List GCS parquet files in the requested time ranges.
-  - Optional memory safety check (check_data_load_safe) before loading.
+  - List GCS parquet files in the requested time ranges as a sanity check on data coverage.
+  - Optional memory safety check (check_data_load_safe) before loading (uses an empirical model to estimate the memory required).
 
 PHASE 1: Likes Processing (_load_likes_core_polars)
 -------------------------------------------------------------------------
@@ -338,7 +338,7 @@ def _plot_data_density_histogram(
         logger.warning(f"Failed to create data density histogram: {e}")
         return {}
 
-
+# This function is used to sample users with at least min_likes_per_user likes, and then randomly sample max_liking_users users from the eligible pool
 def _get_sampled_users_with_min_likes(
     likes_lf: pl.LazyFrame,
     min_likes_per_user: int,
@@ -615,7 +615,7 @@ def _load_posts_core_polars(
         'is_liked': bool,
     }
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
-    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim}, emb_idx will be assigned after embedding validation)")
+    logger.info(f"✓ posts_core schema validated")
 
     # calculate metrics
     n_posts_core = posts_core_df.height
@@ -670,27 +670,37 @@ def _build_posts_candidate_lf(
     random_seed: int,
     cols_metadata: List[str],
 ) -> pl.LazyFrame:
-    """Samples random posts (liked or not) and also includes posts from liked_post_uris_df.
-    
+    """
+    Build the posts candidate set by sampling random posts and including all liked posts.
+
     Only selects metadata columns - embeddings are handled separately at the end of the pipeline.
     """
     return (
         posts_lf
+        # Select only required metadata columns for further processing
         .select(cols_metadata)
+        # Compute a deterministic pseudo-random hash value for each post URI (for sampling)
         .with_columns(
             pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
         )
+        # Left join with liked post URIs to tag which posts are in the users' liked set.
+        # The right side adds a _is_liked=True marker for all liked post URIs.
         .join(
             liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
             left_on="at_uri",
             right_on="subject_uri",
             how="left",
         )
+        # Two new columns:
+        #  - in_random_sample: Is this post selected via random hash-sampling (<= threshold)?
+        #  - is_liked: Is this post present in users' likes? Nulls -> False (not liked)
         .with_columns(
             (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
             pl.col("_is_liked").fill_null(False).alias("is_liked"),
         )
+        # Only keep posts that are either in the random sample, or are users' liked posts
         .filter(pl.col("in_random_sample") | pl.col("is_liked"))
+        # Drop temporary helper columns before returning
         .drop(["_is_liked", "_hash_key"])
     )
 
@@ -763,7 +773,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'emb_idx': int,  # NEW: index for memmap lookup
     }
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
-    logger.info("✓ likes_core schema validated (includes emb_idx)")
+    logger.info("✓ likes_core schema validated")
 
     posts_schema = {
         'at_uri': str,
@@ -775,7 +785,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'emb_idx': int,  # NEW: index for memmap lookup
     }
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
-    logger.info("✓ posts_core schema validated (includes emb_idx)")
+    logger.info("✓ posts_core schema validated")
 
     n_likes = len(likes_core_df)
     n_posts = len(posts_core_df)
@@ -1013,7 +1023,7 @@ def _run_greenearth_pipeline(
     mem_tracker.checkpoint("pipeline_start")
     
     # Pre-flight memory safety check
-    log_operation_start('Pre-flight memory safety check', '01_GET_DATA', logger)
+    log_operation_start('Check data coverage', '01_GET_DATA', logger)
     
     # Get file paths for memory estimation
     likes_start_dt = parse_one_ts(likes_start)
@@ -1036,7 +1046,6 @@ def _run_greenearth_pipeline(
     )
     
     # Generate data density histogram for observability
-    log_operation_start('Generate data density histogram', '01_GET_DATA', logger)
     density_stats = _plot_data_density_histogram(
         likes_timestamps=likes_timestamps,
         posts_timestamps=posts_timestamps,
@@ -1054,6 +1063,7 @@ def _run_greenearth_pipeline(
         logger.info("Memory estimation skipped (--memory-check skip)")
     elif memory_check in ("full", "ignore"):
         # Smart memory check that accounts for filtering parameters
+        log_operation_start('Check data load safety', '01_GET_DATA', logger)
         memory_estimate = check_data_load_safe(
             likes_paths=likes_paths,
             posts_paths=posts_paths,
@@ -1069,9 +1079,9 @@ def _run_greenearth_pipeline(
         )
         all_stats['memory_estimate'] = memory_estimate
         if memory_check == "full":
-            logger.info("Memory check passed, proceeding with data load")
+            logger.info("Memory safety check passed, proceeding with data load")
         else:
-            logger.info("Memory estimation complete (ignore mode), proceeding regardless")
+            logger.info("Memory safety check complete (ignore mode), proceeding regardless")
         
     mem_tracker.checkpoint("after_memory_check", quiet=True)
     

@@ -953,6 +953,7 @@ def log_operation_start(operation_name: str, stage_name: str, logger: Optional[l
     """
     if logger is None:
         logger = get_stage_logger(stage_name)
+    logger.info("=" * 60)
     logger.info(f"Starting: {operation_name}")
     return logger
 

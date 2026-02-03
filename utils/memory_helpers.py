@@ -709,10 +709,6 @@ def check_data_load_safe(
             logger.warning("psutil not available, skipping memory safety check")
         return {'skipped': True, 'reason': 'psutil not available'}
     
-    if logger:
-        logger.info("=" * 60)
-        logger.info("PRE-FLIGHT MEMORY CHECK")
-        logger.info("=" * 60)
     
     # Use smart estimation that accounts for filtering
     estimation = estimate_filtered_data_memory(
@@ -750,9 +746,6 @@ def check_data_load_safe(
     
     estimation['is_safe'] = is_safe
     estimation['memory_check_message'] = msg
-    
-    if logger:
-        logger.info("=" * 60)
     
     if not is_safe:
         if skip_safety_check:
