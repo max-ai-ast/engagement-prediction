@@ -100,6 +100,14 @@ def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
     subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
 
 
+def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
+    # Load the most recent *.parquet found in the given directory
+    candidates = sorted(prior_path.glob(f"{prefix}*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
+    return pl.scan_parquet(candidates[0])
+
+
 # ----------------------------------------
 # Embeddings helpers
 # ----------------------------------------
