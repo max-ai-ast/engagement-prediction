@@ -31,7 +31,7 @@ fixed:
   min_likes_per_user: 2
   cap_random_seed: 42
   embedding_model: "all_MiniLM_L6_v2"
-  skip_memory_check: true
+  memory_check: ignore
   stop_after: "get_data"
 
 # All experiments ordered by load factor: days × users × likes_cap

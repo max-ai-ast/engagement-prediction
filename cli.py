@@ -47,7 +47,7 @@ DEFAULTS: Dict[str, Any] = {
     "cap_random_seed": 42,
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
-    "skip_memory_check": False,  # Stage 1: skip memory safety check enforcement
+    "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
     "output_dir": None,
     "run_name": None,
     "debug": False,
@@ -524,8 +524,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Maximum memory to use in GB (None = auto based on available RAM)")
     _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum percentage of available RAM to use (default: 0.75)")
-    _add_arg_with_default(p_all, "--skip-memory-check", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Skip memory safety check enforcement (still estimates, but proceeds regardless - use cautiously to discover actual memory usage)")
+    _add_arg_with_default(p_all, "--memory-check", type=str, choices=["full", "ignore", "skip"],
+                          default=argparse.SUPPRESS,
+                          help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
     _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,

@@ -762,7 +762,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     negative_posts_sample = int(args.negative_posts_sample)
     cap_random_seed = int(args.cap_random_seed)
     embedding_model = args.embedding_model
-    skip_memory_check = bool(args.skip_memory_check)
+    memory_check = str(args.memory_check)  # "full", "ignore", or "skip"
     max_memory_gb = args.max_memory_gb
     if max_memory_gb is not None:
         max_memory_gb = float(max_memory_gb)
@@ -777,7 +777,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         likes_end=likes_end,
         posts_start=posts_start,
         posts_end=posts_end,
-        skip_memory_check=skip_memory_check,
+        memory_check=memory_check,
         max_memory_gb=max_memory_gb,
         max_memory_pct=max_memory_pct,
         max_liking_users=max_liking_users,
@@ -878,7 +878,7 @@ def _run_greenearth_pipeline(
     likes_end: str,
     posts_start: str,
     posts_end: str,
-    skip_memory_check: bool,
+    memory_check: str,
     max_memory_gb: Optional[float],
     max_memory_pct: float,
     max_liking_users: Optional[int],
@@ -938,7 +938,9 @@ def _run_greenearth_pipeline(
     all_stats['data_density'] = density_stats
     
     memory_estimate = None
-    if not skip_memory_check:
+    if memory_check == "skip":
+        logger.info("Memory estimation skipped (--memory-check skip)")
+    elif memory_check in ("full", "ignore"):
         # Smart memory check that accounts for filtering parameters
         memory_estimate = check_data_load_safe(
             likes_paths=likes_paths,
@@ -950,17 +952,14 @@ def _run_greenearth_pipeline(
             max_likes_per_user=max_likes_per_user,
             min_likes_per_user=min_likes_per_user,
             negative_posts_sample=negative_posts_sample,
-            skip_safety_check=skip_memory_check,
+            skip_safety_check=(memory_check == "ignore"),
             logger=logger,
         )
         all_stats['memory_estimate'] = memory_estimate
-        logger.info("Memory check passed, proceeding with data load")
-    else:
-        # Log additional warning if skip_memory_check is set
-        logger.warning("=" * 60)
-        logger.warning("SKIPPING MEMORY SAFETY CHECK (--skip-memory-check flag set)")
-        logger.warning("Proceeding anyway - monitor memory usage carefully, OOM may occur!")
-        logger.warning("=" * 60)
+        if memory_check == "full":
+            logger.info("Memory check passed, proceeding with data load")
+        else:
+            logger.info("Memory estimation complete (ignore mode), proceeding regardless")
         
     mem_tracker.checkpoint("after_memory_check")
     
