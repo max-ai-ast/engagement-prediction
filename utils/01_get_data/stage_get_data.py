@@ -146,16 +146,22 @@ def _parse_ts_from_name_ingex_gcs(
     return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
-def _list_files_in_range_ingex_gcs(
+def _list_files_with_timestamps_ingex_gcs(
     gcs_bucket: str, 
     blob_prefix: str, 
     start: Optional[datetime], 
     end: Optional[datetime],
-) -> list[str]:
-    """List GCS blob URIs within specified time range based on Ingex naming convention."""
+) -> Tuple[list[str], list[datetime]]:
+    """
+    List GCS blob URIs and their timestamps within specified time range.
+    
+    Returns:
+        Tuple of (uris, timestamps) where both lists are aligned by index.
+    """
     client = storage.Client()
     blobs = client.list_blobs(gcs_bucket)
-    out = []
+    uris = []
+    timestamps = []
     for b in blobs:
         ts = _parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
         if ts is None:
@@ -164,8 +170,157 @@ def _list_files_in_range_ingex_gcs(
             continue
         if end is not None and ts >= end:
             continue
-        out.append(f"gs://{gcs_bucket}/{b.name}")
-    return out
+        uris.append(f"gs://{gcs_bucket}/{b.name}")
+        timestamps.append(ts)
+    return uris, timestamps
+
+
+def _plot_data_density_histogram(
+    likes_timestamps: list[datetime],
+    posts_timestamps: list[datetime],
+    likes_start: Optional[datetime],
+    likes_end: Optional[datetime],
+    posts_start: Optional[datetime],
+    posts_end: Optional[datetime],
+    out_dir: Path,
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """
+    Create a histogram showing data file density (files/day) for likes and posts.
+    
+    Helps users visualize:
+    - Data collection coverage within their time window
+    - Gaps in data availability
+    - Relative density of likes vs posts data
+    
+    Args:
+        likes_timestamps: Parsed timestamps from likes parquet files
+        posts_timestamps: Parsed timestamps from posts parquet files
+        likes_start, likes_end: Requested time range for likes
+        posts_start, posts_end: Requested time range for posts
+        out_dir: Directory to save the histogram
+        logger: Logger instance
+        
+    Returns:
+        Dict with density statistics for both likes and posts
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from collections import Counter
+        
+        stats = {}
+        
+        # Helper to compute daily counts
+        def compute_daily_counts(timestamps: list[datetime], name: str) -> Tuple[list, list, Dict]:
+            if not timestamps:
+                return [], [], {'total_files': 0, 'days_with_data': 0, 'mean_files_per_day': 0}
+            
+            # Group by date
+            date_counts = Counter(ts.date() for ts in timestamps)
+            dates = sorted(date_counts.keys())
+            counts = [date_counts[d] for d in dates]
+            
+            # Compute stats
+            total_files = sum(counts)
+            days_with_data = len(dates)
+            mean_per_day = total_files / days_with_data if days_with_data > 0 else 0
+            
+            # Check for gaps (missing days)
+            if len(dates) >= 2:
+                expected_days = (dates[-1] - dates[0]).days + 1
+                missing_days = expected_days - days_with_data
+            else:
+                expected_days = days_with_data
+                missing_days = 0
+            
+            return dates, counts, {
+                'total_files': total_files,
+                'days_with_data': days_with_data,
+                'expected_days': expected_days,
+                'missing_days': missing_days,
+                'mean_files_per_day': round(mean_per_day, 1),
+                'min_files_per_day': min(counts) if counts else 0,
+                'max_files_per_day': max(counts) if counts else 0,
+            }
+        
+        likes_dates, likes_counts, likes_stats = compute_daily_counts(likes_timestamps, 'likes')
+        posts_dates, posts_counts, posts_stats = compute_daily_counts(posts_timestamps, 'posts')
+        
+        stats['likes'] = likes_stats
+        stats['posts'] = posts_stats
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+        
+        # Plot likes density
+        if likes_dates:
+            ax1.bar(likes_dates, likes_counts, color='steelblue', alpha=0.7, edgecolor='white', linewidth=0.5)
+            ax1.axhline(y=likes_stats['mean_files_per_day'], color='red', linestyle='--', 
+                       linewidth=1.5, label=f"Mean: {likes_stats['mean_files_per_day']:.1f}")
+            ax1.set_ylabel('Files per Day')
+            ax1.set_title(f"Likes Data Density ({likes_stats['total_files']:,} files across {likes_stats['days_with_data']} days)")
+            ax1.legend(loc='upper right')
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Add gap warning if applicable
+            if likes_stats['missing_days'] > 0:
+                ax1.text(0.02, 0.98, f"Warning: {likes_stats['missing_days']} missing day(s)", 
+                        transform=ax1.transAxes, fontsize=9, verticalalignment='top',
+                        color='orange', fontweight='bold')
+        else:
+            ax1.text(0.5, 0.5, 'No likes files found in range', transform=ax1.transAxes,
+                    ha='center', va='center', fontsize=12, color='gray')
+            ax1.set_title('Likes Data Density (no data)')
+        
+        # Plot posts density
+        if posts_dates:
+            ax2.bar(posts_dates, posts_counts, color='forestgreen', alpha=0.7, edgecolor='white', linewidth=0.5)
+            ax2.axhline(y=posts_stats['mean_files_per_day'], color='red', linestyle='--',
+                       linewidth=1.5, label=f"Mean: {posts_stats['mean_files_per_day']:.1f}")
+            ax2.set_ylabel('Files per Day')
+            ax2.set_xlabel('Date')
+            ax2.set_title(f"Posts Data Density ({posts_stats['total_files']:,} files across {posts_stats['days_with_data']} days)")
+            ax2.legend(loc='upper right')
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+            
+            # Add gap warning if applicable
+            if posts_stats['missing_days'] > 0:
+                ax2.text(0.02, 0.98, f"Warning: {posts_stats['missing_days']} missing day(s)",
+                        transform=ax2.transAxes, fontsize=9, verticalalignment='top',
+                        color='orange', fontweight='bold')
+        else:
+            ax2.text(0.5, 0.5, 'No posts files found in range', transform=ax2.transAxes,
+                    ha='center', va='center', fontsize=12, color='gray')
+            ax2.set_title('Posts Data Density (no data)')
+            ax2.set_xlabel('Date')
+        
+        plt.tight_layout()
+        
+        # Save to output directory
+        plot_path = out_dir / 'data_density_histogram.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        logger.info(f"Data density histogram saved to {plot_path}")
+        logger.info(f"  Likes: {likes_stats['total_files']:,} files, "
+                   f"{likes_stats['days_with_data']} days with data, "
+                   f"{likes_stats['missing_days']} gaps")
+        logger.info(f"  Posts: {posts_stats['total_files']:,} files, "
+                   f"{posts_stats['days_with_data']} days with data, "
+                   f"{posts_stats['missing_days']} gaps")
+        
+        return stats
+        
+    except Exception as e:
+        logger.warning(f"Failed to create data density histogram: {e}")
+        return {}
 
 
 def _get_sampled_users_with_min_likes(
@@ -754,18 +909,33 @@ def _run_greenearth_pipeline(
     posts_start_dt = parse_one_ts(posts_start)
     posts_end_dt = parse_one_ts(posts_end)
     
-    likes_paths = _list_files_in_range_ingex_gcs(
+    # List files with timestamps for density analysis
+    likes_paths, likes_timestamps = _list_files_with_timestamps_ingex_gcs(
         gcs_bucket=gcs_bucket,
         blob_prefix='bsky_likes',
         start=likes_start_dt,
         end=likes_end_dt,
     )
-    posts_paths = _list_files_in_range_ingex_gcs(
+    posts_paths, posts_timestamps = _list_files_with_timestamps_ingex_gcs(
         gcs_bucket=gcs_bucket,
         blob_prefix='bsky_posts',
         start=posts_start_dt,
         end=posts_end_dt,
     )
+    
+    # Generate data density histogram for observability
+    log_operation_start('Generate data density histogram', '01_GET_DATA', logger)
+    density_stats = _plot_data_density_histogram(
+        likes_timestamps=likes_timestamps,
+        posts_timestamps=posts_timestamps,
+        likes_start=likes_start_dt,
+        likes_end=likes_end_dt,
+        posts_start=posts_start_dt,
+        posts_end=posts_end_dt,
+        out_dir=out_dir,
+        logger=logger,
+    )
+    all_stats['data_density'] = density_stats
     
     memory_estimate = None
     if not skip_memory_check:
