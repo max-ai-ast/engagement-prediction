@@ -1,0 +1,27 @@
+{
+  "version": "260202",
+  "fitted_at": "2026-02-03T18:00:00Z",
+  "r_squared": 0.94,
+  "mean_pct_error": 6.7,
+  "coefficients": {
+    "intercept": -74.5927239155,
+    "data_window_days": -0.0708091837,
+    "max_liking_users_10k": 12.0706132179,
+    "max_likes_per_user_100": 1.5620756976,
+    "negative_posts_sample_10k": 0.2271053690,
+    "log_max_liking_users": 15.4635658117,
+    "sqrt_likes_initial_1e6": 2.8735780908,
+    "days_x_users_10k": -0.0101803924,
+    "users_x_log_users": -1.9725666267
+  },
+  "feature_names": [
+    "data_window_days",
+    "max_liking_users_10k",
+    "max_likes_per_user_100",
+    "negative_posts_sample_10k",
+    "log_max_liking_users",
+    "sqrt_likes_initial_1e6",
+    "days_x_users_10k",
+    "users_x_log_users"
+  ]
+}
