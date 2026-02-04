@@ -73,14 +73,14 @@ def _get_negative_target_posts(
         .with_columns(
             # polars cum_count is 1-based; shift to 0-based to match neg_idx
             (pl.col('at_uri').cum_count().over('bucket') - 1).cast(pl.Int64).alias('idx_in_bucket'),
-            pl.len().over('bucket').alias('bucket_size'),
         )
-    ) # 'at_uri', 'post_record_created_at', 'bucket', 'idx_in_bucket', 'bucket_size'
+    ) # 'at_uri', 'post_record_created_at', 'bucket', 'idx_in_bucket'
 
     bucket_sizes_lf = (
         posts_lf
-        .select(['bucket', 'bucket_size'])
-        .unique(subset=['bucket'])
+        .group_by('bucket')
+        .len()
+        .rename({'len': 'bucket_size'})
     ) # 'bucket', 'bucket_size'
 
     like_ts_col_name = 'like_'+TS_COL_NAME
