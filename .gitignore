@@ -46,3 +46,9 @@ config.yml
 # Pytest
 .pytest_cache/
 pytest-of-*/
+
+# Folders for testing stuff
+*_scratchpad/
+
+# memory sweep results csv
+sweep_results_*.csv

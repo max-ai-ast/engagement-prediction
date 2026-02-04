@@ -13,39 +13,20 @@ from __future__ import annotations
 import os
 import sys
 import json
-import time
 import random
-import hashlib
-import tempfile
 import base64
 import struct
 import zlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from functools import partial
-import warnings
-from io import BytesIO
 import multiprocessing as mp
-from google.cloud import storage
-import re
 import polars as pl
-
+import subprocess
 import numpy as np
 import pandas as pd
 
 # Optional heavy deps: provide stubs/fallbacks to keep imports robust
-try:
-    import boto3  # type: ignore
-    from botocore.exceptions import ClientError, NoCredentialsError  # type: ignore
-except Exception:  # pragma: no cover
-    boto3 = None  # type: ignore
-    class ClientError(Exception):  # type: ignore
-        pass
-    class NoCredentialsError(Exception):  # type: ignore
-        pass
-
 try:
     from tqdm import tqdm  # type: ignore
 except Exception:  # pragma: no cover
@@ -60,47 +41,14 @@ except Exception:  # pragma: no cover
     class nn:  # type: ignore
         Module = object
 
-try:
-    import torchvision.transforms as transforms  # type: ignore
-    from torchvision.models import resnet18, ResNet18_Weights  # type: ignore
-except Exception:  # pragma: no cover
-    transforms = None  # type: ignore
-    resnet18 = None  # type: ignore
-    ResNet18_Weights = None  # type: ignore
-
-try:
-    from PIL import Image  # type: ignore
-except Exception:  # pragma: no cover
-    Image = None  # type: ignore
-
-try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
-
-try:
-    from sentence_transformers import SentenceTransformer  # type: ignore
-except Exception:  # pragma: no cover
-    SentenceTransformer = None  # type: ignore
-
-
-# ----------------------------------------
-# Config
-# ----------------------------------------
-SPACES_BUCKET = "parquet-dumps"
-SPACES_REGION = "sfo3"
-SPACES_HOST = f"{SPACES_REGION}.digitaloceanspaces.com"
 
 # Avoid HF tokenizers fork warnings/deadlocks in multiprocessing contexts
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 
 # ----------------------------------------
-# Datetime helpers
+# Data loading helpers
 # ----------------------------------------
-# For parsing GCS Ingex filenames
-TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
-
 # For parsing CLI arg strings
 KNOWN_TS_FORMATS = [
     "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+0000
@@ -124,257 +72,121 @@ def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
 
 
+def apply_time_filter(
+    lf: pl.LazyFrame, 
+    start_str: Optional[str], 
+    end_str: Optional[str]
+) -> pl.LazyFrame:
+    """
+    Apply a time filter to a polars lazyframe. 
+    Note that applying the filter using strings instead of converting to datetimes allows for 
+    streaming rather than loading everything into memory.
+    """
+    if 'record_created_at' not in lf.collect_schema().names():
+        raise ValueError("Input LazyFrame does not contain 'record_created_at' column for time filtering")
+    if start_str is not None:
+        lf = lf.filter(pl.col("record_created_at") >= start_str)
+    if end_str is not None:
+        lf = lf.filter(pl.col("record_created_at") < end_str)
+    return lf
+
+
+def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
+    dot = lf.show_graph(plan_stage='physical', engine='streaming', raw_output=True)
+    if dot is not None:
+        Path("plan.dot").write_text(dot)
+    else:
+        print("\n\nNo DOT output generated!!!\n\n")
+    subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
+
+
 # ----------------------------------------
-# Data IO helpers (Green Earth Ingex + GCS)
+# Embeddings helpers
 # ----------------------------------------
-def parse_ts_from_name_ingex_gcs(
-        blob_name: str, 
-        blob_prefix: str
-    ) -> Optional[datetime]:
-    """Parse timestamp from GCS blob name based on Ingex naming convention."""
-    pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
-    m = pattern.match(blob_name)
-    if not m:
-        return None
-    ymd, hms = m.group(1), m.group(2)
-    return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
-def list_files_in_range_ingex_gcs(
-        gcs_bucket: str, 
-        blob_prefix: str, 
-        start: Optional[datetime], 
-        end: Optional[datetime],
-        ) -> list[str]:
-    """List GCS blob URIs within specified time range based on Ingex naming convention."""
-    client = storage.Client()
-    blobs = client.list_blobs(gcs_bucket)
-    out = []
-    for b in blobs:
-        ts = parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
-        if ts is None:
-            continue
-        if start is not None and ts < start:
-            continue
-        if end is not None and ts >= end:
-            continue
-        out.append(f"gs://{gcs_bucket}/{b.name}")
-    return out
+# Known embedding model dimensions
+EMBEDDING_MODEL_DIMS: Dict[str, int] = {
+    "all_MiniLM_L6_v2": 384,
+    "all_MiniLM_L12_v2": 384,
+    "all-MiniLM-L6-v2": 384,
+    "all-MiniLM-L12-v2": 384,
+    "paraphrase-MiniLM-L6-v2": 384,
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+}
 
-def load_raw_data_ingex(
-        gcs_bucket: str, 
-        blob_prefix: str,
-        start_str: Optional[str], 
-        end_str: Optional[str], 
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load raw data from GreenEarth Ingex on GCS within specified time ranges."""
+
+def get_embedding_dim_for_model(embedding_model: str) -> int:
+    """
+    Get the embedding dimension for a known model name.
     
-    start_dt: Optional[datetime] = parse_one_ts(start_str)
-    end_dt: Optional[datetime] = parse_one_ts(end_str)
-    
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket = gcs_bucket,
-        blob_prefix = blob_prefix,
-        start = start_dt,
-        end = end_dt,
-    )
-
-    # LazyFrame (from polars)
-    lf = (
-        pl
-        .scan_parquet(paths)
-        .with_columns(
-            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+    Args:
+        embedding_model: Name of the embedding model
+        
+    Returns:
+        Embedding dimension (e.g., 384 for MiniLM models)
+        
+    Raises:
+        ValueError: If model name is not in EMBEDDING_MODEL_DIMS
+    """
+    if embedding_model not in EMBEDDING_MODEL_DIMS:
+        known_models = ", ".join(sorted(EMBEDDING_MODEL_DIMS.keys()))
+        raise ValueError(
+            f"Unknown embedding model '{embedding_model}'. "
+            f"Known models: {known_models}. "
+            f"Add new models to EMBEDDING_MODEL_DIMS in helpers.py."
         )
+    return EMBEDDING_MODEL_DIMS[embedding_model]
+
+
+def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    emb_str = (
+        pl.col("embeddings")
+        .list.eval(
+            pl.when(pl.element().struct.field("key") == embedding_model)
+              .then(pl.element().struct.field("value"))
+        )
+        .list.drop_nulls()
+        .list.get(0)
     )
-    if start_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
-    if end_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
-    pandas_df = lf.collect().to_pandas()
-
-    return pandas_df
-
-
-# ----------------------------------------
-# Data IO helpers (Digital Ocean Spaces/S3 + parquet)
-# ----------------------------------------
-def list_recent_objects_digital_ocean(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
-    """List S3 object keys from the last `days` days within `prefix`."""
-    if boto3 is None:
-        return [], []
-    s3 = boto3.client(
-        "s3",
-        region_name=SPACES_REGION,
-        endpoint_url=f"https://{SPACES_HOST}",
-        aws_access_key_id=os.getenv("SPACES_KEY"),
-        aws_secret_access_key=os.getenv("SPACES_SECRET"),
+    emb_vec = emb_str.map_elements(
+        lambda s: _embedding_loads(s, decompress=True) if s is not None else None,
+        return_dtype=pl.List(pl.Float32),
     )
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    paginator = s3.get_paginator("list_objects_v2")
-
-    keys: List[str] = []
-    file_info: List[dict] = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["LastModified"] >= cutoff:
-                keys.append(obj["Key"])
-                file_info.append(
-                    {
-                        "key": obj["Key"],
-                        "size": obj["Size"],
-                        "modified": obj["LastModified"],
-                    }
-                )
-    return keys, file_info
+    return lf.with_columns(emb_vec.alias("_emb_vec"))
 
 
-def list_all_objects_digital_ocean(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
-    """List all S3 object keys for a prefix (no time filter)."""
-    if boto3 is None:
-        return [], []
-    s3 = boto3.client(
-        "s3",
-        region_name=SPACES_REGION,
-        endpoint_url=f"https://{SPACES_HOST}",
-        aws_access_key_id=os.getenv("SPACES_KEY"),
-        aws_secret_access_key=os.getenv("SPACES_SECRET"),
+def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
+    lf_with_emb = get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
     )
-    paginator = s3.get_paginator("list_objects_v2")
-
-    keys: List[str] = []
-    file_info: List[dict] = []
-    for page in tqdm(paginator.paginate(Bucket=bucket, Prefix=prefix), desc="Scanning S3 pages"):
-        for obj in page.get("Contents", []):
-            keys.append(obj["Key"])
-            file_info.append({
-                "key": obj["Key"],
-                "size": obj["Size"],
-                "modified": obj["LastModified"],
-            })
-    return keys, file_info
 
 
-def download_parquet_files_digital_ocean(keys: List[str], bucket: str, dest_dir: Path) -> List[Path]:
-    """Download parquet files from Spaces/S3 to dest_dir; skip existing."""
-    if boto3 is None:
-        return []
-    s3 = boto3.client(
-        "s3",
-        region_name=SPACES_REGION,
-        endpoint_url=f"https://{SPACES_HOST}",
-        aws_access_key_id=os.getenv("SPACES_KEY"),
-        aws_secret_access_key=os.getenv("SPACES_SECRET"),
+def expand_embeddings_polars(
+    lf: pl.LazyFrame,
+    embedding_model: str,
+    embed_dim: int
+) -> pl.LazyFrame:
+    lf = get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf
+        .with_columns(
+            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(embed_dim)]
+        ).drop(["embeddings", "_emb_vec"])
     )
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    downloaded: List[Path] = []
-    for key in tqdm(keys, desc="Downloading files"):
-        local_path = dest_dir / Path(key).name
-        if not local_path.exists():
-            s3.download_file(bucket, key, str(local_path))
-        downloaded.append(local_path)
-    return downloaded
 
 
-def load_and_combine_data_digital_ocean(datasets: Dict[str, List[Path]], drop_unliked_posts: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load parquet dataframes for posts/likes/(optional images metadata) and optionally drop unliked posts."""
-    posts_dfs: List[pd.DataFrame] = []
-    likes_dfs: List[pd.DataFrame] = []
-    metadata_dfs: List[pd.DataFrame] = []
-
-    for f in tqdm(datasets.get("posts", []), desc="Loading posts"):
-        posts_dfs.append(pd.read_parquet(f))
-    for f in tqdm(datasets.get("likes", []), desc="Loading likes"):
-        likes_dfs.append(pd.read_parquet(f))
-    for f in tqdm(datasets.get("images", []), desc="Loading images"):
-        metadata_dfs.append(pd.read_parquet(f))
-
-    metadata_df = (
-        pd.DataFrame(columns=['commit_cid', 'embed_images'])
-        if len(metadata_dfs) == 0 else pd.concat(metadata_dfs, ignore_index=True)
-    )
-    posts_df = pd.concat(posts_dfs, ignore_index=True) if posts_dfs else pd.DataFrame()
-    likes_df = pd.concat(likes_dfs, ignore_index=True) if likes_dfs else pd.DataFrame()
-
-    if drop_unliked_posts and not likes_df.empty and not posts_df.empty:
-        posts_df = posts_df[posts_df.get("did").isin(likes_df.get("did"))]
-
-    return posts_df, likes_df, metadata_df
-
-
-# ----------------------------------------
-# Join/text detection
-# ----------------------------------------
-def find_join_key(posts_df: pd.DataFrame, likes_df: pd.DataFrame) -> Tuple[str, str]:
-    """Find joins between posts and likes with common cases and overlap fallback."""
-    if "subject_cid" in likes_df.columns and "commit_cid" in posts_df.columns:
-        return "subject_cid", "commit_cid"
-    if "subject_uri" in likes_df.columns and "at_uri" in posts_df.columns:
-        return "subject_uri", "at_uri"
-    common = set(posts_df.columns) & set(likes_df.columns)
-    if not common:
-        raise ValueError("No common column names between likes and posts tables")
-    for col in common:
-        if posts_df[col].isin(likes_df[col]).any():
-            return col, col
-    raise ValueError("No obvious join key between likes and posts tables")
-
-
-def find_text_column(posts_df: pd.DataFrame) -> str:
-    """Heuristic to find the text column."""
-    if "record_text" in posts_df.columns:
-        return "record_text"
-    text_cols = [c for c in posts_df.columns if "text" in c.lower()]
-    if not text_cols:
-        raise ValueError("No text column found in posts table for embedding")
-    return text_cols[0]
-
-
-# ----------------------------------------
-# Embeddings (text + image)
-# ----------------------------------------
 def get_embed_col_names(dim: int) -> List[str]:
     """Generate embedding column names for given dimension."""
     return [f"post_emb_{i}" for i in range(dim)]
 
 
-def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str) -> Tuple[pd.DataFrame, int]:
-    """Compute sentence-transformer embeddings for all posts."""
-    import time
-    if SentenceTransformer is None:
-        raise RuntimeError("sentence-transformers not available")
-    
-    print(f"  Loading embedding model: {model_name}...")
-    t0 = time.time()
-    model = SentenceTransformer(model_name)
-    
-    # Check if GPU is available
-    import torch
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device == 'cuda':
-        print(f"  Model loaded in {time.time()-t0:.2f}s (using GPU)")
-    else:
-        print(f"  Model loaded in {time.time()-t0:.2f}s (using CPU)")
-    
-    sample_text = posts_df[text_column].fillna("").astype(str).iloc[0] if len(posts_df) else ""
-    emb = model.encode([sample_text])
-    dim = emb.shape[1]
-    
-    texts = posts_df[text_column].fillna("").astype(str).tolist()
-    # Use larger batch size for GPU, smaller for CPU
-    batch_size = 1024 if device == 'cuda' else 256
-    print(f"  Computing embeddings for {len(texts)} posts (dim={dim}, batch_size={batch_size})...")
-    t1 = time.time()
-    all_emb = model.encode(texts, batch_size=batch_size, show_progress_bar=True, device=device)
-    rate = len(texts) / (time.time() - t1) if time.time() - t1 > 0 else 0
-    print(f"  Embeddings computed in {time.time()-t1:.2f}s ({rate:.1f} posts/sec)")
-    
-    emb_cols = get_embed_col_names(dim)
-    emb_df = pd.DataFrame(all_emb, columns=emb_cols)
-    posts_emb_df = pd.concat([posts_df.reset_index(drop=True), emb_df], axis=1)
-    return posts_emb_df, dim
-
-
-def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
+def _embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
     """
     Convert an embedding from a base85-encoded string to a list of floats.
 
@@ -396,119 +208,6 @@ def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
                 raise
 
     return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
-
-
-def extract_encoded_embedding_ingex(emb_list: Optional[list[dict]], model_name: str) -> Optional[str]:
-    """Extract base85-encoded embedding string from Ingex embeddings list for given model name."""
-    if emb_list is None:
-        return None
-    for emb_dict in emb_list:
-        if emb_dict['key'] == model_name:
-            return emb_dict['value']
-    return None
-
-
-def load_embeddings_ingex(posts_df: pd.DataFrame, model_name: str) -> Tuple[pd.DataFrame, int]:
-    """Load precomputed embeddings from GreenEarth Ingex."""
-
-    # get the dimension of the embeddings by finding one example:
-    embed_dim = None
-    for _, row in posts_df.iterrows():
-        emb_list = row['embeddings']
-        if emb_list is None:
-            continue
-        else:
-            emb_str = extract_encoded_embedding_ingex(emb_list, model_name)
-            if emb_str is not None:
-                sample_emb = embedding_loads(emb_str, decompress=True)
-                embed_dim = len(sample_emb)
-                break
-    if embed_dim is None:
-        raise ValueError(f"No embeddings found for model {model_name} in posts data")
-
-    # Now load all embeddings
-    # First get the string out of the list of dicts for the given model
-    embed_str_col = f"embed_{model_name}"
-    posts_df[embed_str_col] = posts_df['embeddings'].map(lambda x: extract_encoded_embedding_ingex(x, model_name))
-
-    # Pre-allocate the numpy array to speed things up
-    n = len(posts_df)
-    arr = np.zeros((n, embed_dim), dtype=float)
-    for i, x in enumerate(posts_df[embed_str_col].to_numpy()):
-        if x is not None:
-            arr[i] = embedding_loads(x, True)
-
-    emb_cols = get_embed_col_names(embed_dim)
-
-    lded_embs_df = pd.DataFrame(arr, index=posts_df.index, columns=emb_cols)
-    posts_emb_df = pd.concat([posts_df, lded_embs_df], axis=1)
-
-    return posts_emb_df, embed_dim
-
-
-def _load_image_tensor(image_url: str, target_size: Tuple[int, int] = (224, 224)):
-    if requests is None or Image is None or transforms is None:
-        return None
-    try:
-        resp = requests.get(image_url, timeout=10)
-        resp.raise_for_status()
-        image = Image.open(BytesIO(resp.content)).convert('RGB')
-        transform = transforms.Compose([
-            transforms.Resize(target_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        return transform(image).unsqueeze(0)
-    except Exception:
-        return None
-
-
-def compute_image_embeddings(posts_emb_df: pd.DataFrame, image_column: str, batch_size: int = 32, max_images: Optional[int] = None) -> Tuple[pd.DataFrame, int]:
-    """Compute ResNet18 features for posts that have an image URL in `image_column`."""
-    if resnet18 is None or torch is None:
-        # Fallback: add zero image embeddings
-        zero_dim = 512
-        cols = [f"image_emb_{i}" for i in range(zero_dim)]
-        z = np.zeros((len(posts_emb_df), zero_dim), dtype=float)
-        return pd.concat([posts_emb_df.reset_index(drop=True), pd.DataFrame(z, columns=cols)], axis=1), zero_dim
-
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model = nn.Sequential(*list(model.children())[:-1])
-    model.eval()
-    if torch.cuda.is_available():
-        model = model.cuda()
-    with torch.no_grad():
-        dummy = torch.randn(1, 3, 224, 224)
-        if torch.cuda.is_available():
-            dummy = dummy.cuda()
-        out = model(dummy)
-        emb_dim = int(out.shape[1])
-
-    df = posts_emb_df.copy()
-    has_img = df[image_column].notna() & (df[image_column] != "") if image_column in df.columns else pd.Series(False, index=df.index)
-    idxs = df[has_img].index.tolist()
-    if max_images is not None:
-        idxs = idxs[:max_images]
-    all_embeddings: Dict[int, np.ndarray] = {}
-    for start in tqdm(range(0, len(idxs), batch_size), desc="Processing images"):
-        for idx in idxs[start:start+batch_size]:
-            img_url = df.at[idx, image_column]
-            tensor = _load_image_tensor(img_url)
-            if tensor is None:
-                all_embeddings[idx] = np.zeros((emb_dim,), dtype=float)
-                continue
-            with torch.no_grad():
-                if torch.cuda.is_available():
-                    tensor = tensor.cuda()
-                emb = model(tensor).squeeze().detach().cpu().numpy()
-            all_embeddings[idx] = emb
-    cols = [f"image_emb_{i}" for i in range(emb_dim)]
-    img_emb_df = pd.DataFrame(0.0, index=df.index, columns=cols)
-    if all_embeddings:
-        filled = pd.DataFrame.from_dict(all_embeddings, orient='index')
-        filled.columns = cols
-        img_emb_df.loc[filled.index] = filled.values
-    return pd.concat([df.reset_index(drop=True), img_emb_df.reset_index(drop=True)], axis=1), emb_dim
 
 
 # ----------------------------------------
@@ -843,12 +542,12 @@ def validate_dataframe_schema(
                     return dtype in polars_string or dtype == pl.Object
 
             if isinstance(expected, type):
+                if issubclass(expected, (bool, np.bool_)):
+                    return dtype == pl.Boolean
                 if issubclass(expected, (int, np.integer)):
                     return dtype in polars_integer
                 if issubclass(expected, (float, np.floating)):
                     return dtype in polars_float
-                if issubclass(expected, (bool, np.bool_)):
-                    return dtype == pl.Boolean
                 if issubclass(expected, str):
                     return dtype in polars_string
                 if issubclass(expected, (np.datetime64, datetime)):
@@ -1079,16 +778,16 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
 __all__ = [
     # Datetime
     'parse_one_ts',
-    # Data IO Green Earth Ingex GCS
-    'load_raw_data_ingex',
-    # Data IO Digital Ocean
-    'list_recent_objects_digital_ocean', 'list_all_objects_digital_ocean', 'download_parquet_files_digital_ocean', 'load_and_combine_data_digital_ocean', 'load_most_recent_raw_data_digital_ocean',
-    # Detection
-    'find_join_key', 'find_text_column',
+    # Stage 1: Memory safety checks and tracking
+    'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
+    'estimate_parquet_memory', 'estimate_filtered_data_memory',
+    'compute_memory_model_features', 'predict_memory_gb',
+    'MEMORY_MODEL_COEFFICIENTS', 'MEMORY_MODEL_FEATURE_NAMES',
+    'check_memory_available', 'check_data_load_safe',
     # Embeddings
-    'get_embed_col_names', 'embedding_loads', 'extract_encoded_embedding_ingex', 'load_embeddings_ingex', 'compute_post_embeddings', 'compute_image_embeddings',
+    'expand_embeddings_polars', 'get_embed_col_names', 
     # Features/columns
-    'get_actual_feature_columns', 'build_user_feature_frame', 'build_candidate_posts', 'compute_post_feature_frame', 'save_bundle',
+    'get_actual_feature_columns', 'build_user_feature_frame',
     # Relevel/topic helpers
     'discover_topics', 'compute_user_topic_mixtures', 'relevel_uniform_mixture',
     # Dataset construction
@@ -1098,168 +797,6 @@ __all__ = [
     # Viz
     'plot_training_history', 'plot_model_performance', 'create_user_visualization',
 ]
-
-
-# ----------------------------------------
-# Stage 1 convenience: load most recent small raw bundle
-# ----------------------------------------
-def load_most_recent_raw_data_digital_ocean(max_files_per_table: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Download and load a compact slice of recent posts/likes (and optional images) from Spaces.
-
-    Selects the most recently modified up to `max_files_per_table` files for each table.
-    """
-    # Discover latest keys
-    posts_keys, posts_info = list_all_objects_digital_ocean(SPACES_BUCKET, "bsky_firehose_posts_tmp")
-    likes_keys, likes_info = list_all_objects_digital_ocean(SPACES_BUCKET, "bsky_firehose_likes_light_tmp")
-    # Sort by LastModified desc using info arrays
-    def _top_n(keys: List[str], info: List[dict], n: int) -> List[str]:
-        if not keys or not info:
-            return []
-        m = {d['key']: d.get('modified') for d in info if 'key' in d}
-        ordered = sorted([k for k in keys if k in m], key=lambda k: m[k], reverse=True)
-        return ordered[: max(0, int(n))]
-
-    posts_sel = _top_n(posts_keys, posts_info, max_files_per_table)
-    likes_sel = _top_n(likes_keys, likes_info, max_files_per_table)
-
-    # Download and load
-    with tempfile.TemporaryDirectory() as tmpd:
-        tmp = Path(tmpd)
-        posts_files = download_parquet_files_digital_ocean(posts_sel, SPACES_BUCKET, tmp / "posts") if posts_sel else []
-        likes_files = download_parquet_files_digital_ocean(likes_sel, SPACES_BUCKET, tmp / "likes") if likes_sel else []
-        posts_df, likes_df, metadata_df = load_and_combine_data_digital_ocean({
-            "posts": posts_files,
-            "likes": likes_files,
-            # images omitted in Stage 1 bundle; keep empty
-        })
-    return posts_df, likes_df, metadata_df
-
-
-# ----------------------------------------
-# Stage 2: Featurize helpers
-# ----------------------------------------
-def build_candidate_posts(
-    posts_df: pd.DataFrame,
-    likes_df: pd.DataFrame,
-    join_like: str,
-    join_post: str,
-    author_col: str,
-    *,
-    max_posts_per_author: int = 3,
-    max_liked_posts_per_user: int = 100,
-    rng_seed: int = 42,
-) -> pd.DataFrame:
-    """Select candidate posts by union of liked posts and per-author caps.
-
-    - Always include posts that appear in likes_df[join_like].
-    - Augment with up to `max_posts_per_author` posts per author (random selection).
-    """
-    import time
-    t0 = time.time()
-    
-    rng = np.random.RandomState(int(rng_seed))
-    join_like_str = likes_df[join_like].astype(str)
-    liked_post_ids = set(join_like_str.dropna().unique().tolist())
-    print(f"  Found {len(liked_post_ids)} unique liked posts")
-
-    posts_df_local = posts_df.copy()
-    posts_df_local[join_post] = posts_df_local[join_post].astype(str)
-
-    liked_posts = posts_df_local[posts_df_local[join_post].isin(liked_post_ids)]
-    print(f"  Matched {len(liked_posts)} liked posts from posts_df")
-    
-    extra_rows: List[pd.DataFrame] = []
-    if author_col in posts_df_local.columns and max_posts_per_author > 0:
-        print(f"  Sampling {max_posts_per_author} posts per author...")
-        grouped = posts_df_local.groupby(author_col)
-        num_authors = len(grouped)
-        print(f"  Processing {num_authors} authors...")
-        
-        # OPTIMIZED: Use vectorized sampling instead of loop
-        sampled_indices = []
-        for author, g in grouped:
-            if len(g) <= max_posts_per_author:
-                sampled_indices.extend(g.index.tolist())
-            else:
-                idx = rng.choice(g.index.values, size=int(max_posts_per_author), replace=False)
-                sampled_indices.extend(idx.tolist())
-        
-        if sampled_indices:
-            extra_rows = [posts_df_local.loc[sampled_indices]]
-            print(f"  Sampled {len(sampled_indices)} posts from authors")
-    
-    pool = [liked_posts] + extra_rows if extra_rows else [liked_posts]
-    if not pool:
-        return posts_df_local
-    
-    print(f"  Concatenating and deduplicating...")
-    candidates = pd.concat(pool, ignore_index=True).drop_duplicates(subset=[join_post])
-    print(f"  Built {len(candidates)} candidate posts (took {time.time()-t0:.2f}s)")
-    return candidates
-
-
-def compute_post_feature_frame(candidate_posts: pd.DataFrame, data_source: str, model_name: str, image_mode: str = 'auto') -> Tuple[pd.DataFrame, int]:
-    """Compute embeddings for candidate posts (text always; optional image).
-
-    image_mode: 'off' | 'on' | 'auto' (currently same as 'off' unless image_url present)
-    """
-    if data_source == 'digitalocean':
-        text_col = find_text_column(candidate_posts)
-        model_name_st = 'sentence-transformers/' + model_name.replace('_', '-')
-        posts_emb_df, text_dim = compute_post_embeddings(candidate_posts, text_col, model_name_st)
-        img_dim = 0
-        if image_mode in ('on', 'auto') and 'image_url' in candidate_posts.columns:
-            try:
-                posts_emb_df, img_dim = compute_image_embeddings(posts_emb_df, 'image_url')
-            except Exception:
-                img_dim = 0
-        return posts_emb_df, (text_dim + img_dim)
-    elif data_source == 'greenearth':
-        posts_emb_df, text_dim = load_embeddings_ingex(candidate_posts, model_name)
-        return posts_emb_df, text_dim
-    else:
-        raise ValueError(f"Unsupported data_source: {data_source}")
-
-
-def save_bundle(
-    *,
-    out_dir: Path,
-    posts_emb_df: pd.DataFrame,
-    likes_df: pd.DataFrame,
-    join_like: str,
-    join_post: str,
-    text_column: str,
-    author_column: str,
-    data_source: str,
-    embedding_model: str,
-    embedding_dim: int,
-    image_mode: str,
-    extra_meta: Optional[Dict[str, Any]] = None,
-    liked_posts_texts_path: Optional[str] = None,
-) -> str:
-    """Persist embedding bundle to out_dir and return its path."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = out_dir.name
-    bundle_path = out_dir / f"embedding_bundle_{ts}.pkl"
-    payload = {
-        'posts_emb_df': posts_emb_df,
-        'likes_df': likes_df,
-        'join_like': join_like,
-        'join_post': join_post,
-        'text_column': text_column,
-        'author_column': author_column,
-        'data_source': data_source,
-        'embedding_model': embedding_model,
-        'embedding_dim': int(embedding_dim),
-        'image_mode': str(image_mode),
-        'meta': dict(extra_meta or {}),
-    }
-    if liked_posts_texts_path:
-        payload['liked_posts_texts_path'] = str(liked_posts_texts_path)
-    import pickle
-    with open(bundle_path, 'wb') as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return str(bundle_path)
 
 
 # ----------------------------------------
@@ -1413,7 +950,7 @@ def get_stage_logger(stage_name: str, log_file: Optional[Path] = None) -> loggin
     
     # Create formatter with timestamp
     formatter = logging.Formatter(
-        '[%(asctime)s.%(msecs)03d] [%(name)s] %(message)s',
+        '[%(asctime)s] [%(name)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -1451,6 +988,7 @@ def log_operation_start(operation_name: str, stage_name: str, logger: Optional[l
     """
     if logger is None:
         logger = get_stage_logger(stage_name)
+    logger.info("=" * 60)
     logger.info(f"Starting: {operation_name}")
     return logger
 

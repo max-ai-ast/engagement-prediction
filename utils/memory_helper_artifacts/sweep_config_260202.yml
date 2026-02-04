@@ -1,0 +1,293 @@
+# Unified Data Sweep Configuration
+# =================================
+# Single configuration file for complete hyperparameter sweep over data filtering
+# parameters to understand N (sample sizes) and memory consumption.
+#
+# Total: 84 experiments, strictly ordered by expected load (fastest → slowest)
+# Load factor = days × max_liking_users × max_likes_per_user
+#
+# Usage:
+#   python scripts/run_data_sweep.py --config configs/data_sweep_unified.yml --dry-run
+#   python scripts/run_data_sweep.py --config configs/data_sweep_unified.yml
+#   python scripts/run_data_sweep.py --config configs/data_sweep_unified.yml --resume
+
+sweep:
+  name: "data_sweep_unified"
+  description: "Comprehensive sweep over data filtering hyperparameters"
+  
+  project: "Engagement Prediction"
+  
+  tags:
+    - "data-sweep-26-02-02"
+
+# Fixed parameters for all experiments
+fixed:
+  gcs_bucket: "greenearth-471522-ingex-extract-stage"
+  posts_start: "2026-01-01"
+  likes_start: "2026-01-01"
+  min_likes_per_user: 2
+  cap_random_seed: 42
+  embedding_model: "all_MiniLM_L6_v2"
+  memory_check: ignore
+  stop_after: "get_data"
+
+# All experiments ordered by load factor: days × users × likes_cap
+# Within same load, ordered by: days (asc), users (asc), likes (asc), negatives (asc)
+experiments:
+  # ============================================================================
+  # Load: 7M (7d × 10k × 100)
+  # ============================================================================
+  - name: "01_7d_10ku_100l_10kn"
+    params: { data_window_days: 7, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "02_7d_10ku_100l_50kn"
+    params: { data_window_days: 7, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "03_7d_10ku_100l_100kn"
+    params: { data_window_days: 7, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 14M (14d × 10k × 100)
+  # ============================================================================
+  - name: "04_14d_10ku_100l_10kn"
+    params: { data_window_days: 14, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "05_14d_10ku_100l_50kn"
+    params: { data_window_days: 14, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "06_14d_10ku_100l_100kn"
+    params: { data_window_days: 14, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 21M (21d × 10k × 100)
+  # ============================================================================
+  - name: "07_21d_10ku_100l_10kn"
+    params: { data_window_days: 21, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "08_21d_10ku_100l_50kn"
+    params: { data_window_days: 21, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "09_21d_10ku_100l_100kn"
+    params: { data_window_days: 21, max_liking_users: 10000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 35M (7d × 10k × 500) and (7d × 50k × 100)
+  # ============================================================================
+  - name: "10_7d_10ku_500l_10kn"
+    params: { data_window_days: 7, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "11_7d_10ku_500l_50kn"
+    params: { data_window_days: 7, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "12_7d_10ku_500l_100kn"
+    params: { data_window_days: 7, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "13_7d_50ku_100l_10kn"
+    params: { data_window_days: 7, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "14_7d_50ku_100l_50kn"
+    params: { data_window_days: 7, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "15_7d_50ku_100l_100kn"
+    params: { data_window_days: 7, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 70M (7d × 100k × 100), (14d × 10k × 500), (14d × 50k × 100)
+  # ============================================================================
+  - name: "16_7d_100ku_100l_10kn"
+    params: { data_window_days: 7, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "17_7d_100ku_100l_50kn"
+    params: { data_window_days: 7, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "18_7d_100ku_100l_100kn"
+    params: { data_window_days: 7, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+  - name: "19_14d_10ku_500l_10kn"
+    params: { data_window_days: 14, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "20_14d_10ku_500l_50kn"
+    params: { data_window_days: 14, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "21_14d_10ku_500l_100kn"
+    params: { data_window_days: 14, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "22_14d_50ku_100l_10kn"
+    params: { data_window_days: 14, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "23_14d_50ku_100l_50kn"
+    params: { data_window_days: 14, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "24_14d_50ku_100l_100kn"
+    params: { data_window_days: 14, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 105M (21d × 10k × 500), (21d × 50k × 100)
+  # ============================================================================
+  - name: "25_21d_10ku_500l_10kn"
+    params: { data_window_days: 21, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "26_21d_10ku_500l_50kn"
+    params: { data_window_days: 21, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "27_21d_10ku_500l_100kn"
+    params: { data_window_days: 21, max_liking_users: 10000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "28_21d_50ku_100l_10kn"
+    params: { data_window_days: 21, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "29_21d_50ku_100l_50kn"
+    params: { data_window_days: 21, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "30_21d_50ku_100l_100kn"
+    params: { data_window_days: 21, max_liking_users: 50000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 140M (14d × 100k × 100)
+  # ============================================================================
+  - name: "31_14d_100ku_100l_10kn"
+    params: { data_window_days: 14, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "32_14d_100ku_100l_50kn"
+    params: { data_window_days: 14, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "33_14d_100ku_100l_100kn"
+    params: { data_window_days: 14, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 175M (7d × 50k × 500), (7d × 250k × 100)
+  # ============================================================================
+  - name: "34_7d_50ku_500l_10kn"
+    params: { data_window_days: 7, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "35_7d_50ku_500l_50kn"
+    params: { data_window_days: 7, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "36_7d_50ku_500l_100kn"
+    params: { data_window_days: 7, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "37_7d_250ku_100l_10kn"
+    params: { data_window_days: 7, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "38_7d_250ku_100l_50kn"
+    params: { data_window_days: 7, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "39_7d_250ku_100l_100kn"
+    params: { data_window_days: 7, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 210M (21d × 100k × 100), (14d × 150k × 100) [SUPPLEMENT]
+  # ============================================================================
+  - name: "40_21d_100ku_100l_10kn"
+    params: { data_window_days: 21, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "41_21d_100ku_100l_50kn"
+    params: { data_window_days: 21, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "42_21d_100ku_100l_100kn"
+    params: { data_window_days: 21, max_liking_users: 100000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+  - name: "43_14d_150ku_100l_50kn"
+    params: { data_window_days: 14, max_liking_users: 150000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 350M (7d × 100k × 500), (14d × 50k × 500), (14d × 250k × 100), (7d × 500k × 100) [SUPPLEMENT]
+  # ============================================================================
+  - name: "44_7d_100ku_500l_10kn"
+    params: { data_window_days: 7, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "45_7d_100ku_500l_50kn"
+    params: { data_window_days: 7, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "46_7d_100ku_500l_100kn"
+    params: { data_window_days: 7, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "47_14d_50ku_500l_10kn"
+    params: { data_window_days: 14, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "48_14d_50ku_500l_50kn"
+    params: { data_window_days: 14, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "49_14d_50ku_500l_100kn"
+    params: { data_window_days: 14, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "50_14d_250ku_100l_10kn"
+    params: { data_window_days: 14, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "51_14d_250ku_100l_50kn"
+    params: { data_window_days: 14, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "52_14d_250ku_100l_100kn"
+    params: { data_window_days: 14, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+  - name: "53_7d_500ku_100l_50kn"
+    params: { data_window_days: 7, max_liking_users: 500000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 525M (21d × 50k × 500), (21d × 250k × 100)
+  # ============================================================================
+  - name: "54_21d_50ku_500l_10kn"
+    params: { data_window_days: 21, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "55_21d_50ku_500l_50kn"
+    params: { data_window_days: 21, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "56_21d_50ku_500l_100kn"
+    params: { data_window_days: 21, max_liking_users: 50000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "57_21d_250ku_100l_10kn"
+    params: { data_window_days: 21, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 10000 }
+  - name: "58_21d_250ku_100l_50kn"
+    params: { data_window_days: 21, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+  - name: "59_21d_250ku_100l_100kn"
+    params: { data_window_days: 21, max_liking_users: 250000, max_likes_per_user: 100, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 700M (14d × 100k × 500), (14d × 500k × 100) [SUPPLEMENT]
+  # ============================================================================
+  - name: "60_14d_100ku_500l_10kn"
+    params: { data_window_days: 14, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "61_14d_100ku_500l_50kn"
+    params: { data_window_days: 14, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "62_14d_100ku_500l_100kn"
+    params: { data_window_days: 14, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "63_14d_500ku_100l_50kn"
+    params: { data_window_days: 14, max_liking_users: 500000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 875M (7d × 250k × 500)
+  # ============================================================================
+  - name: "64_7d_250ku_500l_10kn"
+    params: { data_window_days: 7, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "65_7d_250ku_500l_50kn"
+    params: { data_window_days: 7, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "66_7d_250ku_500l_100kn"
+    params: { data_window_days: 7, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 1050M (21d × 100k × 500), (14d × 150k × 500) [SUPPLEMENT], (21d × 500k × 100) [SUPPLEMENT]
+  # ============================================================================
+  - name: "67_21d_100ku_500l_10kn"
+    params: { data_window_days: 21, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "68_21d_100ku_500l_50kn"
+    params: { data_window_days: 21, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "69_21d_100ku_500l_100kn"
+    params: { data_window_days: 21, max_liking_users: 100000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "70_14d_150ku_500l_50kn"
+    params: { data_window_days: 14, max_liking_users: 150000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "71_21d_500ku_100l_50kn"
+    params: { data_window_days: 21, max_liking_users: 500000, max_likes_per_user: 100, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 1750M (14d × 250k × 500), (7d × 500k × 500) [SUPPLEMENT]
+  # ============================================================================
+  - name: "72_14d_250ku_500l_10kn"
+    params: { data_window_days: 14, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "73_14d_250ku_500l_50kn"
+    params: { data_window_days: 14, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "74_14d_250ku_500l_100kn"
+    params: { data_window_days: 14, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+  - name: "75_7d_500ku_500l_50kn"
+    params: { data_window_days: 7, max_liking_users: 500000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 2100M (14d × 150k × 1000) [SUPPLEMENT]
+  # ============================================================================
+  - name: "76_14d_150ku_1000l_50kn"
+    params: { data_window_days: 14, max_liking_users: 150000, max_likes_per_user: 1000, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 2625M (21d × 250k × 500)
+  # ============================================================================
+  - name: "77_21d_250ku_500l_10kn"
+    params: { data_window_days: 21, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 10000 }
+  - name: "78_21d_250ku_500l_50kn"
+    params: { data_window_days: 21, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+  - name: "79_21d_250ku_500l_100kn"
+    params: { data_window_days: 21, max_liking_users: 250000, max_likes_per_user: 500, negative_posts_sample: 100000 }
+
+  # ============================================================================
+  # Load: 3500M (14d × 500k × 500) [SUPPLEMENT], (7d × 500k × 1000) [SUPPLEMENT]
+  # ============================================================================
+  - name: "80_7d_500ku_1000l_50kn"
+    params: { data_window_days: 7, max_liking_users: 500000, max_likes_per_user: 1000, negative_posts_sample: 50000 }
+  - name: "81_14d_500ku_500l_50kn"
+    params: { data_window_days: 14, max_liking_users: 500000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 5250M (21d × 500k × 500) [SUPPLEMENT]
+  # ============================================================================
+  - name: "82_21d_500ku_500l_50kn"
+    params: { data_window_days: 21, max_liking_users: 500000, max_likes_per_user: 500, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 7000M (14d × 500k × 1000) [SUPPLEMENT]
+  # ============================================================================
+  - name: "83_14d_500ku_1000l_50kn"
+    params: { data_window_days: 14, max_liking_users: 500000, max_likes_per_user: 1000, negative_posts_sample: 50000 }
+
+  # ============================================================================
+  # Load: 10500M (21d × 500k × 1000) [SUPPLEMENT] - HIGHEST RISK
+  # ============================================================================
+  - name: "84_21d_500ku_1000l_50kn"
+    params: { data_window_days: 21, max_liking_users: 500000, max_likes_per_user: 1000, negative_posts_sample: 50000 }
+
+execution:
+  mode: "sequential"
+  delay_between_runs: 10
+  continue_on_failure: true
+  output_base: "outputs/sweeps"

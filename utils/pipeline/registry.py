@@ -15,7 +15,6 @@ from .core import ROOT, Context, load_run_callable
 # Stage specs: stage_key -> (relative_file_path_from_root, stage_folder_name)
 STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'get_data':      ("utils/01_get_data/stage_get_data.py", "01_get_data"),
-    'featurize':     ("utils/02_featurize/stage_featurize.py", "02_featurize"),
     'relevel':       ("utils/03_relevel/stage_relevel_uniform.py", "03_relevel"),
     # Optional alternative relevelers (caller can override file path if desired)
     'relevel_simple':("utils/03_relevel/stage_relevel_simple.py", "03_relevel"),

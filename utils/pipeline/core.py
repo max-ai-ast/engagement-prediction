@@ -89,7 +89,6 @@ def select_prior_output(run_dir: Path, stage_name: str, *, use_latest: bool = Tr
     else:
         prefix_map = {
             "get_data": "01_get_data",
-            "featurize": "02_featurize",
             "relevel": "03_relevel",
             "split": "04_split",
             "train": "05_train",
