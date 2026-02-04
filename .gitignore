@@ -49,3 +49,6 @@ pytest-of-*/
 
 # Folders for testing stuff
 *_scratchpad/
+
+# memory sweep results csv
+sweep_results_*.csv

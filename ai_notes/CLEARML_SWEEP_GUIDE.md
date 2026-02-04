@@ -4,20 +4,38 @@ This guide explains how to run hyperparameter sweeps to analyze the impact of da
 
 ## Quick Start
 
-```bash
+The sweep functionality is now consolidated in `utils/memory_helpers.py`. Use it via Python:
+
+```python
+from utils.memory_helpers import (
+    generate_sweep_config,
+    run_memory_sweep,
+    export_sweep_results_from_clearml,
+    fit_memory_model,
+    save_model_weights,
+)
+
+# Generate a sweep config
+config = generate_sweep_config(
+    name="data_sweep_260205",
+    tag="data-sweep-26-02-05",
+    days_options=[7, 14, 21],
+    users_options=[10000, 50000, 100000],
+)
+
 # Preview what will run (no execution)
-python scripts/run_data_sweep.py --config configs/data_sweep.yml --dry-run
+run_memory_sweep(config, dry_run=True)
 
 # Run the full sweep
-python scripts/run_data_sweep.py --config configs/data_sweep.yml
+run_memory_sweep(config)
 
-# Resume if interrupted
-python scripts/run_data_sweep.py --config configs/data_sweep.yml --resume
+# Run with resume capability (skips completed experiments)
+run_memory_sweep(config, resume=True)
 ```
 
 ## Sweep Configuration
 
-The sweep is configured in `configs/data_sweep.yml`. Key sections:
+Configs can be generated programmatically or loaded from YAML in `utils/memory_helper_artifacts/`. Key sections:
 
 ### Fixed Parameters
 Parameters that stay constant across all experiments:
@@ -186,11 +204,11 @@ If experiments OOM:
 
 ### Resume After Failure
 
-The sweep script tracks progress in `outputs/sweeps/<sweep_name>/progress.json`.
-Use `--resume` to skip completed experiments:
+The sweep tracks progress in `outputs/sweeps/<sweep_name>/progress.json`.
+Use `resume=True` to skip completed experiments:
 
-```bash
-python scripts/run_data_sweep.py --config configs/data_sweep.yml --resume
+```python
+run_memory_sweep(config, resume=True)
 ```
 
 ## Advanced: ClearML Comparison Tips
@@ -212,18 +230,49 @@ Good for seeing relationships:
 
 ### Export Data
 
-For analysis in Python/R:
-1. Select experiments
-2. Click **Export** → **CSV**
-3. Download metrics table
+For analysis in Python, use the built-in export function:
 
-## Next Steps
+```python
+from utils.memory_helpers import export_sweep_results_from_clearml
 
-After analyzing sweep results:
+# Export all data from a sweep tag to CSV
+data = export_sweep_results_from_clearml(
+    tag="data-sweep-26-02-05",
+    output_file="sweep_results_260205.csv",
+)
+```
 
-1. Identify parameter combinations that balance N vs memory
-2. Create a production config with optimal settings
-3. Run full pipeline with chosen parameters:
+Results are saved to `utils/memory_helper_artifacts/`.
+
+## Next Steps: Updating the Memory Model
+
+After running a sweep:
+
+```python
+from utils.memory_helpers import (
+    export_sweep_results_from_clearml,
+    fit_memory_model,
+    save_model_weights,
+)
+
+# 1. Export results from ClearML
+data = export_sweep_results_from_clearml(
+    tag="data-sweep-26-02-05",
+    output_file="sweep_results_260205.csv",
+)
+
+# 2. Fit new memory model
+weights = fit_memory_model("sweep_results_260205.csv", version="260205")
+
+# 3. Save weights (automatically updates model_weights_latest.json)
+save_model_weights(weights, "model_weights_260205.json")
+```
+
+The memory estimator will automatically use the new model weights.
+
+## Running Production Pipeline
+
+After finding optimal parameters, run the full pipeline:
 
 ```bash
 python cli.py run-all \

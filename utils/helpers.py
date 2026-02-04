@@ -111,7 +111,42 @@ def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
 # ----------------------------------------
 # Embeddings helpers
 # ----------------------------------------
-def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+
+# Known embedding model dimensions
+EMBEDDING_MODEL_DIMS: Dict[str, int] = {
+    "all_MiniLM_L6_v2": 384,
+    "all_MiniLM_L12_v2": 384,
+    "all-MiniLM-L6-v2": 384,
+    "all-MiniLM-L12-v2": 384,
+    "paraphrase-MiniLM-L6-v2": 384,
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+}
+
+
+def get_embedding_dim_for_model(embedding_model: str) -> int:
+    """
+    Get the embedding dimension for a known model name.
+    
+    Args:
+        embedding_model: Name of the embedding model
+        
+    Returns:
+        Embedding dimension (e.g., 384 for MiniLM models)
+        
+    Raises:
+        ValueError: If model name is not in EMBEDDING_MODEL_DIMS
+    """
+    if embedding_model not in EMBEDDING_MODEL_DIMS:
+        known_models = ", ".join(sorted(EMBEDDING_MODEL_DIMS.keys()))
+        raise ValueError(
+            f"Unknown embedding model '{embedding_model}'. "
+            f"Known models: {known_models}. "
+            f"Add new models to EMBEDDING_MODEL_DIMS in helpers.py."
+        )
+    return EMBEDDING_MODEL_DIMS[embedding_model]
+
+
+def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
     emb_str = (
         pl.col("embeddings")
         .list.eval(
@@ -129,7 +164,7 @@ def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyF
 
 
 def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
-    lf_with_emb = _get_embeddings_list_col(lf, embedding_model)
+    lf_with_emb = get_embeddings_list_col(lf, embedding_model)
     return (
         lf_with_emb
         .select(pl.col("_emb_vec").list.len().alias("dim"))
@@ -145,7 +180,7 @@ def expand_embeddings_polars(
     embedding_model: str,
     embed_dim: int
 ) -> pl.LazyFrame:
-    lf = _get_embeddings_list_col(lf, embedding_model)
+    lf = get_embeddings_list_col(lf, embedding_model)
     return (
         lf
         .with_columns(
@@ -961,6 +996,7 @@ def log_operation_start(operation_name: str, stage_name: str, logger: Optional[l
     """
     if logger is None:
         logger = get_stage_logger(stage_name)
+    logger.info("=" * 60)
     logger.info(f"Starting: {operation_name}")
     return logger
 
