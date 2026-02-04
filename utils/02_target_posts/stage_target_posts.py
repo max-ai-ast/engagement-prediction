@@ -28,7 +28,6 @@ from utils.helpers import (
     log_operation_start, 
     validate_dataframe_schema, 
     load_parquet_from_prior, 
-    save_polars_physical_plan_image, 
     parse_one_ts,
     parse_one_ts_strict
 )
@@ -43,6 +42,8 @@ def _get_liked_target_posts(
     """
     Get all of the liked target posts (positive examples). 
     For now this is just all of the liked posts in the dataset.
+    We could filter out a user's first like in the entire dataset but this
+    probably makes more sense in the downstream user history creation.
     """
     return (
         likes_lf
@@ -110,6 +111,8 @@ def _get_negative_target_posts(
                 [pl.col('did'), pl.col('subject_uri'), pl.col(like_ts_col_name)]
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
         )
+        # seed and neg_idx together effectively assign a random post in the bucket to each like
+        # (multiple likes can be assigned to the same negative post, which is what we want - a true random sample)
         .with_columns(
             (pl.col('seed') % pl.col('bucket_size').cast(pl.UInt64)).cast(pl.Int64).alias('neg_idx'),
         )
@@ -237,6 +240,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     })
 
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
+
+    # The core logic. (1) Generate target posts and (2) split into train/val/holdout
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf)
     target_posts_lf = _apply_temporal_splits(args, target_posts_lf)
     validate_dataframe_schema(target_posts_lf, {
@@ -256,7 +261,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: target_posts",
         f"runtime_seconds: {time.time()-t0:.2f}",
-        f"settings: ",
         f"inputs: posts_core, likes_core",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
