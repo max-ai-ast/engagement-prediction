@@ -138,7 +138,7 @@ def get_embedding_dim_for_model(embedding_model: str) -> int:
     return EMBEDDING_MODEL_DIMS[embedding_model]
 
 
-def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
     emb_str = (
         pl.col("embeddings")
         .list.eval(
@@ -156,7 +156,7 @@ def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyF
 
 
 def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
-    lf_with_emb = _get_embeddings_list_col(lf, embedding_model)
+    lf_with_emb = get_embeddings_list_col(lf, embedding_model)
     return (
         lf_with_emb
         .select(pl.col("_emb_vec").list.len().alias("dim"))
@@ -172,7 +172,7 @@ def expand_embeddings_polars(
     embedding_model: str,
     embed_dim: int
 ) -> pl.LazyFrame:
-    lf = _get_embeddings_list_col(lf, embedding_model)
+    lf = get_embeddings_list_col(lf, embedding_model)
     return (
         lf
         .with_columns(

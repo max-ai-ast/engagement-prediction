@@ -14,7 +14,7 @@ FILTERING SEQUENCE
 
 PHASE 0: Inputs and safety check
 -------------------------------------------------------------------------
-  - List GCS parquet files in the requested time ranges as a sanity check on data coverage.
+  - List GCS parquet files in the requested time ranges.
   - Optional memory safety check (check_data_load_safe) before loading (uses an empirical model to estimate the memory required).
 
 PHASE 1: Likes Processing (_load_likes_core_polars)
@@ -135,8 +135,7 @@ from utils.helpers import (
     apply_time_filter,
     get_embed_dim,
     get_embedding_dim_for_model,
-    _embedding_loads,
-    _get_embeddings_list_col,
+    get_embeddings_list_col,
 )
 from utils.memory_helpers import (
     check_data_load_safe,
@@ -918,8 +917,8 @@ def _write_embeddings_memmap(
     )
     
     # Process with streaming - decode embeddings
-    # Use _get_embeddings_list_col to extract the correct embedding model
-    posts_lf = _get_embeddings_list_col(posts_lf, embedding_model)
+    # Use get_embeddings_list_col to extract the correct embedding model
+    posts_lf = get_embeddings_list_col(posts_lf, embedding_model)
     
     # Collect the filtered data - this should be manageable since we've filtered to candidates
     filtered_df = posts_lf.select(["at_uri", "_emb_vec"]).collect(engine="streaming")
