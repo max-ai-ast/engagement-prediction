@@ -71,8 +71,9 @@ def _get_negative_target_posts(
         # stable ordering so idx assignment is deterministic
         .sort(['bucket', post_ts_col_name, 'at_uri'])
         .with_columns(
-            pl.col('at_uri').cum_count().over('bucket').alias('idx_in_bucket'),
-            pl.count().over('bucket').alias('bucket_size'),
+            # polars cum_count is 1-based; shift to 0-based to match neg_idx
+            (pl.col('at_uri').cum_count().over('bucket') - 1).cast(pl.Int64).alias('idx_in_bucket'),
+            pl.len().over('bucket').alias('bucket_size'),
         )
     ) # 'at_uri', 'post_record_created_at', 'bucket', 'idx_in_bucket', 'bucket_size'
 

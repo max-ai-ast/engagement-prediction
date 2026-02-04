@@ -983,7 +983,7 @@ def _write_embeddings_memmap(
         uri_to_idx[uri] = idx
         idx += 1
         
-        if idx % 100_000 == 0:
+        if idx % 10_000 == 0:
             logger.info(f"Written {idx:,} embeddings...")
     
     if idx != n_valid:
