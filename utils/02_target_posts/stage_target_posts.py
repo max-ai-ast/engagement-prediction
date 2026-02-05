@@ -106,9 +106,9 @@ def _get_negative_target_posts(
         # join to get bucket_size for the like's bucket
         .join(bucket_sizes_lf, on="bucket", how="inner")
         .with_columns(
-            # deterministic "random" seed per (user, liked_post, time)
+            # deterministic "random" seed per (user, liked_post)
             pl.struct(
-                [pl.col('did'), pl.col('subject_uri'), pl.col(like_ts_col_name)]
+                [pl.col('did'), pl.col('subject_uri')]
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
         )
         # seed and neg_idx together effectively assign a random post in the bucket to each like
