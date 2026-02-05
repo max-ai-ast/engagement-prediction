@@ -936,8 +936,12 @@ def _write_embeddings_memmap(
     n_duplicate_uri = 0
     n_valid = 0
     seen_valid_uris: set[str] = set()
+    n_processed = 0
     
     for uri, emb_vec in _iter_candidate_embeddings():
+        n_processed += 1
+        if n_processed % 10_000 == 0:
+            logger.info(f"Validation progress: {n_processed:,} rows scanned, {n_valid:,} valid so far")
         if emb_vec is None:
             n_null += 1
             continue
