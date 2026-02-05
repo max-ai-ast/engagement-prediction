@@ -1,4 +1,5 @@
 import argparse
+import logging
 import importlib.util
 import sys
 from datetime import datetime, timezone
@@ -22,6 +23,20 @@ def stage_target_posts_module():
 
 def _dt(y, m, d, h=0, mi=0):
     return datetime(y, m, d, h, mi, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def dummy_logger():
+    logger = logging.getLogger("test_stage_target_posts")
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+@pytest.fixture
+def dummy_context(tmp_path):
+    from utils.pipeline.core import Context
+
+    return Context(run_dir=tmp_path)
 
 
 def test_get_liked_target_posts_selects_expected_columns(stage_target_posts_module):
@@ -68,7 +83,9 @@ def test_get_liked_target_posts_selects_expected_columns(stage_target_posts_modu
     assert out["like_author_did"].to_list() == ["author_a"]
 
 
-def test_negative_target_posts_deterministic_and_bucketed(stage_target_posts_module):
+def test_negative_target_posts_deterministic_and_bucketed(
+    stage_target_posts_module, dummy_logger, dummy_context
+):
     args = argparse.Namespace(random_seed=7, neg_sample_bucket="1d")
 
     posts_df = pl.DataFrame(
@@ -89,8 +106,12 @@ def test_negative_target_posts_deterministic_and_bucketed(stage_target_posts_mod
     liked_lf = stage_target_posts_module._get_liked_target_posts(
         likes_df.lazy(), posts_df.lazy()
     )
-    first = stage_target_posts_module._get_negative_target_posts(args, posts_df.lazy(), liked_lf).collect()
-    second = stage_target_posts_module._get_negative_target_posts(args, posts_df.lazy(), liked_lf).collect()
+    first = stage_target_posts_module._get_negative_target_posts(
+        args, posts_df.lazy(), liked_lf, dummy_logger, dummy_context
+    ).collect()
+    second = stage_target_posts_module._get_negative_target_posts(
+        args, posts_df.lazy(), liked_lf, dummy_logger, dummy_context
+    ).collect()
 
     assert first.height == likes_df.height
     first_sorted = first.sort(["target_did", "like_uri"])
@@ -126,7 +147,9 @@ def test_negative_target_posts_deterministic_and_bucketed(stage_target_posts_mod
         assert like_ts.date() == neg_ts.date()
 
 
-def test_negative_target_posts_requires_bucket(stage_target_posts_module):
+def test_negative_target_posts_requires_bucket(
+    stage_target_posts_module, dummy_logger, dummy_context
+):
     args = argparse.Namespace(random_seed=0, neg_sample_bucket=None)
     posts_df = pl.DataFrame(
         [{"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1), "emb_idx": 1, "did": "author_1"}]
@@ -139,10 +162,14 @@ def test_negative_target_posts_requires_bucket(stage_target_posts_module):
         likes_df.lazy(), posts_df.lazy()
     )
     with pytest.raises(ValueError, match="bucket size"):
-        stage_target_posts_module._get_negative_target_posts(args, posts_df.lazy(), liked_lf).collect()
+        stage_target_posts_module._get_negative_target_posts(
+            args, posts_df.lazy(), liked_lf, dummy_logger, dummy_context
+        ).collect()
 
 
-def test_get_target_posts_emits_negative_pairs(stage_target_posts_module):
+def test_get_target_posts_emits_negative_pairs(
+    stage_target_posts_module, dummy_logger, dummy_context
+):
     args = argparse.Namespace(random_seed=42, neg_sample_bucket="1d")
     posts_df = pl.DataFrame(
         [
@@ -157,7 +184,9 @@ def test_get_target_posts_emits_negative_pairs(stage_target_posts_module):
         ]
     )
 
-    out = stage_target_posts_module._get_target_posts(args, posts_df.lazy(), likes_df.lazy()).collect()
+    out = stage_target_posts_module._get_target_posts(
+        args, posts_df.lazy(), likes_df.lazy(), dummy_logger, dummy_context
+    ).collect()
 
     assert out.height == likes_df.height
     assert out.columns == [
