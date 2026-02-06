@@ -71,6 +71,8 @@ DEFAULTS: Dict[str, Any] = {
     "relevel_alpha": 0.35,
     "relevel_min_users_per_topic": None,
     # Stage 4 (train)
+    "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
+    "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
@@ -174,6 +176,8 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "max_memory_pct": args.max_memory_pct,
         },
         "train": {
+            "user_summarization": args.user_summarization,
+            "ema_alpha": args.ema_alpha,
             "model_type": args.model_type,
             "shared_dim": args.shared_dim,
             "user_hidden_dim": args.user_hidden_dim,
@@ -550,7 +554,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Minimum users per topic when releveling")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
-    # Stage 5 (train) model selection
+    # Stage 4 (train) user summarization + model selection
+    _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
+                          default=argparse.SUPPRESS,
+                          help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
+    _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
+                          help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options

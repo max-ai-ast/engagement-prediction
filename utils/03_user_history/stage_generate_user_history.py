@@ -294,16 +294,16 @@ def _log_and_plot_history_distribution(
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
-    Stage 2: Generate user history directory.
+    Stage 3: Generate user history directory.
 
     Creates a parquet file mapping each target row to a list of prior liked
     post embedding indices for efficient on-the-fly lookup during training.
     """
     run_dir = Path(context.run_dir).resolve()
-    out_dir = new_stage_timestamp_dir(run_dir, '02_featurize')
+    out_dir = new_stage_timestamp_dir(run_dir, '03_user_history')
 
     # Initialize logger and memory tracker
-    logger = get_stage_logger('STAGE_02_FEATURIZE', log_file=out_dir / 'stage.log')
+    logger = get_stage_logger('STAGE_03_USER_HISTORY', log_file=out_dir / 'stage.log')
     t0 = time.time()
     mem_tracker = MemoryTracker(logger=logger)
     mem_tracker.checkpoint("stage_start")
@@ -355,7 +355,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         history_buffer_hours = None  # Treat 0 or negative as "no buffer"
 
     # === Load data ===
-    log_operation_start('Load likes_core from prior stage', 'STAGE_02_FEATURIZE', logger)
+    log_operation_start('Load likes_core from prior stage', 'STAGE_03_USER_HISTORY', logger)
     likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
 
     # Validate likes schema
@@ -368,7 +368,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
 
-    log_operation_start('Load target_posts', 'STAGE_02_FEATURIZE', logger)
+    log_operation_start('Load target_posts', 'STAGE_03_USER_HISTORY', logger)
     targets_lf: pl.LazyFrame = pl.scan_parquet(target_posts_path)
 
     # Validate target posts schema (wide format)
@@ -388,7 +388,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Input sizes: {n_likes:,} likes, {n_targets:,} targets")
 
     # === Build user history directory ===
-    log_operation_start('Build user history directory', 'STAGE_02_FEATURIZE', logger)
+    log_operation_start('Build user history directory', 'STAGE_03_USER_HISTORY', logger)
 
     directory_lf = _build_user_history_directory(
         targets_lf=targets_lf,
@@ -401,7 +401,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     mem_tracker.checkpoint("after_build_history", quiet=True)
 
     # === Write output ===
-    log_operation_start('Write user history directory', 'STAGE_02_FEATURIZE', logger)
+    log_operation_start('Write user history directory', 'STAGE_03_USER_HISTORY', logger)
     output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
 
     # Collect using the streaming engine so that the intermediate fan-out join
@@ -453,7 +453,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # === Stage info ===
     info_lines = [
-        f"stage: featurize (user_history_directory)",
+        f"stage: user_history",
         f"runtime_seconds: {runtime:.2f}",
         f"settings: max_prior_likes={max_prior_likes}, history_buffer_hours={history_buffer_hours}",
         f"inputs: likes_core ({n_likes:,}), target_posts ({n_targets:,})",
@@ -463,7 +463,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 
-    logger.info(f"Stage 2 completed in {runtime:.2f}s")
+    logger.info(f"Stage 3 (user_history) completed in {runtime:.2f}s")
 
     return {
         'output_dir': out_dir,
