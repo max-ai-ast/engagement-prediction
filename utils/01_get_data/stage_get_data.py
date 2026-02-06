@@ -122,6 +122,7 @@ from datetime import datetime, timezone
 import re
 from google.cloud import storage
 import numpy as np
+from tqdm import tqdm
 
 from utils.pipeline.core import (
     new_stage_timestamp_dir, 
@@ -926,8 +927,11 @@ def _write_embeddings_memmap(
     if n_candidates_unique < n_posts_candidate:
         logger.info(f"Deduped {n_posts_candidate - n_candidates_unique:,} duplicate candidate URIs")
     
-    def _iter_candidate_embeddings() -> Iterable[Tuple[str, Optional[List[float]]]]:
-        for path in posts_paths:
+    def _iter_candidate_embeddings(desc: str = "Scanning embeddings") -> Iterable[Tuple[str, Optional[List[float]]]]:
+        file_pbar = tqdm(posts_paths, desc=f"{desc} (files)", unit="file", position=0)
+        row_pbar = tqdm(desc=f"{desc} (rows)", unit="row", position=1, leave=False)
+        for path in file_pbar:
+            file_pbar.set_postfix_str(Path(path).name[-40:])
             posts_lf = pl.scan_parquet(path)
             posts_lf = apply_time_filter(posts_lf, posts_start, posts_end)
             posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
@@ -936,7 +940,9 @@ def _write_embeddings_memmap(
             posts_lf = get_embeddings_list_col(posts_lf, embedding_model)
             df = posts_lf.select(["at_uri", "_emb_vec"]).collect(engine="streaming")
             for row in df.iter_rows(named=True):
+                row_pbar.update(1)
                 yield row["at_uri"], row["_emb_vec"]
+        row_pbar.close()
     
     # First pass: count valid embeddings to pre-allocate memmap with exact size
     n_null = 0
@@ -945,7 +951,8 @@ def _write_embeddings_memmap(
     n_valid = 0
     seen_valid_uris: set[str] = set()
     
-    for uri, emb_vec in _iter_candidate_embeddings():
+    t0_validate = time.monotonic()
+    for uri, emb_vec in _iter_candidate_embeddings(desc="Pass 1/2: validating"):
         if emb_vec is None:
             n_null += 1
             continue
@@ -961,6 +968,8 @@ def _write_embeddings_memmap(
         seen_valid_uris.add(uri)
         n_valid += 1
     n_skipped = n_null + n_wrong_dim + n_duplicate_uri
+    t_validate = time.monotonic() - t0_validate
+    logger.info(f"Validation pass completed in {t_validate:.1f}s")
     
     logger.info(
         f"Validated embeddings: {n_valid:,} valid, {n_skipped:,} skipped "
@@ -978,7 +987,8 @@ def _write_embeddings_memmap(
     uri_to_idx: Dict[str, int] = {}
     idx = 0
     seen_valid_uris = set()
-    for uri, emb_vec in _iter_candidate_embeddings():
+    t0_write = time.monotonic()
+    for uri, emb_vec in _iter_candidate_embeddings(desc="Pass 2/2: writing"):
         if emb_vec is None:
             continue
         if len(emb_vec) != embed_dim:
@@ -990,9 +1000,8 @@ def _write_embeddings_memmap(
         mmap[idx] = np.array(emb_vec, dtype=np.float32)
         uri_to_idx[uri] = idx
         idx += 1
-        
-        if idx % 10_000 == 0:
-            logger.info(f"Written {idx:,} embeddings...")
+    t_write = time.monotonic() - t0_write
+    logger.info(f"Write pass completed in {t_write:.1f}s — wrote {idx:,} embeddings")
     
     if idx != n_valid:
         logger.warning(f"Expected to write {n_valid:,} embeddings, but wrote {idx:,}")
