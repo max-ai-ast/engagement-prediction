@@ -438,7 +438,7 @@ def _load_likes_core_polars(
     logger.info(f"Found {len(paths)} likes parquet files")
     
     raw_lf = pl.scan_parquet(paths)
-    base_lf = apply_time_filter(raw_lf, start_str, end_str)
+    base_lf = apply_time_filter(raw_lf, start_str, end_str).unique(subset=['did', 'subject_uri'])
 
     # ===== PASS 1: Filter users =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
@@ -586,7 +586,7 @@ def _load_posts_core_polars(
 
     # Metadata columns only - NO embeddings during filtering
     cols_metadata = ["at_uri", "record_created_at", "did", "record_text"]
-    
+
     # get posts: sampled via hash, or in liked_post_uris:
     negs_and_likes_lf = _build_posts_candidate_lf(
         posts_lf=posts_lf,
@@ -1321,7 +1321,7 @@ def _filter_likes_after_post_join(
         # Filter users by min likes
         # (no need to use the max_liking_users functionality)
         # Returns: (sampled_users_df, n_users_total, n_likes_total, n_users_eligible)
-        sampled_users_df, n_users_before_min_likes, _, n_users_after_min_likes = _get_sampled_users_with_min_likes(
+        sampled_users_df, n_users_before_min_likes, _, _ = _get_sampled_users_with_min_likes(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
             max_liking_users=None,
