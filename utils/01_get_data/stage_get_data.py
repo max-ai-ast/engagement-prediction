@@ -741,7 +741,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     negative_posts_sample = int(args.negative_posts_sample)
     cap_random_seed = int(args.cap_random_seed)
     embedding_model = args.embedding_model
-    skip_embeddings = bool(getattr(args, "skip_embeddings", False))
+    skip_embeddings = args.skip_embeddings
     memory_check = str(args.memory_check)  # "full", "ignore", or "skip"
     max_memory_gb = args.max_memory_gb
     if max_memory_gb is not None:
