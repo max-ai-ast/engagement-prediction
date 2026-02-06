@@ -136,7 +136,7 @@ def _get_negative_target_posts(
     n_likes_orig = liked_target_posts_lf.select(pl.len()).collect(engine='streaming').item()
     n_likes_after_bucket_join = likes_lf.select(pl.len()).collect(engine='streaming').item()
     n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
-    logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_after_bucket_join} likes).")
+    logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_lost_from_bucket_join:,} likes).")
     context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
 
     posts_keyed_lf = posts_lf.with_columns(
