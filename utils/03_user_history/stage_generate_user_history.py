@@ -407,7 +407,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Collect using the streaming engine so that the intermediate fan-out join
     # is processed in batches rather than fully materialised in memory.
     # Falls back to the default engine automatically if the plan can't be streamed.
-    directory_df = directory_lf.collect(streaming=True)
+    directory_df = directory_lf.collect(engine="streaming")
 
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
