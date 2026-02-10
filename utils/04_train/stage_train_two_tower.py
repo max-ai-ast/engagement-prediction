@@ -15,7 +15,8 @@ Inputs (from prior pipeline stages):
 
 Outputs under <run_dir>/04_train/<timestamp>/:
 - checkpoints/two_tower_*.pth
-- plots/training_history_*.png, val_performance_*.png, holdout_performance_*.png
+- plots/training_history_*.png, train_performance_*.png, val_performance_*.png, holdout_performance_*.png
+- logs/
 - training_config.json
 - stage_info.txt
 - holdout_eval/metrics_overall.json, predictions.parquet
@@ -36,7 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
-from utils.helpers import get_stage_logger, log_operation_start, get_device
+from utils.helpers import get_stage_logger, log_operation_start, get_device, plot_model_performance
 from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
@@ -388,60 +389,6 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Path):
     plt.close()
 
 
-def plot_model_performance_tt(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    save_path: Path,
-    title_suffix: str = "",
-):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, confusion_matrix
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-    fpr, tpr, _ = roc_curve(y_true, y_pred)
-    auc_score = roc_auc_score(y_true, y_pred) if len(set(y_true)) > 1 else 0.5
-    axes[0, 0].plot(fpr, tpr, label=f"ROC (AUC = {auc_score:.3f})")
-    axes[0, 0].plot([0, 1], [0, 1], "k--", alpha=0.5)
-    axes[0, 0].set_xlabel("False Positive Rate")
-    axes[0, 0].set_ylabel("True Positive Rate")
-    axes[0, 0].set_title(f"ROC Curve {title_suffix}")
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    precision, recall, _ = precision_recall_curve(y_true, y_pred)
-    axes[0, 1].plot(recall, precision)
-    axes[0, 1].set_xlabel("Recall")
-    axes[0, 1].set_ylabel("Precision")
-    axes[0, 1].set_title(f"Precision-Recall Curve {title_suffix}")
-    axes[0, 1].grid(True, alpha=0.3)
-
-    y_pred_binary = (y_pred > 0.5).astype(int)
-    cm = confusion_matrix(y_true, y_pred_binary)
-    axes[1, 0].imshow(cm, cmap="Blues")
-    for (i, j), val in np.ndenumerate(cm):
-        axes[1, 0].text(j, i, int(val), ha="center", va="center", fontsize=14)
-    axes[1, 0].set_title(f"Confusion Matrix {title_suffix}")
-    axes[1, 0].set_xlabel("Predicted")
-    axes[1, 0].set_ylabel("Actual")
-    axes[1, 0].set_xticks([0, 1])
-    axes[1, 0].set_yticks([0, 1])
-
-    axes[1, 1].hist(y_pred[y_true == 0], bins=50, alpha=0.7, label="Negative", color="blue")
-    axes[1, 1].hist(y_pred[y_true == 1], bins=50, alpha=0.7, label="Positive", color="orange")
-    axes[1, 1].set_xlabel("Predicted Probability")
-    axes[1, 1].set_ylabel("Frequency")
-    axes[1, 1].set_title(f"Prediction Distribution {title_suffix}")
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
 # =============================================================================
 # Pipeline entry point
 # =============================================================================
@@ -554,28 +501,46 @@ def run(context: Context, args) -> Dict[str, Any]:
     )
     trained_model: TwoTowerEngagement = training_result["model"]
 
-    # --- plots ---
-    plot_training_history(training_result["history"], plots_dir / f"training_history_{timestamp}.png")
+    # --- plots & evaluation ---
+    generate_plots = not bool(getattr(args, "no_plots", False))
 
-    # experiment tracker scalars
     hist = training_result["history"]
+
+    # experiment tracker scalars (always logged, regardless of --no-plots)
     for e in range(len(hist["train_loss"])):
         context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
         context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
         context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
         context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
-    # Validation performance plot
+    if generate_plots:
+        plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png")
+
+    # Collect train + val predictions for performance plots & metrics
+    train_eval = evaluate_model(trained_model, train_loader, device)
     val_eval = evaluate_model(trained_model, val_loader, device)
+    logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
-    try:
-        plot_model_performance_tt(
-            val_eval["predictions"]["y_true"],
-            val_eval["predictions"]["y_pred"],
-            plots_dir / f"val_performance_{timestamp}.png",
-        )
-    except Exception:
-        pass
+
+    if generate_plots:
+        try:
+            plot_model_performance(
+                train_eval["predictions"]["y_true"],
+                train_eval["predictions"]["y_pred"],
+                plots_dir / f"train_performance_{timestamp}.png",
+                title_suffix="(Train)",
+            )
+        except Exception:
+            pass
+        try:
+            plot_model_performance(
+                val_eval["predictions"]["y_true"],
+                val_eval["predictions"]["y_pred"],
+                plots_dir / f"val_performance_{timestamp}.png",
+                title_suffix="(Validation)",
+            )
+        except Exception:
+            pass
 
     # --- save model ---
     model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -637,15 +602,16 @@ def run(context: Context, args) -> Dict[str, Any]:
             with open(holdout_dir / "metrics_overall.json", "w") as f:
                 json.dump(holdout_metrics, f, indent=2)
 
-            try:
-                plot_model_performance_tt(
-                    holdout_eval["predictions"]["y_true"],
-                    holdout_eval["predictions"]["y_pred"],
-                    plots_dir / f"holdout_performance_{timestamp}.png",
-                    title_suffix="(Holdout)",
-                )
-            except Exception:
-                pass
+            if generate_plots:
+                try:
+                    plot_model_performance(
+                        holdout_eval["predictions"]["y_true"],
+                        holdout_eval["predictions"]["y_pred"],
+                        plots_dir / f"holdout_performance_{timestamp}.png",
+                        title_suffix="(Holdout)",
+                    )
+                except Exception:
+                    pass
     except Exception as exc:
         logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
 
@@ -660,6 +626,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
+        "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
         "holdout_metrics": holdout_metrics,
         "best_val_auc": training_result["best_val_auc"],
@@ -673,6 +640,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"stage: train_two_tower",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"best_val_auc: {training_result['best_val_auc']:.4f}",

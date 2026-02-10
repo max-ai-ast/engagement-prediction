@@ -731,8 +731,15 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
     plt.show()
 
 
-def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_path: Optional[Path] = None):
+def plot_model_performance(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    save_path: Optional[Path] = None,
+    title_suffix: str = "",
+):
     import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # type: ignore
     try:
         import seaborn as sns  # type: ignore
@@ -746,14 +753,14 @@ def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_pa
     axes[0, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5)
     axes[0, 0].set_xlabel('False Positive Rate')
     axes[0, 0].set_ylabel('True Positive Rate')
-    axes[0, 0].set_title('ROC Curve')
+    axes[0, 0].set_title(f'ROC Curve {title_suffix}'.strip())
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
     axes[0, 1].plot(recall, precision)
     axes[0, 1].set_xlabel('Recall')
     axes[0, 1].set_ylabel('Precision')
-    axes[0, 1].set_title('Precision-Recall Curve')
+    axes[0, 1].set_title(f'Precision-Recall Curve {title_suffix}'.strip())
     axes[0, 1].grid(True, alpha=0.3)
     y_pred_binary = (y_pred_proba > 0.5).astype(int)
     cm = confusion_matrix(y_true, y_pred_binary)
@@ -763,20 +770,20 @@ def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_pa
         axes[1, 0].imshow(cm, cmap='Blues')
         for (i, j), val in np.ndenumerate(np.array(cm)):
             axes[1, 0].text(j, i, int(val), ha='center', va='center')
-    axes[1, 0].set_title('Confusion Matrix')
+    axes[1, 0].set_title(f'Confusion Matrix {title_suffix}'.strip())
     axes[1, 0].set_xlabel('Predicted')
     axes[1, 0].set_ylabel('Actual')
     axes[1, 1].hist(y_pred_proba[y_true == 0], bins=50, alpha=0.7, label='Not Liked')
     axes[1, 1].hist(y_pred_proba[y_true == 1], bins=50, alpha=0.7, label='Liked')
     axes[1, 1].set_xlabel('Predicted Probability')
     axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_title('Prediction Distribution')
+    axes[1, 1].set_title(f'Prediction Distribution {title_suffix}'.strip())
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.show()
+    plt.close()
 
 
 def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: str, save_dir: Path) -> None:

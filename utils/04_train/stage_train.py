@@ -11,11 +11,11 @@ Inputs (from prior pipeline stages):
 
 Outputs under <run_dir>/04_train/<timestamp>/:
 - checkpoints/engagement_model_*.pth
-- plots/training_history_*.png, train_model_performance_*.png, val_model_performance_*.png
+- plots/training_history_*.png, train_performance_*.png, val_performance_*.png, holdout_performance_*.png
 - logs/
 - training_config.json
 - stage_info.txt
-- holdout_eval/metrics_overall.json  (lightweight)
+- holdout_eval/metrics_overall.json
 """
 
 from __future__ import annotations
@@ -340,48 +340,6 @@ def train_model(
 # Lightweight holdout evaluation
 # =============================================================================
 
-def _holdout_auc(
-    model: nn.Module,
-    holdout_dataset: Dataset,
-    device: str,
-    batch_size: int,
-    collate_fn=None,
-) -> Dict[str, Any]:
-    """Compute AUC + accuracy on the holdout split (best-effort)."""
-    try:
-        from sklearn.metrics import roc_auc_score, accuracy_score
-    except ImportError:
-        return {"note": "sklearn not available"}
-
-    if len(holdout_dataset) == 0:
-        return {"note": "no holdout samples"}
-
-    loader_kw: Dict[str, Any] = dict(
-        batch_size=batch_size, shuffle=False,
-        num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
-    )
-    if collate_fn is not None:
-        loader_kw["collate_fn"] = collate_fn
-    loader = DataLoader(holdout_dataset, **loader_kw)
-
-    all_preds: List[float] = []
-    all_labels: List[float] = []
-    model.eval()
-    with torch.inference_mode():
-        for batch in loader:
-            _, preds = model.train_step(batch, device)
-            all_preds.extend(preds.cpu().numpy().tolist())
-            all_labels.extend(batch["label"].numpy().tolist())
-
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
-    metrics: Dict[str, Any] = {"total_samples": len(y_true), "positive": int(y_true.sum())}
-    if len(set(y_true)) > 1:
-        metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-    metrics["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
-    return metrics
-
-
 # =============================================================================
 # Pipeline entry point
 # =============================================================================
@@ -511,54 +469,77 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     trained_model: nn.Module = training_results["model"]
     clear_cuda_memory()
 
-    # --- plots ---
+    # --- plots & evaluation ---
     generate_plots = not bool(args.no_plots)
+    hist = training_results["history"]
+
+    # experiment tracker scalars (always logged, regardless of --no-plots)
+    for e in range(len(hist["train_loss"])):
+        context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
+        context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
+        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
+        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
+
     if generate_plots:
         log_operation_start("Generate plots", STAGE_LOG_NAME, logger)
         from utils.helpers import plot_training_history
 
-        hist = training_results["history"]
         try:
             best_epoch = int(np.argmin(hist.get("val_loss", []))) + 1 if hist.get("val_loss") else None
         except Exception:
             best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
-        # experiment tracker scalars
-        for e in range(len(hist["train_loss"])):
-            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
+    # Collect train + val predictions for performance plots & metrics
+    def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
+        loader_kw_ = dict(
+            batch_size=batch_size, shuffle=False, drop_last=False,
+            num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
+        )
+        if collate_fn_ is not None:
+            loader_kw_["collate_fn"] = collate_fn_
+        loader = DataLoader(ds, **loader_kw_)
+        ys, ps = [], []
+        trained_model.eval()
+        with torch.inference_mode():
+            for batch in loader:
+                _, preds = trained_model.train_step(batch, device)
+                if preds.ndim == 0:
+                    ps.append(float(preds.cpu()))
+                    ys.append(float(batch["label"].cpu()))
+                else:
+                    ps.extend(preds.cpu().numpy().tolist())
+                    ys.extend(batch["label"].numpy().tolist())
+        return np.asarray(ys), np.asarray(ps)
 
-        # performance plots (train + val)
+    try:
+        from sklearn.metrics import roc_auc_score, accuracy_score
+        _have_sklearn = True
+    except ImportError:
+        _have_sklearn = False
+
+    def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
+        m: Dict[str, Any] = {"total_samples": len(y_true), "positive_samples": int(y_true.sum())}
+        if _have_sklearn and len(set(y_true)) > 1:
+            m["auc_roc"] = float(roc_auc_score(y_true, y_pred))
+        if _have_sklearn:
+            m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
+        return m
+
+    y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
+    y_val, p_val = _collect_predictions(val_dataset, collate_fn_=collate_fn)
+    train_metrics = _compute_metrics(y_train, p_train)
+    val_metrics = _compute_metrics(y_val, p_val)
+    logger.info(f"Train metrics: {train_metrics}")
+    logger.info(f"Validation metrics: {val_metrics}")
+
+    if generate_plots:
         try:
-            trained_model.eval()
-
-            def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
-                loader_kw_ = dict(
-                    batch_size=batch_size, shuffle=False, drop_last=False,
-                    num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
-                )
-                if collate_fn_ is not None:
-                    loader_kw_["collate_fn"] = collate_fn_
-                loader = DataLoader(ds, **loader_kw_)
-                ys, ps = [], []
-                with torch.inference_mode():
-                    for batch in loader:
-                        _, preds = trained_model.train_step(batch, device)
-                        if preds.ndim == 0:
-                            ps.append(float(preds.cpu()))
-                            ys.append(float(batch["label"].cpu()))
-                        else:
-                            ps.extend(preds.cpu().numpy().tolist())
-                            ys.extend(batch["label"].numpy().tolist())
-                return np.asarray(ys), np.asarray(ps)
-
-            y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
-            plot_model_performance(y_train, p_train, plots_dir / f"train_model_performance_{timestamp}.png")
-            y_val, p_val = _collect_predictions(val_dataset, collate_fn_=collate_fn)
-            plot_model_performance(y_val, p_val, plots_dir / f"val_model_performance_{timestamp}.png")
+            plot_model_performance(y_train, p_train, plots_dir / f"train_performance_{timestamp}.png", title_suffix="(Train)")
+        except Exception:
+            pass
+        try:
+            plot_model_performance(y_val, p_val, plots_dir / f"val_performance_{timestamp}.png", title_suffix="(Validation)")
         except Exception:
             pass
 
@@ -598,7 +579,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger.info(f"Model saved to: {model_path}")
         context.tracker.log_artifact(name="trained_model_mlp", path=model_path)
 
-    # --- lightweight holdout eval ---
+    # --- holdout eval ---
     holdout_metrics: Dict[str, Any] = {}
     try:
         if user_encoder == "summarized":
@@ -613,14 +594,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            holdout_metrics = _holdout_auc(
-                trained_model, holdout_dataset, device, batch_size, collate_fn=collate_fn,
-            )
+            y_holdout, p_holdout = _collect_predictions(holdout_dataset, collate_fn_=collate_fn)
+            holdout_metrics = _compute_metrics(y_holdout, p_holdout)
             logger.info(f"Holdout metrics: {holdout_metrics}")
+
             he_dir = out_dir / "holdout_eval"
             he_dir.mkdir(parents=True, exist_ok=True)
             with open(he_dir / "metrics_overall.json", "w") as f:
                 json.dump(holdout_metrics, f, indent=2)
+
+            if generate_plots:
+                try:
+                    plot_model_performance(
+                        y_holdout, p_holdout,
+                        plots_dir / f"holdout_performance_{timestamp}.png",
+                        title_suffix="(Holdout)",
+                    )
+                except Exception:
+                    pass
     except Exception as exc:
         logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
 
@@ -642,8 +633,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "random_seed": int(args.random_seed),
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
-        "best_val_auc": training_results["best_val_auc"],
+        "train_metrics": train_metrics,
+        "val_metrics": val_metrics,
         "holdout_metrics": holdout_metrics,
+        "best_val_auc": training_results["best_val_auc"],
     }
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
@@ -652,6 +645,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     runtime = time.time() - t0
     info_lines = [
         f"stage: train_mlp",
+        f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
         f"settings: batch_size={batch_size}, lr={args.learning_rate}, epochs={args.epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
         f"inputs: embeddings memmap, target_posts, user_history",
@@ -669,5 +663,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "output_dir": out_dir,
         "artifacts": {
             "model_path": str(model_path) if model_path else None,
+            "training_config": str(out_dir / "training_config.json"),
         },
     }
