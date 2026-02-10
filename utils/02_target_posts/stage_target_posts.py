@@ -78,6 +78,7 @@ def _get_negative_target_posts(
     """
     Samples one negative (unliked) post per like by bucketing posts in time and
     selecting a deterministic index within each bucket based on the like metadata.
+    Ensures the selected negative was not liked by the target user.
     """
     random_seed = args.random_seed
     bucket = args.neg_sample_bucket
@@ -110,13 +111,62 @@ def _get_negative_target_posts(
         .rename({'len': 'bucket_size'})
     ) # 'bucket', 'bucket_size'
 
-    likes_lf = (
+    likes_with_bucket_lf = (
         liked_target_posts_lf
         .with_columns([
             # using posted_at time of like so that it can match up with negatives
             # (for which we only currently have the posted_at time)
             pl.col('like_posted_at').dt.truncate(bucket).alias('bucket')
         ])
+    )
+
+    liked_idx_by_user_bucket_lf = (
+        liked_target_posts_lf
+        .join(
+            posts_lf.select(['neg_uri', 'bucket', 'idx_in_bucket']),
+            left_on='like_uri',
+            right_on='neg_uri',
+            how='inner'
+        )
+        .group_by(['target_did', 'bucket'])
+        .agg(
+            pl.col('idx_in_bucket').unique().sort().alias('liked_idx_list')
+        )
+        .with_columns(
+            pl.col('liked_idx_list').list.len().alias('liked_count')
+        )
+    ) # 'target_did', 'bucket', 'liked_idx_list', 'liked_count'
+
+    user_bucket_candidates_lf = (
+        likes_with_bucket_lf
+        .join(bucket_sizes_lf, on="bucket", how="inner")
+        .select(['target_did', 'bucket', 'bucket_size'])
+        .unique()
+        .join(liked_idx_by_user_bucket_lf, on=['target_did', 'bucket'], how='left')
+        .with_columns(
+            pl.col('liked_idx_list')
+            .fill_null(pl.lit([], dtype=pl.List(pl.Int64)))
+            .alias('liked_idx_list')
+        )
+        .with_columns(
+            pl.int_ranges(0, pl.col('bucket_size')).alias('all_idx'),
+        )
+        .with_columns(
+            pl.col('all_idx')
+            .list
+            .set_difference(pl.col('liked_idx_list'))
+            .list
+            .sort()
+            .alias('unliked_idx_list')
+        )
+        .with_columns(
+            pl.col('unliked_idx_list').list.len().alias('unliked_count')
+        )
+        .select(['target_did', 'bucket', 'unliked_idx_list', 'unliked_count'])
+    )
+
+    likes_lf = (
+        likes_with_bucket_lf
         # join to get bucket_size for the like's bucket
         .join(bucket_sizes_lf, on="bucket", how="inner")
         .with_columns(
@@ -125,10 +175,20 @@ def _get_negative_target_posts(
                 [pl.col('target_did'), pl.col('like_uri')]
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
         )
-        # seed and neg_idx together effectively assign a random post in the bucket to each like
-        # (multiple likes can be assigned to the same negative post, which is what we want - a true random sample)
+        .join(user_bucket_candidates_lf, on=['target_did', 'bucket'], how='left')
         .with_columns(
-            (pl.col('seed') % pl.col('bucket_size').cast(pl.UInt64)).cast(pl.Int64).alias('neg_idx'),
+            # seed and neg_rank together assign a random *unliked* post in the bucket to each like
+            # (multiple likes can be assigned to the same negative post, which is what we want)
+            pl.when(pl.col('unliked_count') > 0)
+            .then((pl.col('seed') % pl.col('unliked_count').cast(pl.UInt64)).cast(pl.Int64))
+            .otherwise(None)
+            .alias('neg_rank'),
+        )
+        .with_columns(
+            pl.when(pl.col('neg_rank').is_not_null())
+            .then(pl.col('unliked_idx_list').list.get(pl.col('neg_rank')))
+            .otherwise(None)
+            .alias('neg_idx'),
         )
     ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did' 'bucket', 'bucket_size', 'seed', 'neg_idx'
 
@@ -138,6 +198,19 @@ def _get_negative_target_posts(
     n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
     logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_lost_from_bucket_join:,} likes).")
     context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
+
+    # If a user liked every post in a bucket, there is no valid negative for that like.
+    n_likes_without_neg = (
+        likes_lf
+        .filter(pl.col('neg_idx').is_null())
+        .select(pl.len())
+        .collect(engine='streaming')
+        .item()
+    )
+    if n_likes_without_neg > 0:
+        logger.info(f"Dropping {n_likes_without_neg:,} likes with no unliked negatives in the bucket.")
+        context.tracker.log_single_value('Target Posts - Dropped Likes with No Unliked Negatives', n_likes_without_neg)
+        likes_lf = likes_lf.filter(pl.col('neg_idx').is_not_null())
 
     posts_keyed_lf = posts_lf.with_columns(
         pl.concat_str(['bucket', 'idx_in_bucket']).alias('key')
@@ -172,7 +245,7 @@ def _log_final_metrics(
         all_target_posts_lf
         .select(['neg_uri', 'target_did'])
         .join(
-            liked_target_posts_lf.select(['target_did', 'like_uri']).unique(), 
+            liked_target_posts_lf.select(['target_did', 'like_uri']), 
             left_on=['target_did', 'neg_uri'], 
             right_on=['target_did', 'like_uri'], 
             how='left',

@@ -147,6 +147,42 @@ def test_negative_target_posts_deterministic_and_bucketed(
         assert like_ts.date() == neg_ts.date()
 
 
+def test_negative_target_posts_excludes_liked_by_target(
+    stage_target_posts_module, dummy_logger, dummy_context
+):
+    args = argparse.Namespace(random_seed=11, neg_sample_bucket="1d")
+
+    posts_df = pl.DataFrame(
+        [
+            {"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1, 1), "emb_idx": 1, "did": "author_1"},
+            {"at_uri": "post:2", "record_created_at": _dt(2024, 1, 1, 2), "emb_idx": 2, "did": "author_2"},
+            {"at_uri": "post:3", "record_created_at": _dt(2024, 1, 1, 3), "emb_idx": 3, "did": "author_3"},
+        ]
+    )
+    likes_df = pl.DataFrame(
+        [
+            {"did": "user_a", "subject_uri": "post:1", "record_created_at": _dt(2024, 1, 1, 10), "emb_idx": 10},
+            {"did": "user_a", "subject_uri": "post:2", "record_created_at": _dt(2024, 1, 1, 11), "emb_idx": 11},
+            {"did": "user_b", "subject_uri": "post:3", "record_created_at": _dt(2024, 1, 1, 12), "emb_idx": 12},
+        ]
+    )
+
+    liked_lf = stage_target_posts_module._get_liked_target_posts(
+        likes_df.lazy(), posts_df.lazy()
+    )
+    out = stage_target_posts_module._get_negative_target_posts(
+        args, posts_df.lazy(), liked_lf, dummy_logger, dummy_context
+    ).collect()
+
+    liked_pairs = set(zip(likes_df["did"].to_list(), likes_df["subject_uri"].to_list()))
+    for did, neg_uri in zip(out["target_did"].to_list(), out["neg_uri"].to_list()):
+        assert (did, neg_uri) not in liked_pairs
+
+    user_a_negs = out.filter(pl.col("target_did") == "user_a")["neg_uri"].to_list()
+    assert len(user_a_negs) == 2
+    assert set(user_a_negs) == {"post:3"}
+
+
 def test_negative_target_posts_requires_bucket(
     stage_target_posts_module, dummy_logger, dummy_context
 ):
