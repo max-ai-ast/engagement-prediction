@@ -207,11 +207,11 @@ def _log_and_plot_history_distribution(
         logger.info(f"  {label}:")
         logger.info(f"    mean={dist.mean():.1f}, median={dist.median():.1f}")
         logger.info(
-            f"    p25={int(dist.quantile(0.25, 'nearest'))}, "
-            f"p75={int(dist.quantile(0.75, 'nearest'))}, "
-            f"p90={int(dist.quantile(0.90, 'nearest'))}, "
-            f"p95={int(dist.quantile(0.95, 'nearest'))}, "
-            f"p99={int(dist.quantile(0.99, 'nearest'))}"
+            f"    p25={int(dist.quantile(0.25, 'nearest') or 0)}, "
+            f"p75={int(dist.quantile(0.75, 'nearest') or 0)}, "
+            f"p90={int(dist.quantile(0.90, 'nearest') or 0)}, "
+            f"p95={int(dist.quantile(0.95, 'nearest') or 0)}, "
+            f"p99={int(dist.quantile(0.99, 'nearest') or 0)}"
         )
         logger.info(f"    min={dist.min()}, max={dist.max()}")
 
