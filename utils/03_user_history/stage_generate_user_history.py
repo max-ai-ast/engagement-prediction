@@ -346,11 +346,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Using target posts from: {target_posts_path}")
 
     # === Get CLI args ===
-    max_prior_likes: Optional[int] = getattr(args, 'max_prior_likes', None)
+    max_prior_likes: Optional[int] = args.max_prior_likes
     if max_prior_likes is not None and max_prior_likes <= 0:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
 
-    history_buffer_hours: Optional[float] = getattr(args, 'history_buffer_hours', None)
+    history_buffer_hours: Optional[float] = args.history_buffer_hours
     if history_buffer_hours is not None and history_buffer_hours <= 0:
         history_buffer_hours = None  # Treat 0 or negative as "no buffer"
 
