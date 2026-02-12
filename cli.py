@@ -61,7 +61,7 @@ DEFAULTS: Dict[str, Any] = {
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
-    # Stage 4 (train)
+    # Stage 4 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
     "user_encoder": None,  # None = smart default (summarized for mlp, attention for two-tower)
@@ -86,6 +86,17 @@ DEFAULTS: Dict[str, Any] = {
     "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
+    # Stage 4 (train) - DataLoader settings
+    "num_dataloader_workers": 4,
+    "dataloader_pin_memory": True,
+    "dataloader_persistent_workers": True,
+    "dataloader_prefetch_factor": 2,
+    # Stage 4 (train) - Learning rate scheduler
+    "lr_scheduler_mode": "max",
+    "lr_scheduler_factor": 0.5,
+    "lr_scheduler_patience": 5,
+    # Stage 4 (train) - Training optimization
+    "gradient_clip_max_norm": 1.0,
     # Stage 5 (eval)
     "eval_batch_size": 8192,
     "eval_max_users": None,
@@ -589,7 +600,26 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip saving model checkpoints")
-    # Stage 4 options (subset)
+    # Stage 4 (train) - DataLoader settings
+    _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of DataLoader worker processes")
+    _add_arg_with_default(p_all, "--dataloader-pin-memory", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable DataLoader pin_memory for faster GPU transfer")
+    _add_arg_with_default(p_all, "--dataloader-persistent-workers", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Keep DataLoader workers alive between epochs")
+    _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of batches to prefetch per DataLoader worker")
+    # Stage 4 (train) - Learning rate scheduler
+    _add_arg_with_default(p_all, "--lr-scheduler-mode", type=str, choices=["min", "max"], default=argparse.SUPPRESS,
+                          help_text="Learning rate scheduler mode (min for loss, max for accuracy/AUC)")
+    _add_arg_with_default(p_all, "--lr-scheduler-factor", type=float, default=argparse.SUPPRESS,
+                          help_text="Factor by which to reduce learning rate")
+    _add_arg_with_default(p_all, "--lr-scheduler-patience", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of epochs with no improvement before reducing LR")
+    # Stage 4 (train) - Training optimization
+    _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum gradient norm for clipping (two-tower only)")
+    # Stage 5 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
     _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,

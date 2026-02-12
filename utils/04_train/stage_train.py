@@ -189,6 +189,9 @@ def create_data_loaders(
     batch_size: int,
     test_dataset: Optional[Dataset] = None,
     num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2,
 ):
     # With pre-computed tensors the workers just do index lookups + collation,
     # so even a few workers eliminate any remaining CPU-side bottleneck and
@@ -197,9 +200,9 @@ def create_data_loaders(
     if num_workers > 0:
         worker_kw = dict(
             num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
         )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, **worker_kw)
@@ -243,6 +246,9 @@ def train_model(
     load_best_checkpoint: bool = False,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
+    lr_scheduler_mode: str = "max",
+    lr_scheduler_factor: float = 0.5,
+    lr_scheduler_patience: int = 5,
 ) -> Dict[str, Any]:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import torch.optim as optim
@@ -254,7 +260,9 @@ def train_model(
 
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+    # Cast mode to satisfy type checker (value is validated by argparse choices)
+    mode: Any = lr_scheduler_mode
+    scheduler = ReduceLROnPlateau(optimizer, mode=mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience)
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_loss = float("inf")
     patience_counter = 0
@@ -378,6 +386,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     hidden_dims = list(args.hidden_dims)
     dropout_rate = float(args.dropout_rate_mlp)
     collate_fn = None  # non-None only for sequence datasets
+    
+    # Get worker settings from args (shared by all encoder types)
+    num_workers = int(getattr(args, "num_dataloader_workers", 4))
+    pin_memory = bool(getattr(args, "dataloader_pin_memory", True))
+    persistent_workers = bool(getattr(args, "dataloader_persistent_workers", True))
+    prefetch_factor = int(getattr(args, "dataloader_prefetch_factor", 2))
 
     if user_encoder == "summarized":
         # Classic MLP path: deterministic user summary + post embedding
@@ -397,7 +411,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
         input_dim = 2 * embed_dim  # [user_summary || post_embedding]
         model = create_model(input_dim, hidden_dims, dropout_rate)
-        train_loader, val_loader, _ = create_data_loaders(train_dataset, val_dataset, batch_size)
+        
+        train_loader, val_loader, _ = create_data_loaders(
+            train_dataset, val_dataset, batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
 
     elif user_encoder == "attention":
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
@@ -430,10 +451,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
         collate_fn = sequence_collate_fn
         _worker_kw: Dict[str, Any] = dict(
-            num_workers=4,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
@@ -453,6 +474,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # --- train ---
     log_operation_start(f"Training MLP (epochs={args.epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
     disable_progress = bool(getattr(args, "disable_progress", False))
+    
+    # Get scheduler settings from args
+    lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "max"))
+    lr_scheduler_factor = float(getattr(args, "lr_scheduler_factor", 0.5))
+    lr_scheduler_patience = int(getattr(args, "lr_scheduler_patience", 5))
+    
     training_results = train_model(
         model=model,
         train_loader=train_loader,
@@ -465,6 +492,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         load_best_checkpoint=True,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
+        lr_scheduler_mode=lr_scheduler_mode,
+        lr_scheduler_factor=lr_scheduler_factor,
+        lr_scheduler_patience=lr_scheduler_patience,
     )
     trained_model: nn.Module = training_results["model"]
     clear_cuda_memory()
@@ -494,7 +524,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
         loader_kw_ = dict(
             batch_size=batch_size, shuffle=False, drop_last=False,
-            num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
+            num_workers=num_workers, pin_memory=pin_memory, 
+            persistent_workers=persistent_workers, prefetch_factor=prefetch_factor,
         )
         if collate_fn_ is not None:
             loader_kw_["collate_fn"] = collate_fn_

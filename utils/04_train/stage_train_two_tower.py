@@ -185,12 +185,18 @@ def train_two_tower_model(
     patience: int = 20,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
+    lr_scheduler_mode: str = "max",
+    lr_scheduler_factor: float = 0.5,
+    lr_scheduler_patience: int = 5,
+    gradient_clip_max_norm: float = 1.0,
 ) -> Dict[str, Any]:
     from tqdm import tqdm
 
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode=lr_scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience
+    )
 
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_auc = 0.0
@@ -220,7 +226,7 @@ def train_two_tower_model(
             optimizer.zero_grad()
             loss, scores = model.train_forward(history_emb, history_mask, target_emb, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
 
             train_losses.append(loss.item())
@@ -440,6 +446,12 @@ def run(context: Context, args) -> Dict[str, Any]:
     patience = int(args.patience)
     disable_progress = bool(getattr(args, "disable_progress", False))
 
+    # Get worker settings from args
+    num_workers = int(getattr(args, "num_dataloader_workers", 4))
+    pin_memory = bool(getattr(args, "dataloader_pin_memory", True))
+    persistent_workers = bool(getattr(args, "dataloader_persistent_workers", True))
+    prefetch_factor = int(getattr(args, "dataloader_prefetch_factor", 2))
+
     # --- datasets ---
     log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
     train_dataset = SequenceEngagementDataset(
@@ -453,10 +465,10 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # With pre-computed tensors, workers just do index lookups + collation.
     _worker_kw: Dict[str, Any] = dict(
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -487,6 +499,13 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- train ---
     log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
+    
+    # Get scheduler and training optimization settings from args
+    lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "max"))
+    lr_scheduler_factor = float(getattr(args, "lr_scheduler_factor", 0.5))
+    lr_scheduler_patience = int(getattr(args, "lr_scheduler_patience", 5))
+    gradient_clip_max_norm = float(getattr(args, "gradient_clip_max_norm", 1.0))
+    
     training_result = train_two_tower_model(
         model=model,
         train_loader=train_loader,
@@ -498,6 +517,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         patience=patience,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
+        lr_scheduler_mode=lr_scheduler_mode,
+        lr_scheduler_factor=lr_scheduler_factor,
+        lr_scheduler_patience=lr_scheduler_patience,
+        gradient_clip_max_norm=gradient_clip_max_norm,
     )
     trained_model: TwoTowerEngagement = training_result["model"]
 
