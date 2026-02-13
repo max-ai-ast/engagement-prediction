@@ -5,7 +5,7 @@ Consolidated Helpers for Engagement Prediction Pipeline
 
 This module centralizes the shared helper functions used across pipeline stages.
 Only truly cross-stage utilities live here. Stage-specific helpers should live
-inside their respective stage scripts (e.g., utils/05_train/stage_train.py).
+inside their respective stage scripts (e.g., utils/04_train/stage_train_mlp.py).
 """
 
 from __future__ import annotations

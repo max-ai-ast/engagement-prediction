@@ -76,8 +76,8 @@ Tests all reside in the `tests/` directory and should use the file naming conven
 - `utils/02_featurize/stage_featurize.py`: Stage 2 — Build candidate post set and compute text+image embeddings → save `embedding_bundle_*.pkl`.
 - `utils/03_relevel/stage_relevel_uniform.py`: Stage 3 — Discover topics and compute per-user mixtures; optional uniform-mixture-balanced relevel selection.
 - `utils/04_split/stage_split_users.py`: Stage 4 — Produce `user_splits.json` (train/val/holdout).
-- `utils/05_train/stage_train.py`: Stage 5 (MLP) — Train MLP model using bundle + splits; saves checkpoint and `training_config.json`.
-- `utils/05_train/stage_train_two_tower.py`: Stage 5 (Two-Tower) — Train two-tower model with user history attention encoder.
+- `utils/04_train/stage_train_mlp.py`: Stage 4 (MLP) — Train MLP model using bundle + splits; saves checkpoint and `training_config.json`.
+- `utils/04_train/stage_train_two_tower.py`: Stage 4 (Two-Tower) — Train two-tower model with user history attention encoder.
 - `utils/06_evaluate/stage_evaluate.py`: Stage 6 — Consolidated evaluation (pairs, matrix, global_unliked).
 - `utils/00_helpers/helpers.py`: Minimal cross-stage helpers (re-exported from existing modules).
 - `utils/pipeline/{core.py, registry.py}`: Context, timestamped output dirs, and stage registry.

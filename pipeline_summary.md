@@ -22,9 +22,9 @@ This report documents only the code under `wills_tinkering_folder`. It covers th
   - Entrypoint: `utils/04_split/stage_split_users.py`
   - Output: `outputs/<run>/split/<ts>/user_splits.json` (+ summary)
 
-- **Stage 5: Train** — Train an engagement classifier using `embedding_bundle.pkl` and `user_splits.json`. Build user features (default: per-user KMeans multi-centroid), construct balanced prediction pairs, enforce strict 50/50 class balance, and train an MLP. Save checkpoint plus a `training_config.json` describing the feature schema for evaluation-time parity.
-  - Entrypoint: `utils/05_train/stage_train.py`
-  - Output: `outputs/<run>/train/<ts>/{checkpoints,plots,logs}/...` and `training_config.json`
+- **Stage 4: Train** — Train an engagement classifier using embeddings and user history. Build user features (default: per-user KMeans multi-centroid), construct balanced prediction pairs, enforce strict 50/50 class balance, and train an MLP or Two-Tower model. Save checkpoint plus a `training_config.json` describing the feature schema for evaluation-time parity.
+  - Entrypoint: `utils/04_train/stage_train_mlp.py` (MLP) or `utils/04_train/stage_train_two_tower.py` (Two-Tower)
+  - Output: `outputs/<run>/04_train/<ts>/{checkpoints,plots,logs}/...` and `training_config.json`
 
 - **Stage 6: Evaluation** — Consolidated evaluator supporting `pairs`, `matrix`, and `global_unliked` modes.
   - Entrypoint: `utils/06_evaluate/stage_evaluate.py`
