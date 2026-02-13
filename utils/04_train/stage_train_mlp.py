@@ -570,7 +570,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --- output dirs ---
-    run_tag = getattr(args, "run_tag", "") or ""
+    run_tag = args.run_tag or ""
     out_dir = new_stage_timestamp_dir(run_dir, "04_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
@@ -593,22 +593,23 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     # --- user encoder selection ---
-    user_encoder = getattr(args, "user_encoder", "summarized")
+    # Smart defaults already applied in CLI (summarized for MLP, attention for two-tower)
+    user_encoder = args.user_encoder
     batch_size = int(args.batch_size)
     hidden_dims = list(args.hidden_dims)
     dropout_rate = float(args.dropout_rate_mlp)
     collate_fn = None  # non-None only for sequence datasets
     
     # Get worker settings from args (shared by all encoder types)
-    num_workers = int(getattr(args, "num_dataloader_workers", 4))
-    pin_memory = bool(getattr(args, "dataloader_pin_memory", True))
-    persistent_workers = bool(getattr(args, "dataloader_persistent_workers", True))
-    prefetch_factor = int(getattr(args, "dataloader_prefetch_factor", 2))
+    num_workers = int(args.num_dataloader_workers)
+    pin_memory = bool(args.dataloader_pin_memory)
+    persistent_workers = bool(args.dataloader_persistent_workers)
+    prefetch_factor = int(args.dataloader_prefetch_factor)
 
     if user_encoder == "summarized":
         # Classic MLP path: deterministic user summary + post embedding
-        summarizer_name = getattr(args, "user_summarization", "mean")
-        ema_alpha = float(getattr(args, "ema_alpha", 0.1))
+        summarizer_name = args.user_summarization
+        ema_alpha = float(args.ema_alpha)
         summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
         logger.info(f"User encoder: summarized ({summarizer_name}, ema_alpha={ema_alpha})")
 
@@ -649,16 +650,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
 
+        # AttentionMLP uses user_output_dim (not shared_dim) since user vector is 
+        # concatenated with post embedding, not compared via dot product like TwoTower
         model = AttentionMLP(
             embed_dim=embed_dim,
             hidden_dims=hidden_dims,
             dropout_rate=dropout_rate,
             user_hidden_dim=int(args.user_hidden_dim),
-            user_output_dim=int(args.shared_dim),
+            user_output_dim=int(args.user_output_dim),
             num_attention_heads=int(args.num_attention_heads),
             num_attention_layers=int(args.num_attention_layers),
             max_history_len=max_history_len,
-            attention_dropout=dropout_rate,  # Use MLP dropout rate for consistency
+            attention_dropout=float(args.attention_dropout),
         )
 
         collate_fn = sequence_collate_fn
@@ -685,12 +688,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- train ---
     log_operation_start(f"Training MLP (epochs={args.epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    disable_progress = bool(getattr(args, "disable_progress", False))
+    disable_progress = bool(args.disable_progress)
     
     # Get scheduler settings from args
-    lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "max"))
-    lr_scheduler_factor = float(getattr(args, "lr_scheduler_factor", 0.5))
-    lr_scheduler_patience = int(getattr(args, "lr_scheduler_patience", 5))
+    lr_scheduler_mode = str(args.lr_scheduler_mode)
+    lr_scheduler_factor = float(args.lr_scheduler_factor)
+    lr_scheduler_patience = int(args.lr_scheduler_patience)
     
     training_results = train_model(
         model=model,

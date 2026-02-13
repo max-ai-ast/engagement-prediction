@@ -68,10 +68,12 @@ DEFAULTS: Dict[str, Any] = {
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
+    "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
     "num_attention_layers": 2,
     "max_history_len": 20,
+    "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
@@ -86,6 +88,7 @@ DEFAULTS: Dict[str, Any] = {
     "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
+    "disable_progress": False,  # Disable progress bars during training
     # Stage 4 (train) - DataLoader settings
     "num_dataloader_workers": 4,
     "dataloader_pin_memory": True,
@@ -385,7 +388,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         raise ValueError(f"Unknown model_type: {model_type}")
 
     # --- Smart default & validation for --user-encoder ---
-    user_encoder = getattr(args, "user_encoder", None)
+    user_encoder = args.user_encoder
     if user_encoder is None:
         # Apply smart default based on model type
         user_encoder = "summarized" if model_type == "mlp" else "attention"
@@ -562,7 +565,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
     _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower user encoder hidden dimension")
+                          help_text="User encoder hidden dimension")
+    _add_arg_with_default(p_all, "--user-output-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
     _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
@@ -570,7 +575,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention layers")
     _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower max user history length")
+                          help_text="Max user history length")
+    _add_arg_with_default(p_all, "--attention-dropout", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for attention-based user encoders")
     # Stage 5 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -600,6 +607,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip saving model checkpoints")
+    _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Disable progress bars during training")
     # Stage 4 (train) - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")

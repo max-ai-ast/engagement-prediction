@@ -576,7 +576,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --- output dirs ---
-    run_tag = getattr(args, "run_tag", "") or ""
+    run_tag = args.run_tag or ""
     out_dir = new_stage_timestamp_dir(run_dir, "04_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
@@ -614,13 +614,13 @@ def run(context: Context, args) -> Dict[str, Any]:
     weight_decay = float(args.weight_decay_two_tower)
     epochs = int(args.epochs)
     patience = int(args.patience)
-    disable_progress = bool(getattr(args, "disable_progress", False))
+    disable_progress = bool(args.disable_progress)
 
     # Get worker settings from args
-    num_workers = int(getattr(args, "num_dataloader_workers", 4))
-    pin_memory = bool(getattr(args, "dataloader_pin_memory", True))
-    persistent_workers = bool(getattr(args, "dataloader_persistent_workers", True))
-    prefetch_factor = int(getattr(args, "dataloader_prefetch_factor", 2))
+    num_workers = int(args.num_dataloader_workers)
+    pin_memory = bool(args.dataloader_pin_memory)
+    persistent_workers = bool(args.dataloader_persistent_workers)
+    prefetch_factor = int(args.dataloader_prefetch_factor)
 
     # --- datasets ---
     log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
@@ -653,7 +653,8 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
 
     # --- create model ---
-    user_encoder_type = getattr(args, "user_encoder", "attention")
+    # Get encoder type from args with smart defaults applied in CLI
+    user_encoder_type = args.user_encoder
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
     model = TwoTowerEngagement(
         post_embedding_dim=embed_dim,
@@ -671,10 +672,10 @@ def run(context: Context, args) -> Dict[str, Any]:
     log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
     
     # Get scheduler and training optimization settings from args
-    lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "max"))
-    lr_scheduler_factor = float(getattr(args, "lr_scheduler_factor", 0.5))
-    lr_scheduler_patience = int(getattr(args, "lr_scheduler_patience", 5))
-    gradient_clip_max_norm = float(getattr(args, "gradient_clip_max_norm", 1.0))
+    lr_scheduler_mode = str(args.lr_scheduler_mode)
+    lr_scheduler_factor = float(args.lr_scheduler_factor)
+    lr_scheduler_patience = int(args.lr_scheduler_patience)
+    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     
     training_result = train_two_tower_model(
         model=model,
@@ -695,7 +696,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     trained_model: TwoTowerEngagement = training_result["model"]
 
     # --- plots & evaluation ---
-    generate_plots = not bool(getattr(args, "no_plots", False))
+    generate_plots = not bool(args.no_plots)
 
     hist = training_result["history"]
 
