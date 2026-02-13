@@ -25,7 +25,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import torch
@@ -246,7 +246,7 @@ def train_model(
     load_best_checkpoint: bool = False,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
-    lr_scheduler_mode: str = "max",
+    lr_scheduler_mode: Literal["min", "max"] = "max",
     lr_scheduler_factor: float = 0.5,
     lr_scheduler_patience: int = 5,
 ) -> Dict[str, Any]:
@@ -260,9 +260,7 @@ def train_model(
 
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    # Cast mode to satisfy type checker (value is validated by argparse choices)
-    mode: Any = lr_scheduler_mode
-    scheduler = ReduceLROnPlateau(optimizer, mode=mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience)
+    scheduler = ReduceLROnPlateau(optimizer, mode=lr_scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience)
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_loss = float("inf")
     patience_counter = 0
