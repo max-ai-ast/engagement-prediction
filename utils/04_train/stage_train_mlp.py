@@ -19,12 +19,6 @@ Architecture:
     Hidden: Stack of Linear -> BatchNorm -> GELU -> Dropout layers
     Output: Single sigmoid-activated probability
 
-When to use:
-    - Baseline models
-    - Fast training and inference
-    - Interpretable aggregation (can analyze summarizer behavior)
-    - Limited compute resources
-
 ═══════════════════════════════════════════════════════════════════════════════
 APPROACH 2: MLP + LEARNED ATTENTION ENCODER (AttentionMLP)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -36,11 +30,6 @@ Architecture:
     User tower: UserHistoryEncoder(history_sequence) -> user_vector
     Concat: [user_vector || post_embedding]
     MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
-
-When to use:
-    - When you want the model to discover complex history patterns
-    - Sufficient training data to learn attention weights
-    - Can afford higher computational cost
 
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -199,7 +188,7 @@ class AttentionMLP(nn.Module):
     This is the more sophisticated of two MLP architectures, using a trainable
     UserHistoryEncoder (transformer self-attention) to learn optimal history
     aggregation from raw embedding sequences. The encoder and MLP head are
-    trained jointly end-to-end.
+    trained jointly end-to-end. NOTE: THIS MODEL DOES NOT ACTUALLY PERFORM BETTER YET -- SOMETHING TO WORK ON.
     
     Architecture:
         User encoder: UserHistoryEncoder(history_sequence, mask) -> user_vector [user_output_dim]
