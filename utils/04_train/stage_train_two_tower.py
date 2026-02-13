@@ -236,7 +236,7 @@ def train_two_tower_model(
 
             train_losses.append(loss.item())
             train_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-            train_labels.extend(batch["label"].numpy().tolist())
+            train_labels.extend(labels.cpu().numpy().tolist())
 
         # --- Validation ---
         model.eval()
@@ -255,7 +255,7 @@ def train_two_tower_model(
 
                 val_losses.append(loss.item())
                 val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-                val_labels.extend(batch["label"].numpy().tolist())
+                val_labels.extend(labels.cpu().numpy().tolist())
 
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
