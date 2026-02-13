@@ -480,8 +480,8 @@ def train_model(
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_loss = float("inf")
     patience_counter = 0
-    ckpt_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     from tqdm import tqdm as _tqdm
 
@@ -520,14 +520,14 @@ def train_model(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            ckpt_full = ckpt_dir / f"{model_name}_best.pth"
-            ckpt_weights = ckpt_dir / f"{model_name}_best_weights.pth"
+            checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
+            checkpoint_weights = checkpoint_dir / f"{model_name}_best_weights.pth"
             history_clean = {k: [float(x) for x in v] for k, v in history.items()}
             torch.save(
                 {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": float(val_loss), "val_auc": float(va_auc), "history": history_clean},
-                ckpt_full,
+                checkpoint_full,
             )
-            torch.save(model.state_dict(), ckpt_weights)
+            torch.save(model.state_dict(), checkpoint_weights)
             patience_counter = 0
         else:
             patience_counter += 1
@@ -537,11 +537,11 @@ def train_model(
             break
 
     if load_best_checkpoint:
-        ckpt_full = ckpt_dir / f"{model_name}_best.pth"
-        if ckpt_full.exists():
+        checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
+        if checkpoint_full.exists():
             try:
-                ckpt = torch.load(ckpt_full, weights_only=False)
-                state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+                checkpoint = torch.load(checkpoint_full, weights_only=False)
+                state = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
                 model.load_state_dict(state)
                 if isinstance(ckpt, dict) and "history" in ckpt:
                     history = ckpt["history"]

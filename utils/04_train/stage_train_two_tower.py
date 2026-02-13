@@ -677,7 +677,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     
-    training_result = train_two_tower_model(
+    training_results = train_two_tower_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -693,12 +693,12 @@ def run(context: Context, args) -> Dict[str, Any]:
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
     )
-    trained_model: TwoTowerEngagement = training_result["model"]
+    trained_model: TwoTowerEngagement = training_results["model"]
 
     # --- plots & evaluation ---
     generate_plots = not bool(args.no_plots)
 
-    hist = training_result["history"]
+    hist = training_results["history"]
 
     # experiment tracker scalars (always logged, regardless of --no-plots)
     for e in range(len(hist["train_loss"])):
@@ -759,9 +759,9 @@ def run(context: Context, args) -> Dict[str, Any]:
         {
             "model_state_dict": trained_model.state_dict(),
             "config": config,
-            "training_history": training_result["history"],
-            "best_val_auc": training_result["best_val_auc"],
-            "best_val_loss": training_result["best_val_loss"],
+            "training_history": training_results["history"],
+            "best_val_auc": training_results["best_val_auc"],
+            "best_val_loss": training_results["best_val_loss"],
         },
         model_path,
     )
@@ -828,7 +828,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
         "holdout_metrics": holdout_metrics,
-        "best_val_auc": training_result["best_val_auc"],
+        "best_val_auc": training_results["best_val_auc"],
     }
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
@@ -842,7 +842,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
-        f"best_val_auc: {training_result['best_val_auc']:.4f}",
+        f"best_val_auc: {training_results['best_val_auc']:.4f}",
     ]
     if holdout_metrics.get("auc_roc"):
         info_lines.append(f"holdout_auc: {holdout_metrics['auc_roc']:.4f}")
