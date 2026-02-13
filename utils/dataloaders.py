@@ -661,7 +661,7 @@ class SequenceEngagementDataset(Dataset):
         seq_len = min(len(hist_indices), self.max_history_len)
 
         padded = np.zeros((self.max_history_len, self.embed_dim), dtype=np.float32)
-        mask = np.zeros(self.max_history_len, dtype=np.bool_)
+        mask = np.zeros(self.max_history_len, dtype=bool)
 
         if seq_len > 0:
             used_indices = hist_indices[: self.max_history_len]
