@@ -18,7 +18,7 @@ model architectures:
 1. **Fixed-Size Summary Vectors** (SummarizedEngagementDataset)
    ─────────────────────────────────────────────────────────────────────────
    Reduces variable-length history to a single fixed-dimensional vector using
-   PLUGGABLE summarization strategies:
+   HAND-CRAFTED, DETERMINISTIC summarization strategies (no learnable parameters):
    
    • MeanSummarizer          : Simple arithmetic average of all liked posts
    • EMASummarizer           : Exponential moving average (recent posts weighted higher)
@@ -31,8 +31,8 @@ model architectures:
 2. **Variable-Length Sequences** (SequenceEngagementDataset)
    ─────────────────────────────────────────────────────────────────────────
    Preserves full temporal structure as padded/masked embedding sequences,
-   enabling LEARNED attention-based encoders to discover optimal history
-   aggregation:
+   enabling LEARNED, TRAINABLE encoders (neural networks with parameters) to
+   discover optimal history aggregation during training:
    
    • TransformerDualPoolingEncoder  : Full transformer self-attention
                                       Dual pooling: attention-weighted + mean
@@ -42,6 +42,26 @@ model architectures:
    Output format: (padded_sequences, mask, target_post_embedding)
    Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
    Best for:      Two-Tower models and Attention-MLP variants
+
+═══════════════════════════════════════════════════════════════════════════════
+KEY TERMINOLOGY
+═══════════════════════════════════════════════════════════════════════════════
+
+**SUMMARIZERS** (Hand-Crafted, Static)
+  - Deterministic aggregation functions with NO learnable parameters
+  - Apply predefined rules (mean, EMA, weighted average)
+  - Fast, interpretable, work out-of-the-box
+  - Examples: MeanSummarizer, EMASummarizer, LinearRecencySummarizer
+
+**ENCODERS** (Learned, Trainable)
+  - Neural network modules with trainable parameters
+  - Learn optimal aggregation patterns from data during training
+  - More flexible but require sufficient training data
+  - Examples: TransformerDualPoolingEncoder, CrossAttentionPoolingEncoder
+
+Both transform user history → fixed-size vector, but:
+  - Summarizers use predetermined statistical operations
+  - Encoders learn optimal transformations via backpropagation
 
 ═══════════════════════════════════════════════════════════════════════════════
 ARCHITECTURE PATTERNS
@@ -65,13 +85,13 @@ Datasets:
     SummarizedEngagementDataset  -- Fixed-size [user_summary ‖ post_emb] vectors
     SequenceEngagementDataset    -- Padded variable-length history sequences + mask
 
-Summarization Strategies (pluggable):
+Hand-Crafted Summarizers (deterministic, no learnable parameters):
     UserSummarizer               -- Abstract base class
     MeanSummarizer               -- Arithmetic mean
     EMASummarizer                -- Exponential moving average with recency bias
     LinearRecencySummarizer      -- Linear recency weighting
 
-Learned Encoders (end-to-end trainable):
+Learned Encoders (trainable neural networks):
     TransformerDualPoolingEncoder   -- Full transformer self-attention + dual pooling
     CrossAttentionPoolingEncoder    -- Efficient single-query cross-attention pooling
 
@@ -106,23 +126,40 @@ from utils.helpers import (
 # ---------------------------------------------------------------------------
 
 class UserSummarizer(ABC):
-    """Base class for user-history summarization strategies.
+    """Base class for hand-crafted user-history summarization strategies.
     
-    Summarizers collapse a variable-length sequence of post embeddings (user's
-    engagement history) into a single fixed-size vector that captures their
-    preferences. This enables MLP models to consume user histories of arbitrary
-    length through a consistent input dimensionality.
+    Summarizers are DETERMINISTIC, HAND-CRAFTED aggregation functions with NO
+    learnable parameters. They collapse a variable-length sequence of post
+    embeddings (user's engagement history) into a single fixed-size vector using
+    predefined statistical operations (mean, EMA, weighted average, etc.).
+    
+    This contrasts with LEARNED ENCODERS (TransformerDualPoolingEncoder,
+    CrossAttentionPoolingEncoder), which are trainable neural networks that learn
+    optimal aggregation patterns from data during training.
+    
+    Use summarizers when:
+      - You want fast, interpretable aggregation
+      - Training data is limited (no parameters to learn)
+      - Simple baselines are needed for comparison
+      - Inference speed is critical
+    
+    Use learned encoders when:
+      - You have sufficient training data (>50K samples)
+      - You want the model to discover optimal aggregation
+      - Complex temporal patterns need to be captured
+      - Computational resources allow neural network training
     
     All concrete summarizers must:
     - Handle empty histories gracefully (return zero vector)
     - Preserve embedding dimensionality: input [seq_len, D] -> output [D]
     - Expect embeddings sorted most-recent-first (index 0 = most recent like)
+    - Be deterministic (no randomness, no learnable parameters)
     
     Design rationale:
-        Pluggable summarizers allow experimentation with different history
+        Pluggable summarizers allow experimentation with different hand-crafted
         aggregation strategies without changing dataset or model code. Simple
-        strategies (mean, EMA) are fast and interpretable; more complex strategies
-        could incorporate learned weights or content-based filtering.
+        strategies (mean, EMA) are fast and interpretable baseline alternatives
+        to more complex learned encoders.
     """
 
     @abstractmethod
@@ -295,12 +332,16 @@ def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
 # ---------------------------------------------------------------------------
 
 class TransformerDualPoolingEncoder(nn.Module):
-    """Full-featured transformer-based user history encoder with dual pooling.
+    """Learned transformer-based user history encoder with dual pooling.
     
-    Encodes variable-length engagement history into a fixed user representation
-    using self-attention + dual pooling strategy. This allows the model to LEARN
-    which historical engagement patterns are most predictive, rather than using
-    hand-crafted aggregation rules.
+    This is a TRAINABLE NEURAL NETWORK with learnable parameters that encodes
+    variable-length engagement history into a fixed user representation. Unlike
+    hand-crafted SUMMARIZERS (MeanSummarizer, EMASummarizer), this encoder LEARNS
+    optimal aggregation patterns from data during training via backpropagation.
+    
+    Uses transformer self-attention + dual pooling strategy to discover which
+    historical engagement patterns are most predictive, rather than relying on
+    predetermined statistical rules.
     
     Architecture:
         1. Input projection: Raw embeddings -> hidden_dim
@@ -317,10 +358,10 @@ class TransformerDualPoolingEncoder(nn.Module):
         - Dual pooling combines adaptive focus (attention) with comprehensive
           coverage (mean), providing robustness
         - Flipped positional embeddings ensure position 0 = most recent, matching
-          the recency-biased intuition of traditional summarizers
+          the recency-biased intuition of hand-crafted summarizers
     
     Complexity:
-        - Parameters: ~2M (typical settings)
+        - Parameters: ~2M (typical settings) - ALL TRAINABLE
         - Forward pass: O(num_layers * seq_len^2 * hidden_dim) due to self-attention
         - Memory: Scales quadratically with sequence length
     
@@ -460,11 +501,17 @@ class TransformerDualPoolingEncoder(nn.Module):
 
 
 class CrossAttentionPoolingEncoder(nn.Module):
-    """Efficient user history encoder using single-query cross-attention pooling.
+    """Learned efficient user history encoder using single-query cross-attention pooling.
     
-    Designed as a fast alternative to TransformerDualPoolingEncoder for production ranking
-    scenarios where latency and throughput matter. Achieves significant speedup
-    and parameter reduction while maintaining competitive accuracy.
+    This is a TRAINABLE NEURAL NETWORK with learnable parameters, designed as a
+    faster alternative to TransformerDualPoolingEncoder. Unlike hand-crafted
+    SUMMARIZERS (MeanSummarizer, EMASummarizer) which use predetermined statistical
+    operations, this encoder LEARNS optimal aggregation patterns from data during
+    training via backpropagation.
+    
+    Designed for production ranking scenarios where latency and throughput matter.
+    Achieves significant speedup and parameter reduction while maintaining
+    competitive accuracy.
     
     Key difference from TransformerDualPoolingEncoder:
         **NO SELF-ATTENTION** - removes the expensive O(seq_len²) transformer layers
@@ -484,7 +531,7 @@ class CrossAttentionPoolingEncoder(nn.Module):
         5. Output projection: Combined features -> output_dim
     
     Complexity:
-        - Parameters: Significantly fewer than TransformerDualPoolingEncoder (~150K vs ~2M typical)
+        - Parameters: ~150K (typical) - significantly fewer than TransformerDualPoolingEncoder, ALL TRAINABLE
         - Forward pass: O(seq_len * hidden_dim) - linear in sequence length
         - Memory: Scales linearly with sequence length
     
