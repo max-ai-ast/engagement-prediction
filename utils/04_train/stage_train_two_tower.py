@@ -496,12 +496,12 @@ def train_two_tower_model(
 # Evaluation
 # =============================================================================
 
-def evaluate_model(
+def evaluate_two_tower_model(
     model: TwoTowerEngagement,
     data_loader: DataLoader,
     device: str,
 ) -> Dict[str, Any]:
-    """Evaluate model and return metrics + predictions."""
+    """Evaluate two-tower model and return metrics + predictions."""
     try:
         from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
     except ImportError:
@@ -716,8 +716,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    train_eval = evaluate_model(trained_model, train_loader, device)
-    val_eval = evaluate_model(trained_model, val_loader, device)
+    train_eval = evaluate_two_tower_model(trained_model, train_loader, device)
+    val_eval = evaluate_two_tower_model(trained_model, val_loader, device)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
 
@@ -782,7 +782,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 holdout_dataset, batch_size=batch_size, shuffle=False,
                 collate_fn=sequence_collate_fn, **_worker_kw,
             )
-            holdout_eval = evaluate_model(trained_model, holdout_loader, device)
+            holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device)
             holdout_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics: {holdout_metrics}")
 
