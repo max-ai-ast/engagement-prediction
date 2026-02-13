@@ -532,7 +532,21 @@ FIGURE_SIZE = (10, 6)
 DPI = 300
 
 
+def _configure_matplotlib_backend():
+    """Configure matplotlib to use non-interactive Agg backend.
+    
+    This should be called before any matplotlib.pyplot imports to avoid
+    display issues in headless environments. Only sets backend if matplotlib
+    hasn't been imported yet to avoid warnings.
+    """
+    import sys
+    if 'matplotlib' not in sys.modules:
+        import matplotlib
+        matplotlib.use("Agg")
+
+
 def plot_training_history(history: Dict[str, List[float]], save_path: Optional[Path] = None, best_epoch: Optional[int] = None):
+    _configure_matplotlib_backend()
     import matplotlib.pyplot as plt  # type: ignore
     required_keys = ['train_loss', 'val_loss', 'train_auc', 'val_auc']
     if any(k not in history for k in required_keys) or len(history.get('train_loss', [])) == 0:
@@ -572,8 +586,7 @@ def plot_model_performance(
     title_suffix: str = "",
 ):
     import numpy as np
-    import matplotlib
-    matplotlib.use("Agg")
+    _configure_matplotlib_backend()
     import matplotlib.pyplot as plt  # type: ignore
     try:
         import seaborn as sns  # type: ignore
