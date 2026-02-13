@@ -44,10 +44,9 @@ def test_ema_summarizer_non_empty_input():
     embeddings = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
     result = summarizer.summarize(embeddings)
     
-    # With alpha=0.5: weights = [0.5, 0.25] normalized = [0.667, 0.333]
-    # Result should be [0.667, 0.333]
+    # Verify more weight on first (most recent) embedding
     assert result.shape == (2,)
-    assert result[0] > result[1]  # More weight on first (most recent) embedding
+    assert result[0] > result[1]
 
 
 def test_linear_recency_summarizer_empty_input():
@@ -67,8 +66,9 @@ def test_linear_recency_summarizer_non_empty_input():
     embeddings = np.array([[3.0, 0.0], [2.0, 0.0], [1.0, 0.0]], dtype=np.float32)
     result = summarizer.summarize(embeddings)
     
-    # Weights: [3, 2, 1] normalized = [3/6, 2/6, 1/6] = [0.5, 0.333, 0.167]
-    # Result: 3*0.5 + 2*0.333 + 1*0.167 = 1.5 + 0.666 + 0.167 = 2.333
+    # Weights: [3, 2, 1] normalized = [0.5, 0.333, 0.167]
+    # Applied to embeddings: [3.0, 0.0]*0.5 + [2.0, 0.0]*0.333 + [1.0, 0.0]*0.167
+    # Result first dim: 3.0*0.5 + 2.0*0.333 + 1.0*0.167 ≈ 2.333
     expected = np.array([2.333, 0.0], dtype=np.float32)
     assert result.shape == (2,)
     assert np.allclose(result, expected, rtol=1e-3)
