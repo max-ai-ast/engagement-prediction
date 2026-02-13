@@ -38,11 +38,7 @@ This module supports TWO user encoder architectures, selected via user_encoder_t
    
    Architecture: Input projection -> Positional encoding -> Transformer encoder
                  layers -> Dual pooling (attention + mean) -> Output projection
-   
-   When to use:
-       - Accuracy is paramount
-       - Computational resources allow transformer training
-       - User histories contain complex patterns (complementary/contradictory posts)
+
 
 2. **"cross_attention"** - CrossAttentionPoolingEncoder (Single-Query Cross-Attention)
    ───────────────────────────────────────────────────────────────────────────
@@ -51,11 +47,6 @@ This module supports TWO user encoder architectures, selected via user_encoder_t
    
    Architecture: Input projection -> Positional encoding -> Cross-attention
                  pooling (single query) + Mean pooling -> Output projection
-   
-   When to use:
-       - Production systems with strict latency requirements
-       - Large candidate sets need fast scoring
-       - Simpler history patterns (user preferences are consistent)
 
 ═══════════════════════════════════════════════════════════════════════════════
 TRAINING DETAILS

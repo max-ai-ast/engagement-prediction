@@ -3,7 +3,7 @@
 """
 Shared dataloaders and user-encoder building blocks for engagement prediction.
 
-This module provides a **modular framework for representing user engagement history**
+A **modular framework for representing user engagement history**
 in different formats, enabling flexible model architectures while maintaining
 code reuse and memory efficiency.
 
@@ -26,7 +26,6 @@ model architectures:
    
    Output format: Concatenated [user_summary || post_embedding] vector
    Memory:        Pre-computed and cached in RAM (~280 MB for 178K samples)
-   Best for:      Simple MLP models that need fixed-size inputs
    
 2. **Variable-Length Sequences** (SequenceEngagementDataset)
    ─────────────────────────────────────────────────────────────────────────
@@ -41,7 +40,6 @@ model architectures:
    
    Output format: (padded_sequences, mask, target_post_embedding)
    Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
-   Best for:      Two-Tower models and Attention-MLP variants
 
 ═══════════════════════════════════════════════════════════════════════════════
 KEY TERMINOLOGY
@@ -133,22 +131,6 @@ class UserSummarizer(ABC):
     embeddings (user's engagement history) into a single fixed-size vector using
     predefined statistical operations (mean, EMA, weighted average, etc.).
     
-    This contrasts with LEARNED ENCODERS (TransformerDualPoolingEncoder,
-    CrossAttentionPoolingEncoder), which are trainable neural networks that learn
-    optimal aggregation patterns from data during training.
-    
-    Use summarizers when:
-      - You want fast, interpretable aggregation
-      - Training data is limited (no parameters to learn)
-      - Simple baselines are needed for comparison
-      - Inference speed is critical
-    
-    Use learned encoders when:
-      - You have sufficient training data (>50K samples)
-      - You want the model to discover optimal aggregation
-      - Complex temporal patterns need to be captured
-      - Computational resources allow neural network training
-    
     All concrete summarizers must:
     - Handle empty histories gracefully (return zero vector)
     - Preserve embedding dimensionality: input [seq_len, D] -> output [D]
@@ -185,16 +167,11 @@ class MeanSummarizer(UserSummarizer):
     """Simple arithmetic mean summarizer - all history posts weighted equally.
     
     Treats all engagement equally regardless of recency. This is the simplest
-    baseline summarization strategy and works surprisingly well when users have
-    consistent preferences over time.
+    baseline summarization strategy.
     
     Computation: mean(embeddings) along the sequence dimension
     Complexity:  O(seq_len * D)
-    
-    When to use:
-        - Baseline experiments
-        - Users with stable, long-term preferences
-        - When recency bias is undesirable
+
     """
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
@@ -215,8 +192,7 @@ class EMASummarizer(UserSummarizer):
     """Exponential moving average summarizer with recency bias.
     
     Applies exponentially decaying weights to history, with recent likes weighted
-    more heavily than older ones. This captures the intuition that recent
-    engagement better reflects current user preferences.
+    more heavily than older ones.
     
     Weight formula:
         For position i (0 = most recent): w_i = alpha * (1 - alpha)^i
@@ -229,11 +205,6 @@ class EMASummarizer(UserSummarizer):
                α=1.0 uses only the most recent like.
     
     Computation: O(seq_len * D)
-    
-    When to use:
-        - Fashion, news, trending content (preferences shift over time)
-        - Users with evolving tastes
-        - When recent engagement is more predictive than distant history
     
     Raises:
         ValueError: If alpha is not in range (0, 1]
@@ -274,11 +245,6 @@ class LinearRecencySummarizer(UserSummarizer):
         Example (n=4): weights = [4, 3, 2, 1] / 10 = [0.4, 0.3, 0.2, 0.1]
     
     Computation: O(seq_len * D)
-    
-    When to use:
-        - Similar to EMA but prefer interpretable linear decay
-        - Moderate recency bias without exponential drop-off
-        - When you want recent posts to matter more, but not overwhelmingly so
     """
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
@@ -510,8 +476,6 @@ class CrossAttentionPoolingEncoder(nn.Module):
     training via backpropagation.
     
     Designed for production ranking scenarios where latency and throughput matter.
-    Achieves significant speedup and parameter reduction while maintaining
-    competitive accuracy.
     
     Key difference from TransformerDualPoolingEncoder:
         **NO SELF-ATTENTION** - removes the expensive O(seq_len²) transformer layers
@@ -521,7 +485,7 @@ class CrossAttentionPoolingEncoder(nn.Module):
         - Mean pooling for stability
     
     This trades off some modeling capacity (can't capture complex inter-post
-    dependencies) for dramatic efficiency gains.
+    dependencies) for efficiency gains.
     
     Architecture:
         1. Input projection: Raw embeddings -> hidden_dim
@@ -534,11 +498,6 @@ class CrossAttentionPoolingEncoder(nn.Module):
         - Parameters: ~150K (typical) - significantly fewer than TransformerDualPoolingEncoder, ALL TRAINABLE
         - Forward pass: O(seq_len * hidden_dim) - linear in sequence length
         - Memory: Scales linearly with sequence length
-    
-    When to use:
-        - Two-tower models needing fast candidate scoring (user_encoder_type="cross_attention")
-        - Production systems with strict latency requirements
-        - Cold-start scenarios where simple aggregation may generalize better
     
     Args:
         input_dim: Dimensionality of input post embeddings
@@ -884,7 +843,7 @@ class SummarizedEngagementDataset(Dataset):
     
     This dataset represents user engagement history as FIXED-SIZE summary vectors
     computed by pluggable UserSummarizer strategies. It's designed for models that
-    require consistent input dimensionality (e.g., vanilla MLPs).
+    require consistent input dimensionality.
     
     ═══════════════════════════════════════════════════════════════════════════
     DATASET STRUCTURE
@@ -912,19 +871,6 @@ class SummarizedEngagementDataset(Dataset):
     materialized into contiguous float32 tensors at init time (~280 MB for 178K
     samples with D=384). This makes __getitem__ a pure in-memory index lookup
     with ZERO memmap I/O during training.
-    
-    Trade-offs:
-        ✓ Pros: Lightning-fast __getitem__, minimal CPU overhead, works with any
-                number of DataLoader workers
-        ✗ Cons: Upfront memory cost, user summaries baked in (can't change
-                summarization strategy without recreating dataset)
-    
-    When to use:
-        - Training simple MLP models
-        - When memory allows pre-computation (~1.5 MB per 1000 samples)
-        - When you want maximum training throughput
-        - When you don't need to experiment with different summarization strategies
-          within the same training run
     
     ═══════════════════════════════════════════════════════════════════════════
     
@@ -1092,18 +1038,6 @@ class SequenceEngagementDataset(Dataset):
         parameters (N=178K, max_seq=50, D=384). By loading sequences on-demand, we
         keep memory footprint manageable while multi-worker DataLoaders pipeline the
         I/O to keep GPUs fed.
-    
-    Trade-offs:
-        ✓ Pros: Massively reduced memory footprint, flexible max_history_len
-        ✗ Cons: Per-sample memmap I/O overhead (mitigated by DataLoader workers),
-                slightly slower __getitem__ than fully pre-computed
-    
-    When to use:
-        - Training Two-Tower models with attention encoders
-        - Training Attention-MLP models
-        - When you want learned (not hand-crafted) history aggregation
-        - When you need to experiment with different max_history_len values
-        - When memory constraints prevent full pre-computation
     
     ═══════════════════════════════════════════════════════════════════════════
     
