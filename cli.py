@@ -396,7 +396,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
 
     valid_encoders = {
         "mlp": ("summarized", "attention"),
-        "two-tower": ("attention", "lightweight"),
+        "two-tower": ("attention", "cross_attention"),
     }
     allowed = valid_encoders.get(model_type, ())
     if user_encoder not in allowed:
@@ -556,9 +556,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
     _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
-    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "attention", "lightweight"],
+    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "attention", "cross_attention"],
                           default=argparse.SUPPRESS,
-                          help_text="User encoder type: summarized (default for mlp), attention (default for two-tower), lightweight (two-tower only)")
+                          help_text="User encoder type: summarized (default for mlp), attention (default for two-tower), cross_attention (two-tower only - efficient single-query cross-attention pooling)")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options

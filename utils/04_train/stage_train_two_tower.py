@@ -30,7 +30,7 @@ USER ENCODER OPTIONS
 
 This module supports TWO user encoder architectures, selected via user_encoder_type:
 
-1. **"attention"** - UserHistoryEncoder (Full Transformer Self-Attention)
+1. **"attention"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
    ───────────────────────────────────────────────────────────────────────────
    Uses transformer encoder with multi-head self-attention to capture complex
    inter-post relationships in user history. Best modeling capacity but highest
@@ -44,7 +44,7 @@ This module supports TWO user encoder architectures, selected via user_encoder_t
        - Computational resources allow transformer training
        - User histories contain complex patterns (complementary/contradictory posts)
 
-2. **"lightweight"** - LightweightAttentionEncoder (Single-Query Cross-Attention)
+2. **"cross_attention"** - CrossAttentionPoolingEncoder (Single-Query Cross-Attention)
    ───────────────────────────────────────────────────────────────────────────
    Skips expensive self-attention layers, using only a single learned-query
    cross-attention for aggregation. Significantly faster with fewer parameters.
@@ -115,8 +115,8 @@ from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
     sequence_collate_fn,
-    UserHistoryEncoder,
-    LightweightAttentionEncoder,
+    TransformerDualPoolingEncoder,
+    CrossAttentionPoolingEncoder,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -193,7 +193,7 @@ class PostTower(nn.Module):
 # Two-Tower Engagement Model
 # =============================================================================
 
-class TwoTowerEngagement(nn.Module):
+class TwoTowerModel(nn.Module):
     """Two-tower engagement prediction model with pluggable user encoders.
     
     Implements the two-tower architecture where user and post representations
@@ -202,7 +202,7 @@ class TwoTowerEngagement(nn.Module):
     ranking systems.
     
     Architecture:
-        User Tower: UserHistoryEncoder OR LightweightAttentionEncoder
+        User Tower: TransformerDualPoolingEncoder OR CrossAttentionPoolingEncoder
                     (history_sequence, mask) -> user_vector [shared_dim]
         
         Post Tower: PostTower (simple MLP)
@@ -214,7 +214,7 @@ class TwoTowerEngagement(nn.Module):
     Key characteristics:
         - Shared embedding space: Both towers output same dimensionality
         - Independent computation: Towers never exchange information (until final dot product)
-        - Modular encoders: User tower can be "attention" or "lightweight"
+        - Modular encoders: User tower can be "attention" or "cross_attention"
     
     Deployment pattern:
         1. Pre-compute post_vectors for all candidate posts
@@ -227,12 +227,12 @@ class TwoTowerEngagement(nn.Module):
         shared_dim: Output dimension for both towers (default: 128)
         user_hidden_dim: User tower internal hidden size (default: 256)
         post_hidden_dim: Post tower internal hidden size (default: 256)
-        num_attention_heads: Attention heads for UserHistoryEncoder (default: 4)
-        num_attention_layers: Transformer layers for UserHistoryEncoder (default: 2)
+        num_attention_heads: Attention heads for TransformerDualPoolingEncoder (default: 4)
+        num_attention_layers: Transformer layers for TransformerDualPoolingEncoder (default: 2)
         max_history_len: Maximum history sequence length (default: 50)
         dropout_rate: Dropout probability (default: 0.1)
         user_encoder_type: User tower architecture - "attention" (full transformer)
-                           or "lightweight" (single-query cross-attention)
+                           or "cross_attention" (single-query cross-attention pooling)
     """
 
     def __init__(
@@ -253,8 +253,8 @@ class TwoTowerEngagement(nn.Module):
         self.user_encoder_type = user_encoder_type
 
         # Instantiate user tower based on encoder type
-        if user_encoder_type == "lightweight":
-            self.user_tower = LightweightAttentionEncoder(
+        if user_encoder_type == "cross_attention":
+            self.user_tower = CrossAttentionPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -262,7 +262,7 @@ class TwoTowerEngagement(nn.Module):
                 dropout_rate=dropout_rate,
             )
         elif user_encoder_type == "attention":
-            self.user_tower = UserHistoryEncoder(
+            self.user_tower = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -274,7 +274,7 @@ class TwoTowerEngagement(nn.Module):
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
-                "Choose 'attention' or 'lightweight'."
+                "Choose 'attention' or 'cross_attention'."
             )
 
         # Post tower is the same regardless of user encoder type
@@ -374,7 +374,7 @@ class TwoTowerEngagement(nn.Module):
 # =============================================================================
 
 def train_two_tower_model(
-    model: TwoTowerEngagement,
+    model: TwoTowerModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: str,
@@ -496,12 +496,12 @@ def train_two_tower_model(
 # Evaluation
 # =============================================================================
 
-def evaluate_model(
-    model: TwoTowerEngagement,
+def evaluate_two_tower_model(
+    model: TwoTowerModel,
     data_loader: DataLoader,
     device: str,
 ) -> Dict[str, Any]:
-    """Evaluate model and return metrics + predictions."""
+    """Evaluate two-tower model and return metrics + predictions."""
     try:
         from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
     except ImportError:
@@ -656,7 +656,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Get encoder type from args with smart defaults applied in CLI
     user_encoder_type = args.user_encoder
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
-    model = TwoTowerEngagement(
+    model = TwoTowerModel(
         post_embedding_dim=embed_dim,
         shared_dim=shared_dim,
         user_hidden_dim=user_hidden_dim,
@@ -677,7 +677,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     
-    training_result = train_two_tower_model(
+    training_results = train_two_tower_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -693,12 +693,12 @@ def run(context: Context, args) -> Dict[str, Any]:
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
     )
-    trained_model: TwoTowerEngagement = training_result["model"]
+    trained_model: TwoTowerModel = training_results["model"]
 
     # --- plots & evaluation ---
     generate_plots = not bool(args.no_plots)
 
-    hist = training_result["history"]
+    hist = training_results["history"]
 
     # experiment tracker scalars (always logged, regardless of --no-plots)
     for e in range(len(hist["train_loss"])):
@@ -716,8 +716,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    train_eval = evaluate_model(trained_model, train_loader, device)
-    val_eval = evaluate_model(trained_model, val_loader, device)
+    train_eval = evaluate_two_tower_model(trained_model, train_loader, device)
+    val_eval = evaluate_two_tower_model(trained_model, val_loader, device)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
 
@@ -759,9 +759,9 @@ def run(context: Context, args) -> Dict[str, Any]:
         {
             "model_state_dict": trained_model.state_dict(),
             "config": config,
-            "training_history": training_result["history"],
-            "best_val_auc": training_result["best_val_auc"],
-            "best_val_loss": training_result["best_val_loss"],
+            "training_history": training_results["history"],
+            "best_val_auc": training_results["best_val_auc"],
+            "best_val_loss": training_results["best_val_loss"],
         },
         model_path,
     )
@@ -782,7 +782,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 holdout_dataset, batch_size=batch_size, shuffle=False,
                 collate_fn=sequence_collate_fn, **_worker_kw,
             )
-            holdout_eval = evaluate_model(trained_model, holdout_loader, device)
+            holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device)
             holdout_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics: {holdout_metrics}")
 
@@ -828,7 +828,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
         "holdout_metrics": holdout_metrics,
-        "best_val_auc": training_result["best_val_auc"],
+        "best_val_auc": training_results["best_val_auc"],
     }
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
@@ -842,7 +842,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
-        f"best_val_auc: {training_result['best_val_auc']:.4f}",
+        f"best_val_auc: {training_results['best_val_auc']:.4f}",
     ]
     if holdout_metrics.get("auc_roc"):
         info_lines.append(f"holdout_auc: {holdout_metrics['auc_roc']:.4f}")

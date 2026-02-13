@@ -8,7 +8,7 @@ This stage trains Multi-Layer Perceptron (MLP) models for binary engagement pred
 user engagement history:
 
 ═══════════════════════════════════════════════════════════════════════════════
-APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (EngagementPredictor)
+APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (SummarizedMLP)
 ═══════════════════════════════════════════════════════════════════════════════
 
 Uses SummarizedEngagementDataset with pluggable summarization strategies (mean,
@@ -23,11 +23,11 @@ Architecture:
 APPROACH 2: MLP + LEARNED ATTENTION ENCODER (AttentionMLP)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Uses SequenceEngagementDataset with UserHistoryEncoder (transformer self-attention)
+Uses SequenceEngagementDataset with TransformerDualPoolingEncoder (transformer self-attention)
 to LEARN optimal history aggregation end-to-end.
 
 Architecture:
-    User tower: UserHistoryEncoder(history_sequence) -> user_vector
+    User tower: TransformerDualPoolingEncoder(history_sequence) -> user_vector
     Concat: [user_vector || post_embedding]
     MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
 
@@ -84,7 +84,7 @@ from utils.dataloaders import (
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
     sequence_collate_fn,
-    UserHistoryEncoder,
+    TransformerDualPoolingEncoder,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
@@ -94,13 +94,17 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
 # Model Architectures
 # =============================================================================
 
-class EngagementPredictor(nn.Module):
-    """Vanilla MLP engagement predictor with pre-computed user summaries.
+class SummarizedMLP(nn.Module):
+    """MLP engagement predictor using hand-crafted user history summarization.
     
     This is the simpler of two MLP architectures, accepting fixed-size concatenated
     [user_summary || post_embedding] vectors from SummarizedEngagementDataset.
     The user summary is computed by hand-crafted aggregation strategies (mean, EMA,
     linear recency) applied during dataset initialization.
+    
+    The name "SummarizedMLP" reflects that this model works with pre-computed
+    user history SUMMARIES (via Summarizers like MeanSummarizer, EMASummarizer)
+    rather than learned ENCODERS (like TransformerDualPoolingEncoder).
     
     Architecture:
         Input layer: Concatenated [user_summary || post_embedding] vector [2*D]
@@ -119,7 +123,7 @@ class EngagementPredictor(nn.Module):
         dropout_rate: Dropout probability applied after each hidden layer
     
     Example:
-        >>> model = EngagementPredictor(input_dim=768, hidden_dims=[512, 256], dropout_rate=0.3)
+        >>> model = SummarizedMLP(input_dim=768, hidden_dims=[512, 256], dropout_rate=0.3)
         >>> # Input: [batch, 768] -> Hidden: [batch, 512] -> [batch, 256] -> Output: [batch, 1]
     """
 
@@ -186,16 +190,16 @@ class AttentionMLP(nn.Module):
     """MLP engagement predictor with learned attention-based user history encoder.
     
     This is the more sophisticated of two MLP architectures, using a trainable
-    UserHistoryEncoder (transformer self-attention) to learn optimal history
+    TransformerDualPoolingEncoder (transformer self-attention) to learn optimal history
     aggregation from raw embedding sequences. The encoder and MLP head are
     trained jointly end-to-end. NOTE: THIS MODEL DOES NOT ACTUALLY PERFORM BETTER YET -- SOMETHING TO WORK ON.
     
     Architecture:
-        User encoder: UserHistoryEncoder(history_sequence, mask) -> user_vector [user_output_dim]
+        User encoder: TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [user_output_dim]
         Concatenation: [user_vector || post_embedding] -> [user_output_dim + embed_dim]
         MLP head: Stack of (Linear -> BatchNorm -> GELU -> Dropout) -> Linear -> Sigmoid
     
-    Key differences from EngagementPredictor:
+    Key differences from SummarizedMLP:
         ✓ LEARNS history aggregation via attention (not hand-crafted)
         ✓ Consumes SequenceEngagementDataset (not SummarizedEngagementDataset)
         ✓ Can capture complex temporal patterns and inter-post relationships
@@ -212,12 +216,12 @@ class AttentionMLP(nn.Module):
         embed_dim: Dimensionality of post embeddings
         hidden_dims: MLP head hidden layer sizes
         dropout_rate: Dropout for MLP layers (not encoder, which has its own)
-        user_hidden_dim: UserHistoryEncoder internal hidden dimension
-        user_output_dim: UserHistoryEncoder output dimension (user vector size)
+        user_hidden_dim: TransformerDualPoolingEncoder internal hidden dimension
+        user_output_dim: TransformerDualPoolingEncoder output dimension (user vector size)
         num_attention_heads: Number of attention heads in transformer
         num_attention_layers: Number of transformer encoder layers
         max_history_len: Maximum sequence length for positional embeddings
-        attention_dropout: Dropout rate for the UserHistoryEncoder
+        attention_dropout: Dropout rate for the TransformerDualPoolingEncoder
     """
 
     def __init__(
@@ -237,7 +241,7 @@ class AttentionMLP(nn.Module):
         self.user_output_dim = user_output_dim
 
         # User tower: Learned attention-based encoder over engagement history
-        self.user_encoder = UserHistoryEncoder(
+        self.user_encoder = TransformerDualPoolingEncoder(
             input_dim=embed_dim,
             hidden_dim=user_hidden_dim,
             output_dim=user_output_dim,
@@ -331,9 +335,9 @@ class AttentionMLP(nn.Module):
 # Helper Functions
 # =============================================================================
 
-def create_model(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> EngagementPredictor:
-    """Factory function for creating EngagementPredictor instances."""
-    return EngagementPredictor(input_dim, hidden_dims, dropout_rate)
+def create_summarized_mlp(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> SummarizedMLP:
+    """Factory function for creating SummarizedMLP instances."""
+    return SummarizedMLP(input_dim, hidden_dims, dropout_rate)
 
 
 def create_data_loaders(
@@ -449,7 +453,7 @@ def set_random_seeds(seed: int):
 # Training loop
 # =============================================================================
 
-def train_model(
+def train_mlp_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -480,24 +484,24 @@ def train_model(
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_loss = float("inf")
     patience_counter = 0
-    ckpt_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     from tqdm import tqdm as _tqdm
 
     for epoch in _tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         model.train()
-        tr_loss = 0.0
-        tr_preds: List[float] = []
-        tr_labels: List[float] = []
+        train_loss = 0.0
+        train_preds: List[float] = []
+        train_labels: List[float] = []
         for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
             optimizer.zero_grad()
             loss, preds = model.compute_loss_and_preds(batch, device)
             loss.backward()
             optimizer.step()
-            tr_loss += loss.item()
-            tr_preds.extend(preds.detach().cpu().numpy().tolist())
-            tr_labels.extend(batch["label"].numpy().tolist())
+            train_loss += loss.item()
+            train_preds.extend(preds.detach().cpu().numpy().tolist())
+            train_labels.extend(batch["label"].numpy().tolist())
 
         val_loss = 0.0
         val_preds: List[float] = []
@@ -510,24 +514,24 @@ def train_model(
                 val_preds.extend(preds.detach().cpu().numpy().tolist())
                 val_labels.extend(batch["label"].numpy().tolist())
 
-        tr_auc = roc_auc_score(tr_labels, tr_preds) if len(set(tr_labels)) > 1 else 0.5
-        va_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
-        history["train_loss"].append(float(tr_loss / max(1, len(train_loader))))
+        train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
+        val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
+        history["train_loss"].append(float(train_loss / max(1, len(train_loader))))
         history["val_loss"].append(float(val_loss / max(1, len(val_loader))))
-        history["train_auc"].append(float(tr_auc))
-        history["val_auc"].append(float(va_auc))
-        scheduler.step(va_auc)
+        history["train_auc"].append(float(train_auc))
+        history["val_auc"].append(float(val_auc))
+        scheduler.step(val_auc)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            ckpt_full = ckpt_dir / f"{model_name}_best.pth"
-            ckpt_weights = ckpt_dir / f"{model_name}_best_weights.pth"
+            checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
+            checkpoint_weights = checkpoint_dir / f"{model_name}_best_weights.pth"
             history_clean = {k: [float(x) for x in v] for k, v in history.items()}
             torch.save(
-                {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": float(val_loss), "val_auc": float(va_auc), "history": history_clean},
-                ckpt_full,
+                {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": float(val_loss), "val_auc": float(val_auc), "history": history_clean},
+                checkpoint_full,
             )
-            torch.save(model.state_dict(), ckpt_weights)
+            torch.save(model.state_dict(), checkpoint_weights)
             patience_counter = 0
         else:
             patience_counter += 1
@@ -537,14 +541,14 @@ def train_model(
             break
 
     if load_best_checkpoint:
-        ckpt_full = ckpt_dir / f"{model_name}_best.pth"
-        if ckpt_full.exists():
+        checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
+        if checkpoint_full.exists():
             try:
-                ckpt = torch.load(ckpt_full, weights_only=False)
-                state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+                checkpoint = torch.load(checkpoint_full, weights_only=False)
+                state = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
                 model.load_state_dict(state)
-                if isinstance(ckpt, dict) and "history" in ckpt:
-                    history = ckpt["history"]
+                if isinstance(checkpoint, dict) and "history" in checkpoint:
+                    history = checkpoint["history"]
             except Exception:
                 pass
 
@@ -623,7 +627,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
         input_dim = 2 * embed_dim  # [user_summary || post_embedding]
-        model = create_model(input_dim, hidden_dims, dropout_rate)
+        model = create_summarized_mlp(input_dim, hidden_dims, dropout_rate)
         
         train_loader, val_loader, _ = create_data_loaders(
             train_dataset, val_dataset, batch_size,
@@ -635,7 +639,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     elif user_encoder == "attention":
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
-        logger.info("User encoder: attention (UserHistoryEncoder + MLP)")
+        logger.info("User encoder: attention (TransformerDualPoolingEncoder + MLP)")
         max_history_len = int(args.max_history_len)
         summarizer_name = "attention"  # for config logging
         ema_alpha = 0.0
@@ -695,7 +699,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     
-    training_results = train_model(
+    training_results = train_mlp_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,

@@ -39,7 +39,7 @@ MLP_EXPERIMENTS=(
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
 TT_EXPERIMENTS=(
   "attention:"
-  "lightweight:"
+  "cross_attention:"
 )
 
 # ── Resolve paths ──────────────────────────────────────────────────────
