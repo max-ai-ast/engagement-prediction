@@ -675,7 +675,7 @@ def load_training_data(
     
     The three required artifacts:
         1. embeddings_*.npy   : Memmap array of post embeddings from Stage 1
-        2. target_posts_*.parquet : Train/val/test split assignments from Stage 2
+        2. target_posts_*.parquet : Train/val/holdout split assignments from Stage 2
         3. history_posts_*.parquet: User engagement history from Stage 3
     
     Args:
@@ -719,7 +719,7 @@ def load_training_data(
     logger.info(f"Loaded embeddings memmap: shape={embeddings_mmap.shape}, path={embeddings_path}")
 
     # --- 2. Target posts from 02_target_posts ---
-    # Contains the train/val/test split assignments and negative sampling results
+    # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
     tp_candidates = sorted(target_posts_dir.glob("target_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -799,7 +799,7 @@ def _prepare_split_data(
     
     This internal helper performs the core data preparation logic shared by both
     SummarizedEngagementDataset and SequenceEngagementDataset. It:
-    1. Filters target_posts to the requested split (train/val/test)
+    1. Filters target_posts to the requested split (train/val/holdout)
     2. Drops rows with missing negative samples
     3. Joins with user history to get engagement sequences
     4. Converts to numpy arrays for fast indexing
@@ -811,7 +811,7 @@ def _prepare_split_data(
     Args:
         target_posts_df: Full target posts DataFrame with all splits
         history_df: User engagement history DataFrame
-        split: Split name to filter to ("train", "val", or "test")
+        split: Split name to filter to ("train", "val", or "holdout")
         logger: Optional logger for progress reporting
     
     Returns:
@@ -932,7 +932,7 @@ class SummarizedEngagementDataset(Dataset):
         embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
         target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
         history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", or "test")
+        split: Split to load ("train", "val", or "holdout")
         summarizer: UserSummarizer instance for aggregating engagement history
         embed_dim: Embedding dimensionality D
         logger: Optional logger for progress reporting
@@ -1111,7 +1111,7 @@ class SequenceEngagementDataset(Dataset):
         embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
         target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
         history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", or "test")
+        split: Split to load ("train", "val", or "holdout")
         max_history_len: Maximum sequence length for padding (truncate if longer)
         embed_dim: Embedding dimensionality D
         logger: Optional logger for progress reporting

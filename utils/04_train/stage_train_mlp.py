@@ -344,13 +344,13 @@ def create_data_loaders(
     train_dataset: Dataset,
     val_dataset: Dataset,
     batch_size: int,
-    test_dataset: Optional[Dataset] = None,
+    holdout_dataset: Optional[Dataset] = None,
     num_workers: int = 4,
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
 ):
-    """Create PyTorch DataLoaders for training, validation, and optionally test sets.
+    """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
     
     Configures efficient data loading with multi-worker parallelism and GPU pinning.
     
@@ -365,15 +365,15 @@ def create_data_loaders(
         train_dataset: Training dataset
         val_dataset: Validation dataset
         batch_size: Number of samples per batch
-        test_dataset: Optional test/holdout dataset
+        holdout_dataset: Optional holdout dataset for final evaluation
         num_workers: Number of parallel data loading workers (0 = main process only)
         pin_memory: Use pinned (page-locked) memory for faster GPU transfer
         persistent_workers: Keep workers alive between epochs
         prefetch_factor: Number of batches to prefetch per worker
     
     Returns:
-        Tuple of (train_loader, val_loader, test_loader).
-        test_loader is None if test_dataset is not provided.
+        Tuple of (train_loader, val_loader, holdout_loader).
+        holdout_loader is None if holdout_dataset is not provided.
     
     Note:
         With SummarizedEngagementDataset (pre-computed tensors), workers just do
@@ -407,13 +407,13 @@ def create_data_loaders(
         shuffle=False,  # No shuffle for validation (deterministic evaluation)
         **worker_kw
     )
-    test_loader = DataLoader(
-        test_dataset, 
+    holdout_loader = DataLoader(
+        holdout_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
         **worker_kw
-    ) if test_dataset else None
-    return train_loader, val_loader, test_loader
+    ) if holdout_dataset else None
+    return train_loader, val_loader, holdout_loader
 
 
 def clear_cuda_memory():
