@@ -64,7 +64,7 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 4 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
-    "user_encoder": None,  # None = smart default (summarized for mlp, attention for two-tower)
+    "user_encoder": None,  # None = sentinel: cmd__run_all_exec applies model-type-specific smart default (summarized for mlp, attention for two-tower)
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
