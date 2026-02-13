@@ -514,6 +514,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         try:
             best_epoch = int(np.argmin(hist.get("val_loss", []))) + 1 if hist.get("val_loss") else None
         except Exception:
+            # If history is malformed or empty, best_epoch cannot be determined
             best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
@@ -565,10 +566,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         try:
             plot_model_performance(y_train, p_train, plots_dir / f"train_performance_{timestamp}.png", title_suffix="(Train)")
         except Exception:
+            # Plotting is non-critical; continue if it fails
             pass
         try:
             plot_model_performance(y_val, p_val, plots_dir / f"val_performance_{timestamp}.png", title_suffix="(Validation)")
         except Exception:
+            # Plotting is non-critical; continue if it fails
             pass
 
     # --- save model ---
@@ -639,6 +642,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                         title_suffix="(Holdout)",
                     )
                 except Exception:
+                    # Plotting is non-critical; continue if it fails
                     pass
     except Exception as exc:
         logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
