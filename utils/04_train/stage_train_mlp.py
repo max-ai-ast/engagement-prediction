@@ -487,17 +487,17 @@ def train_mlp_model(
 
     for epoch in _tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         model.train()
-        tr_loss = 0.0
-        tr_preds: List[float] = []
-        tr_labels: List[float] = []
+        train_loss = 0.0
+        train_preds: List[float] = []
+        train_labels: List[float] = []
         for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
             optimizer.zero_grad()
             loss, preds = model.compute_loss_and_preds(batch, device)
             loss.backward()
             optimizer.step()
-            tr_loss += loss.item()
-            tr_preds.extend(preds.detach().cpu().numpy().tolist())
-            tr_labels.extend(batch["label"].numpy().tolist())
+            train_loss += loss.item()
+            train_preds.extend(preds.detach().cpu().numpy().tolist())
+            train_labels.extend(batch["label"].numpy().tolist())
 
         val_loss = 0.0
         val_preds: List[float] = []
@@ -510,13 +510,13 @@ def train_mlp_model(
                 val_preds.extend(preds.detach().cpu().numpy().tolist())
                 val_labels.extend(batch["label"].numpy().tolist())
 
-        tr_auc = roc_auc_score(tr_labels, tr_preds) if len(set(tr_labels)) > 1 else 0.5
-        va_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
-        history["train_loss"].append(float(tr_loss / max(1, len(train_loader))))
+        train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
+        val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
+        history["train_loss"].append(float(train_loss / max(1, len(train_loader))))
         history["val_loss"].append(float(val_loss / max(1, len(val_loader))))
-        history["train_auc"].append(float(tr_auc))
-        history["val_auc"].append(float(va_auc))
-        scheduler.step(va_auc)
+        history["train_auc"].append(float(train_auc))
+        history["val_auc"].append(float(val_auc))
+        scheduler.step(val_auc)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
