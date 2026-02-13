@@ -537,7 +537,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title_suffix="(Train)",
             )
         except Exception as plot_exc:
-            logger.warning(f"Train performance plotting failed (non-fatal): {plot_exc}")
+            logger.warning(f"Train performance plotting failed: {plot_exc}")
         try:
             plot_model_performance(
                 val_eval["predictions"]["y_true"],
@@ -546,7 +546,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title_suffix="(Validation)",
             )
         except Exception as plot_exc:
-            logger.warning(f"Validation performance plotting failed (non-fatal): {plot_exc}")
+            logger.warning(f"Validation performance plotting failed: {plot_exc}")
 
     # --- save model ---
     model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -617,7 +617,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                         title_suffix="(Holdout)",
                     )
                 except Exception as plot_exc:
-                    logger.warning(f"Holdout performance plotting failed (non-fatal): {plot_exc}")
+                    logger.warning(f"Holdout performance plotting failed: {plot_exc}")
     except Exception as exc:
         logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
 
