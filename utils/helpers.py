@@ -728,3 +728,43 @@ def get_device(arg_device: Optional[str]) -> str:
         return device
     else:
         return arg_device
+
+
+# ----------------------------------------
+# PyTorch utilities
+# ----------------------------------------
+
+def clear_cuda_memory():
+    """Aggressively clear CUDA cache and run garbage collection.
+    
+    Useful for freeing GPU memory between model creation, particularly when
+    experimenting with different model sizes or batch sizes.
+    """
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def set_random_seeds(seed: int):
+    """Set random seeds for reproducibility across Python, NumPy, and PyTorch.
+    
+    Args:
+        seed: Random seed value
+        
+    Note:
+        This ensures deterministic behavior for model initialization, data
+        shuffling, and stochastic operations like dropout. However, some
+        CUDA operations may still have non-deterministic behavior.
+    """
+    import random as _random
+    import numpy as np
+    import torch
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)

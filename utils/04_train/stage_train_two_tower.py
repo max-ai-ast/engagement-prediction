@@ -102,6 +102,8 @@ from utils.helpers import (
     get_device,
     plot_model_performance,
     plot_training_history,
+    clear_cuda_memory,
+    set_random_seeds,
 )
 from utils.dataloaders import (
     load_training_data,
@@ -561,15 +563,10 @@ def run(context: Context, args) -> Dict[str, Any]:
     log_operation_start("Stage 4 Two-Tower training", STAGE_LOG_NAME, logger)
     t0 = time.time()
 
-    # --- seeds ---
+    # --- seeds & cuda ---
+    clear_cuda_memory()
     random_seed = int(args.random_seed)
-    import random as _random
-    _random.seed(random_seed)
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.manual_seed(random_seed)
-        torch.cuda.manual_seed_all(random_seed)
+    set_random_seeds(random_seed)
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
@@ -669,6 +666,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         gradient_clip_max_norm=gradient_clip_max_norm,
     )
     trained_model: TwoTowerModel = training_results["model"]
+    clear_cuda_memory()
 
     # --- plots & evaluation ---
     hist = training_results["history"]

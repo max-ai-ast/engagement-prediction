@@ -78,6 +78,8 @@ from utils.helpers import (
     log_operation_start,
     get_device,
     plot_model_performance,
+    clear_cuda_memory,
+    set_random_seeds,
 )
 from utils.dataloaders import (
     load_training_data,
@@ -415,39 +417,6 @@ def create_data_loaders(
         **worker_kw
     ) if holdout_dataset else None
     return train_loader, val_loader, holdout_loader
-
-
-def clear_cuda_memory():
-    """Aggressively clear CUDA cache and run garbage collection.
-    
-    Useful for freeing GPU memory between model creation, particularly when
-    experimenting with different model sizes or batch sizes.
-    """
-    import gc
-    gc.collect()
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-
-def set_random_seeds(seed: int):
-    """Set random seeds for reproducibility across Python, NumPy, and PyTorch.
-    
-    Args:
-        seed: Random seed value
-        
-    Note:
-        This ensures deterministic behavior for model initialization, data
-        shuffling, and stochastic operations like dropout. However, some
-        CUDA operations may still have non-deterministic behavior.
-    """
-    import random as _random
-    _random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
 
 # =============================================================================
