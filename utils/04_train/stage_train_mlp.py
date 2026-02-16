@@ -813,7 +813,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     model_path = None
     if not bool(args.no_save_model):
         log_operation_start("Save model checkpoint", STAGE_LOG_NAME, logger)
-        model_path = checkpoints_dir / f"engagement_model_{timestamp}.pth"
+        model_path = checkpoints_dir / f"engagement_model_{timestamp}.pt"
         tr_sanitized = {k: v for k, v in training_results.items() if k != "model"}
         torch.save(
             {
@@ -843,6 +843,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
+        torch.jit.script(model).save(model_path)
         context.tracker.log_artifact(name="trained_model_mlp", path=model_path)
 
     # --- holdout eval ---

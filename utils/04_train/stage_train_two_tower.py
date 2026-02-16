@@ -753,7 +753,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "dropout_rate": dropout_rate,
     }
     if not bool(args.no_save_model):
-        model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
+        model_path = checkpoints_dir / f"two_tower_{timestamp}.pt"
         torch.save(
             {
                 "model_state_dict": trained_model.state_dict(),
@@ -765,6 +765,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
+        torch.jit.script(model).save(model_path)
         context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
 
     # --- holdout evaluation ---
