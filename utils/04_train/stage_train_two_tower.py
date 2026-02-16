@@ -138,17 +138,17 @@ class PostTower(nn.Module):
     
     Args:
         input_dim: Dimensionality of input post embeddings (e.g., 384 for all-MiniLM)
-        hidden_dim: Internal hidden layer size (default: 256)
-        output_dim: Shared space dimensionality (default: 128)
-        dropout_rate: Dropout probability for regularization (default: 0.1)
+        hidden_dim: Internal hidden layer size
+        output_dim: Shared space dimensionality
+        dropout_rate: Dropout probability for regularization
     """
 
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        dropout_rate: float = 0.1,
+        hidden_dim: int,
+        output_dim: int,
+        dropout_rate: float,
     ):
         super().__init__()
         self.network = nn.Sequential(
@@ -215,13 +215,13 @@ class TwoTowerModel(nn.Module):
     
     Args:
         post_embedding_dim: Dimensionality of input post embeddings
-        shared_dim: Output dimension for both towers (default: 128)
-        user_hidden_dim: User tower internal hidden size (default: 256)
-        post_hidden_dim: Post tower internal hidden size (default: 256)
-        num_attention_heads: Attention heads for TransformerDualPoolingEncoder (default: 4)
-        num_attention_layers: Transformer layers for TransformerDualPoolingEncoder (default: 2)
-        max_history_len: Maximum history sequence length (default: 50)
-        dropout_rate: Dropout probability (default: 0.1)
+        shared_dim: Output dimension for both towers
+        user_hidden_dim: User tower internal hidden size
+        post_hidden_dim: Post tower internal hidden size
+        num_attention_heads: Attention heads for TransformerDualPoolingEncoder
+        num_attention_layers: Transformer layers for TransformerDualPoolingEncoder
+        max_history_len: Maximum history sequence length
+        dropout_rate: Dropout probability
         user_encoder_type: User tower architecture - "attention" (full transformer)
                            or "cross_attention" (single-query cross-attention pooling)
     """
@@ -229,14 +229,14 @@ class TwoTowerModel(nn.Module):
     def __init__(
         self,
         post_embedding_dim: int,
-        shared_dim: int = 128,
-        user_hidden_dim: int = 256,
-        post_hidden_dim: int = 256,
-        num_attention_heads: int = 4,
-        num_attention_layers: int = 2,
-        max_history_len: int = 50,
-        dropout_rate: float = 0.1,
-        user_encoder_type: str = "attention",
+        shared_dim: int,
+        user_hidden_dim: int,
+        post_hidden_dim: int,
+        num_attention_heads: int,
+        num_attention_layers: int,
+        max_history_len: int,
+        dropout_rate: float,
+        user_encoder_type: str,
     ):
         super().__init__()
         self.shared_dim = shared_dim

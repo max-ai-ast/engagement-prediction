@@ -1,0 +1,24 @@
+---
+description: Default values for pipeline/training parameters live only in cli.py
+globs: utils/04_train/**/*.py, utils/dataloaders.py, cli.py
+alwaysApply: false
+---
+
+# Default values: single source in cli.py
+
+All default values for run-all / training parameters are defined in **cli.py** in the `DEFAULTS` dict. Do not add default argument values in:
+
+- Model `__init__` (e.g. `AttentionMLP`, `TwoTowerModel`, `SummarizedMLP`)
+- Encoder `__init__` (e.g. `TransformerDualPoolingEncoder`, `CrossAttentionPoolingEncoder`)
+- Tower `__init__` (e.g. `PostTower`)
+- Stage scripts or dataloaders
+
+For any parameter that is set via CLI (e.g. `--user-hidden-dim`, `--max-history-len`), the constructor should require it as a mandatory argument with no default. Callers (train stages) pass values from `args` which are filled from `DEFAULTS` + config + CLI.
+
+When adding a new CLI-controlled hyperparameter:
+
+1. Add it to `DEFAULTS` in `cli.py`
+2. Add the corresponding `--flag` to the run-all parser
+3. Pass the value from `args` into the model/encoder constructors **without** defining a default in those constructors
+
+See **AGENTS.md** for the full convention.

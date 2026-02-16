@@ -337,23 +337,23 @@ class TransformerDualPoolingEncoder(nn.Module):
     
     Args:
         input_dim: Dimensionality of input post embeddings
-        hidden_dim: Internal transformer hidden size (default: 256)
-        output_dim: Final user representation size (default: 128)
-        num_attention_heads: Number of attention heads per layer (default: 4)
-        num_attention_layers: Depth of transformer stack (default: 2)
-        max_seq_len: Maximum history length for positional embeddings (default: 50)
-        dropout_rate: Dropout probability for regularization (default: 0.1)
+        hidden_dim: Internal transformer hidden size
+        output_dim: Final user representation size
+        num_attention_heads: Number of attention heads per layer
+        num_attention_layers: Depth of transformer stack
+        max_seq_len: Maximum history length for positional embeddings
+        dropout_rate: Dropout probability for regularization
     """
 
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        num_attention_heads: int = 4,
-        num_attention_layers: int = 2,
-        max_seq_len: int = 50,
-        dropout_rate: float = 0.1,
+        hidden_dim: int,
+        output_dim: int,
+        num_attention_heads: int,
+        num_attention_layers: int,
+        max_seq_len: int,
+        dropout_rate: float,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -501,19 +501,19 @@ class CrossAttentionPoolingEncoder(nn.Module):
     
     Args:
         input_dim: Dimensionality of input post embeddings
-        hidden_dim: Internal hidden size (default: 256)
-        output_dim: Final user representation size (default: 128)
-        max_seq_len: Maximum history length for positional embeddings (default: 50)
-        dropout_rate: Dropout probability for regularization (default: 0.1)
+        hidden_dim: Internal hidden size
+        output_dim: Final user representation size
+        max_seq_len: Maximum history length for positional embeddings
+        dropout_rate: Dropout probability for regularization
     """
 
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        max_seq_len: int = 50,
-        dropout_rate: float = 0.1,
+        hidden_dim: int,
+        output_dim: int,
+        max_seq_len: int,
+        dropout_rate: float,
     ):
         super().__init__()
         self.input_dim = input_dim

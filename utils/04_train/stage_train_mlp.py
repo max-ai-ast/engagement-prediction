@@ -229,12 +229,12 @@ class AttentionMLP(nn.Module):
         embed_dim: int,
         hidden_dims: List[int],
         dropout_rate: float,
-        user_hidden_dim: int = 256,
-        user_output_dim: int = 128,
-        num_attention_heads: int = 4,
-        num_attention_layers: int = 2,
-        max_history_len: int = 50,
-        attention_dropout: float = 0.1,
+        user_hidden_dim: int,
+        user_output_dim: int,
+        num_attention_heads: int,
+        num_attention_layers: int,
+        max_history_len: int,
+        attention_dropout: float,
     ):
         super().__init__()
         self.embed_dim = embed_dim
