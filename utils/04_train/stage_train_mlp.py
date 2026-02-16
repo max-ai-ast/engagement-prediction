@@ -739,7 +739,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Collect train + val predictions for performance plots & metrics
     def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
-        loader_kw_ = dict(
+        loader_kw_: Dict[str, Any] = dict(
             batch_size=batch_size, shuffle=False, drop_last=False,
             num_workers=num_workers, pin_memory=pin_memory,
         )
