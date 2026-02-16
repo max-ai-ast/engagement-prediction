@@ -297,7 +297,116 @@ def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
 # Learned user-history encoders
 # ---------------------------------------------------------------------------
 
-class TransformerDualPoolingEncoder(nn.Module):
+class BaseAttentionEncoder(nn.Module, ABC):
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        max_seq_len: int,
+        dropout_rate: float,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+
+        # Project raw embeddings to transformer hidden dimension
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+        )
+
+        # Learnable positional embeddings (one per position up to max_seq_len)
+        self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
+
+        # Learnable query vector for attention pooling
+        self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        # Project concatenated dual-pooled features to final output dimension
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # 2x because we concatenate two pooling outputs
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform for linear layers."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+
+    def _forward_up_to_pos_embed(
+        self,
+        history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
+        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+    ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
+        B, seq_len, _ = history_embeddings.shape
+        device = history_embeddings.device
+
+        # Default to all-valid mask if not provided
+        if history_mask is None:
+            history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
+        else:
+            history_mask = history_mask.to(device=device, dtype=torch.bool)
+
+        # Project embeddings to hidden dimension
+        x = self.input_projection(history_embeddings)
+
+        # Add positional information (flipped: position 0 = most recent)
+        positions = torch.arange(seq_len, device=device)
+        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
+        pos_emb = self.positional_embedding(positions)
+        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
+        return B, seq_len, history_mask, x
+
+    def _forward_attention_pooled(
+        self, 
+        B: int, 
+        x: torch.Tensor, 
+        attn_mask_inv: torch.Tensor, 
+        seq_len: int
+    ) -> torch.Tensor:
+        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
+        attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
+        attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        # Handle all-masked sequences
+        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
+        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
+        return attention_pooled
+    
+    def _forward_mean_pooled(
+        self, 
+        x: torch.Tensor, 
+        history_mask: torch.Tensor
+    ) -> torch.Tensor:
+        mask_expanded = history_mask.unsqueeze(-1).float()
+        sum_x = (x * mask_expanded).sum(dim=1)
+        count = mask_expanded.sum(dim=1).clamp(min=1)
+        mean_pooled = sum_x / count
+        return mean_pooled
+
+    @abstractmethod
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
+        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+    ) -> torch.Tensor:
+        ...
+
+
+class TransformerDualPoolingEncoder(BaseAttentionEncoder):
     """Learned transformer-based user history encoder with dual pooling.
     
     This is a TRAINABLE NEURAL NETWORK with learnable parameters that encodes
@@ -348,29 +457,14 @@ class TransformerDualPoolingEncoder(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        num_attention_heads: int = 4,
-        num_attention_layers: int = 2,
-        max_seq_len: int = 50,
-        dropout_rate: float = 0.1,
+        hidden_dim: int,
+        output_dim: int,
+        num_attention_heads: int,
+        num_attention_layers: int,
+        max_seq_len: int,
+        dropout_rate: float,
     ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.max_seq_len = max_seq_len
-
-        # Project raw embeddings to transformer hidden dimension
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-        )
-
-        # Learnable positional embeddings (one per position up to max_seq_len)
-        self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
+        super().__init__(input_dim, hidden_dim, output_dim, max_seq_len, dropout_rate)
 
         # Stack of transformer encoder layers (multi-head self-attention + FFN)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -386,29 +480,7 @@ class TransformerDualPoolingEncoder(nn.Module):
             num_layers=num_attention_layers,
         )
 
-        # Learnable query vector for attention pooling
-        self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
-
-        # Project concatenated dual-pooled features to final output dimension
-        self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # 2x because we concatenate two pooling outputs
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
         self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights using Xavier uniform for linear layers."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0, std=0.02)
 
     def forward(
         self,
@@ -424,49 +496,25 @@ class TransformerDualPoolingEncoder(nn.Module):
         Returns:
             User representations [batch, output_dim]
         """
-        B, seq_len, _ = history_embeddings.shape
-        device = history_embeddings.device
-
-        # Default to all-valid mask if not provided
-        if history_mask is None:
-            history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
-
-        # Project embeddings to hidden dimension
-        x = self.input_projection(history_embeddings)
-
-        # Add positional information (flipped: position 0 = most recent)
-        positions = torch.arange(seq_len, device=device)
-        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
-        pos_emb = self.positional_embedding(positions)
-        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
+        B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
         # Pass through transformer (note: PyTorch uses inverted mask convention)
-        attn_mask = ~history_mask  # Convert to PyTorch convention: True = ignore
-        x = self.transformer_encoder(x, src_key_padding_mask=attn_mask)
+        attn_mask_inv = ~history_mask  # Convert to PyTorch convention: True = ignore
+        x = self.transformer_encoder(x, src_key_padding_mask=attn_mask_inv)
 
         # ─── Attention-weighted pooling ───
         # Use learned query to compute content-aware weights over sequence
-        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
-        attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq_len]
-        attn_scores = attn_scores.masked_fill(attn_mask.unsqueeze(1), float("-inf"))
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        # Handle all-masked sequences (avoids NaN from softmax over all -inf)
-        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
-        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
-
+        attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
+        
         # ─── Mean pooling (masked) ───
-        # Provides stable, comprehensive coverage of all history
-        mask_expanded = history_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
-        sum_x = (x * mask_expanded).sum(dim=1)
-        count = mask_expanded.sum(dim=1).clamp(min=1)  # Avoid division by zero
-        mean_pooled = sum_x / count  # [B, hidden]
+        mean_pooled = self._forward_mean_pooled(x, history_mask)
 
         # Concatenate both pooling strategies and project to output dimension
-        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)  # [B, hidden*2]
-        return self.output_projection(combined)  # [B, output_dim]
+        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
+        return self.output_projection(combined)
 
 
-class CrossAttentionPoolingEncoder(nn.Module):
+class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
     """Learned efficient user history encoder using single-query cross-attention pooling.
     
     This is a TRAINABLE NEURAL NETWORK with learnable parameters, designed as a
@@ -510,51 +558,13 @@ class CrossAttentionPoolingEncoder(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        max_seq_len: int = 50,
-        dropout_rate: float = 0.1,
+        hidden_dim: int,
+        output_dim: int,
+        max_seq_len: int,
+        dropout_rate: float,
     ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.max_seq_len = max_seq_len
-
-        # Project raw embeddings to hidden dimension
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-        )
-
-        # Learnable positional embeddings
-        self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
-
-        # Single learned query for cross-attention pooling
-        self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
-
-        # Project concatenated pooled features to final output dimension
-        self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
+        super().__init__(input_dim, hidden_dim, output_dim, max_seq_len, dropout_rate)
         self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights using Xavier uniform for linear layers."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0, std=0.02)
 
     def forward(
         self,
@@ -570,21 +580,7 @@ class CrossAttentionPoolingEncoder(nn.Module):
         Returns:
             User representations [batch, output_dim]
         """
-        B, seq_len, _ = history_embeddings.shape
-        device = history_embeddings.device
-
-        # Default to all-valid mask if not provided
-        if history_mask is None:
-            history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
-
-        # Project embeddings to hidden dimension
-        x = self.input_projection(history_embeddings)
-
-        # Add positional information (flipped: position 0 = most recent)
-        positions = torch.arange(seq_len, device=device)
-        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
-        pos_emb = self.positional_embedding(positions)
-        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
+        B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
         # ─── KEY DIFFERENCE: No TransformerEncoder here ───
         # We skip the expensive self-attention layers that capture inter-post
@@ -593,19 +589,10 @@ class CrossAttentionPoolingEncoder(nn.Module):
         # ─── Cross-attention pooling ───
         # Learned query attends directly to the projected, position-encoded history
         attn_mask_inv = ~history_mask  # PyTorch convention: True = ignore
-        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
-        attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
-        attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        # Handle all-masked sequences
-        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
-        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
-
+        attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
+        
         # ─── Mean pooling (masked) ───
-        mask_expanded = history_mask.unsqueeze(-1).float()
-        sum_x = (x * mask_expanded).sum(dim=1)
-        count = mask_expanded.sum(dim=1).clamp(min=1)
-        mean_pooled = sum_x / count
+        mean_pooled = self._forward_mean_pooled(x, history_mask)
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
