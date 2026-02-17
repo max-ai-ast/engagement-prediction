@@ -761,8 +761,11 @@ def run(context: Context, args) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
-        torch.jit.script(model).save(model_path)
-        context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
+
+        # save the full TorchScript version of the model in ClearML (for serving)
+        ts_model_path = checkpoints_dir / f"two_tower_{timestamp}_ts.pt"
+        torch.jit.script(trained_model).save(ts_model_path)
+        context.tracker.log_artifact(name="trained_model_mlp", path=ts_model_path)
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
