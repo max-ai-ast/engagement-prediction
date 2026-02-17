@@ -268,10 +268,14 @@ class TwoTowerModel(nn.Module):
                 dropout_rate=dropout_rate,
             )
         elif user_encoder_type == "summarized":
-            # nothing to do in here, we get the summrization from the SummarizedEngagementDataset automatically
+            # nothing to do in here, we get the summarization from the SummarizedEngagementDataset automatically
             def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
                 return history_embeddings
             self.user_tower = _dummy_user_tower
+
+            # if using summarization for user tower, then the post tower has to use the same output dimension
+            if shared_dim != post_embedding_dim:
+                raise ValueError(f"--shared-dim ({shared_dim}) and post embedding dim ({post_embedding_dim}) do not match! They must match for two tower with user summarization.")
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
