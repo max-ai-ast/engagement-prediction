@@ -69,6 +69,7 @@ DEFAULTS: Dict[str, Any] = {
     "shared_dim": 128,
     "user_hidden_dim": 256,
     "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
+    "use_post_encoder": True,  # True means using a transformation on the post embedding (e.g. single layer neural net). False uses the post embedding directly.
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
     "num_attention_layers": 2,
@@ -564,6 +565,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
+    _add_arg_with_default(p_all, "--use-post-encoder", type=bool, default=argparse.SUPPRESS,
+                          help_text="Use a neural transformation for the post tower (True) or use the post embedding directly (False)")
     _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention heads")
     _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,

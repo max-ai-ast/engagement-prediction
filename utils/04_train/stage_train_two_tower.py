@@ -242,11 +242,13 @@ class TwoTowerModel(nn.Module):
         max_history_len: int,
         dropout_rate: float,
         user_encoder_type: str,
+        use_post_encoder: bool,
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
         self.user_encoder_type = user_encoder_type
+        self.use_post_encoder = use_post_encoder
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -269,12 +271,13 @@ class TwoTowerModel(nn.Module):
             )
         elif user_encoder_type == "summarized":
             # nothing to do in here, we get the summarization from the SummarizedEngagementDataset automatically
+            # note that the user_tower is not actually used in this case (see forward())
             def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
                 return history_embeddings
             self.user_tower = _dummy_user_tower
 
             # if using summarization for user tower, then the post tower has to use the same output dimension
-            if shared_dim != post_embedding_dim:
+            if use_post_encoder and (shared_dim != post_embedding_dim):
                 raise ValueError(f"--shared-dim ({shared_dim}) and post embedding dim ({post_embedding_dim}) do not match! They must match for two tower with user summarization.")
         else:
             raise ValueError(
@@ -282,13 +285,20 @@ class TwoTowerModel(nn.Module):
                 "Choose 'attention' or 'cross_attention'."
             )
 
-        # Post tower is the same regardless of user encoder type
-        self.post_tower = PostTower(
-            input_dim=post_embedding_dim,
-            hidden_dim=post_hidden_dim,
-            output_dim=shared_dim,
-            dropout_rate=dropout_rate,
-        )
+        if use_post_encoder:
+            # Post tower is the same regardless of user encoder type
+            self.post_tower = PostTower(
+                input_dim=post_embedding_dim,
+                hidden_dim=post_hidden_dim,
+                output_dim=shared_dim,
+                dropout_rate=dropout_rate,
+            )
+        else:
+            # just use the post embedding directly. note that the post_tower is not actually used in this case (see forward())
+            def _dummy_post_tower(post_embeddings: torch.Tensor):
+                return post_embeddings
+            self.post_tower = _dummy_post_tower
+
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
@@ -337,7 +347,11 @@ class TwoTowerModel(nn.Module):
             user_emb = history_embeddings
         else:
             user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
+
+        if self.use_post_encoder:
+            post_emb = self.encode_post(post_embeddings)
+        else:
+            post_emb = post_embeddings
         
         # Dot product: element-wise multiply then sum over shared_dim
         return (user_emb * post_emb).sum(dim=-1)
@@ -609,6 +623,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     patience = int(args.patience)
     disable_progress = bool(args.disable_progress)
     user_encoder_type = args.user_encoder
+    use_post_encoder = args.use_post_encoder
     generate_plots = not bool(args.no_plots)
     save_model = not bool(args.no_save_model)
     lr_scheduler_factor = float(args.lr_scheduler_factor)
@@ -671,52 +686,64 @@ def run(context: Context, args) -> Dict[str, Any]:
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
         user_encoder_type=user_encoder_type,
+        use_post_encoder=use_post_encoder,
     )
 
-    # --- train ---
-    log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    training_results = train_two_tower_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        patience=patience,
-        checkpoints_dir=checkpoints_dir,
-        disable_progress=disable_progress,
-        lr_scheduler_factor=lr_scheduler_factor,
-        lr_scheduler_patience=lr_scheduler_patience,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-        embed_dim=embed_dim,
-    )
-    trained_model: TwoTowerModel = training_results["model"]
-    clear_cuda_memory()
+    if (not use_post_encoder) and (user_encoder_type == "summarized"):
+        logger.info(f"Creating a simple dot-product model, no need for training")
+        trained_model: TwoTowerModel = model
+        training_results = None
+    else:
+        # --- train ---
+        log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
+        training_results = train_two_tower_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            patience=patience,
+            checkpoints_dir=checkpoints_dir,
+            disable_progress=disable_progress,
+            lr_scheduler_factor=lr_scheduler_factor,
+            lr_scheduler_patience=lr_scheduler_patience,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            embed_dim=embed_dim,
+        )
+        trained_model: TwoTowerModel = training_results["model"]
+        clear_cuda_memory()
 
-    # --- plots & evaluation ---
-    hist = training_results["history"]
+        # --- plots & evaluation ---
+        hist = training_results["history"]
 
-    # experiment tracker scalars (always logged, regardless of --no-plots)
-    for e in range(len(hist["train_loss"])):
-        context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
+        # experiment tracker scalars (always logged, regardless of --no-plots)
+        for e in range(len(hist["train_loss"])):
+            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
+            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
+            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
+            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
-    if generate_plots:
-        try:
-            best_epoch = int(np.argmax(hist.get("val_auc", []))) + 1 if hist.get("val_auc") and len(hist.get("val_auc")) > 0 else None
-        except Exception as e:
-            logger.warning(f"Could not determine best epoch from training history: {e}")
-            best_epoch = None
-        plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
+        if generate_plots:
+            try:
+                best_epoch = int(np.argmax(hist.get("val_auc", []))) + 1 if hist.get("val_auc") and len(hist.get("val_auc")) > 0 else None
+            except Exception as e:
+                logger.warning(f"Could not determine best epoch from training history: {e}")
+                best_epoch = None
+            plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
     train_eval = _evaluate_two_tower_model(trained_model, train_loader, device, embed_dim)
     val_eval = _evaluate_two_tower_model(trained_model, val_loader, device, embed_dim)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
+
+    # calculate the best auc in the case that we didn't train a model (simple dot product version)
+    if training_results is not None:
+        best_val_auc = training_results["best_val_auc"]
+    else:
+        best_val_auc = roc_auc_score(train_eval["predictions"]["y_true"], train_eval["predictions"]["y_pred"])
 
     if generate_plots:
         try:
@@ -758,9 +785,9 @@ def run(context: Context, args) -> Dict[str, Any]:
             {
                 "model_state_dict": trained_model.state_dict(),
                 "config": config,
-                "training_history": training_results["history"],
-                "best_val_auc": training_results["best_val_auc"],
-                "best_val_loss": training_results["best_val_loss"],
+                "training_history": training_results["history"] if training_results is not None else None,
+                "best_val_auc": best_val_auc,
+                "best_val_loss": training_results["best_val_loss"] if training_results is not None else None,
             },
             model_path,
         )
@@ -842,7 +869,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
         "holdout_metrics": holdout_metrics,
-        "best_val_auc": training_results["best_val_auc"],
+        "best_val_auc": best_val_auc,
     }
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
@@ -856,7 +883,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
-        f"best_val_auc: {training_results['best_val_auc']:.4f}",
+        f"best_val_auc: {best_val_auc:.4f}",
     ]
     if holdout_metrics.get("auc_roc"):
         info_lines.append(f"holdout_auc: {holdout_metrics['auc_roc']:.4f}")
