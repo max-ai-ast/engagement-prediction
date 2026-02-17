@@ -972,8 +972,8 @@ class SummarizedEngagementDataset(Dataset):
         return {
             "features": features,
             "label": torch.tensor(label, dtype=torch.float32),
-            "user_id": self.target_dids[row_idx],
-            "post_id": post_id,
+            "user_ids": self.target_dids[row_idx],
+            "post_ids": post_id,
         }
 
 

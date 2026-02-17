@@ -108,10 +108,12 @@ from utils.helpers import (
 from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
+    SummarizedEngagementDataset,
     sequence_collate_fn,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
     create_data_loaders,
+    get_summarizer,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -266,6 +268,11 @@ class TwoTowerModel(nn.Module):
                 max_seq_len=max_history_len,
                 dropout_rate=dropout_rate,
             )
+        elif user_encoder_type == "summarized":
+            # nothing to do in here, we get the summrization from the SummarizedEngagementDataset automatically
+            def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
+                return history_embeddings
+            self.user_tower = _dummy_user_tower
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
@@ -323,17 +330,20 @@ class TwoTowerModel(nn.Module):
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
+        if self.user_encoder_type == "summarized":
+            user_emb = history_embeddings
+        else:
+            user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
+        
         # Dot product: element-wise multiply then sum over shared_dim
         return (user_emb * post_emb).sum(dim=-1)
 
     def compute_loss_and_preds(
         self,
-        history_embeddings: torch.Tensor,
-        history_mask: Optional[torch.Tensor],
-        post_embeddings: torch.Tensor,
-        labels: torch.Tensor,
+        batch: Dict[str, Any],
+        device: str,
+        embed_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute loss and predictions for a batch.
         
@@ -356,6 +366,19 @@ class TwoTowerModel(nn.Module):
             Returns raw scores (not probabilities) for flexibility in evaluation.
             Apply sigmoid(scores) to get probabilities.
         """
+        # unpack inputs
+        if self.user_encoder_type == "summarized":
+            features = batch["features"].to(device) # [B, embed_dim*2]
+            history_embeddings = features[:, :embed_dim]
+            post_embeddings = features[:, embed_dim:]
+            history_mask = None
+            assert history_embeddings.shape[1] == post_embeddings.shape[1]
+        else:
+            history_embeddings = batch["history_embeddings"].to(device)
+            history_mask = batch["history_mask"].to(device)
+            post_embeddings = batch["target_post_embedding"].to(device)
+        labels = batch["label"].to(device)
+
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
         loss = F.binary_cross_entropy(probs, labels.float())
@@ -371,15 +394,16 @@ def train_two_tower_model(
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: str,
-    epochs: int = 100,
-    learning_rate: float = 1e-3,
-    weight_decay: float = 0.01,
-    patience: int = 20,
-    checkpoints_dir: Optional[Path] = None,
-    disable_progress: bool = False,
-    lr_scheduler_factor: float = 0.5,
-    lr_scheduler_patience: int = 5,
-    gradient_clip_max_norm: float = 1.0,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    patience: int,
+    checkpoints_dir: Optional[Path],
+    disable_progress: bool,
+    lr_scheduler_factor: float,
+    lr_scheduler_patience: int,
+    gradient_clip_max_norm: float,
+    embed_dim: int
 ) -> Dict[str, Any]:
     from tqdm import tqdm
 
@@ -403,13 +427,10 @@ def train_two_tower_model(
         train_labels: List[float] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            history_emb = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            target_emb = batch["target_post_embedding"].to(device)
             labels = batch["label"].to(device)
 
             optimizer.zero_grad()
-            loss, scores = model.compute_loss_and_preds(history_emb, history_mask, target_emb, labels)
+            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
@@ -426,12 +447,9 @@ def train_two_tower_model(
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                history_emb = batch["history_embeddings"].to(device)
-                history_mask = batch["history_mask"].to(device)
-                target_emb = batch["target_post_embedding"].to(device)
                 labels = batch["label"].to(device)
 
-                loss, scores = model.compute_loss_and_preds(history_emb, history_mask, target_emb, labels)
+                loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
                 val_losses.append(loss.item())
                 val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
@@ -486,6 +504,7 @@ def evaluate_two_tower_model(
     model: TwoTowerModel,
     data_loader: DataLoader,
     device: str,
+    embed_dim: int,
 ) -> Dict[str, Any]:
     """Evaluate two-tower model and return metrics + predictions."""
     model = model.to(device)
@@ -498,12 +517,9 @@ def evaluate_two_tower_model(
 
     with torch.inference_mode():
         for batch in data_loader:
-            history_emb = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            target_emb = batch["target_post_embedding"].to(device)
             labels = batch["label"]
 
-            scores = model(history_emb, history_mask, target_emb)
+            _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             probs = torch.sigmoid(scores)
 
             all_preds.extend(probs.cpu().numpy().tolist())
@@ -604,23 +620,42 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- datasets ---
     log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
-    train_dataset = SequenceEngagementDataset(
-        embeddings_mmap, target_posts_df, history_df, split="train",
-        max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-    )
-    val_dataset = SequenceEngagementDataset(
-        embeddings_mmap, target_posts_df, history_df, split="val",
-        max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-    )
+    if user_encoder_type == "summarized":
+        # get summarizer
+        summarizer_name = args.user_summarization
+        ema_alpha = float(args.ema_alpha)
+        summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
+        
+        train_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="train", 
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
+        val_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val", 
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
+    else:
+        train_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="train",
+            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+        )
+        val_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val",
+            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+        )
 
     # Create data loaders using centralized helper
+    collate_fn = None
+    if user_encoder_type != "summarized":
+        collate_fn = sequence_collate_fn
+
     train_loader, val_loader, _ = create_data_loaders(
         train_dataset, val_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        collate_fn=sequence_collate_fn,
+        collate_fn=collate_fn,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
@@ -656,6 +691,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        embed_dim=embed_dim,
     )
     trained_model: TwoTowerModel = training_results["model"]
     clear_cuda_memory()
@@ -679,8 +715,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    train_eval = evaluate_two_tower_model(trained_model, train_loader, device)
-    val_eval = evaluate_two_tower_model(trained_model, val_loader, device)
+    train_eval = evaluate_two_tower_model(trained_model, train_loader, device, embed_dim)
+    val_eval = evaluate_two_tower_model(trained_model, val_loader, device, embed_dim)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
 
@@ -738,10 +774,16 @@ def run(context: Context, args) -> Dict[str, Any]:
     holdout_metrics: Dict[str, Any] = {}
     holdout_dir = out_dir / "holdout_eval"
     try:
-        holdout_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="holdout",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-        )
+        if user_encoder_type == "summarized":
+            holdout_dataset = SummarizedEngagementDataset(
+                embeddings_mmap, target_posts_df, history_df, split="holdout", 
+                summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+            )
+        else:
+            holdout_dataset = SequenceEngagementDataset(
+                embeddings_mmap, target_posts_df, history_df, split="holdout",
+                max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
             # Use centralized function for consistency (train_loader unused, just a placeholder)
@@ -752,9 +794,9 @@ def run(context: Context, args) -> Dict[str, Any]:
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
-                collate_fn=sequence_collate_fn,
+                collate_fn=collate_fn,
             )
-            holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device)
+            holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
             holdout_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics: {holdout_metrics}")
 

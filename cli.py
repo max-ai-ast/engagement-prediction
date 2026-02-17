@@ -390,7 +390,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     user_encoder = args.user_encoder
     valid_encoders = {
         "mlp": ("summarized", "attention"),
-        "two-tower": ("attention", "cross_attention"),
+        "two-tower": ("summarized", "attention", "cross_attention"),
     }
     allowed = valid_encoders.get(model_type, ())
     if user_encoder not in allowed:
