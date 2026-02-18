@@ -298,7 +298,7 @@ class TwoTowerModel(nn.Module):
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
-                "Choose 'attention' or 'cross_attention'."
+                "Choose 'summarized', 'attention' or 'cross_attention'."
             )
 
         if use_post_encoder:

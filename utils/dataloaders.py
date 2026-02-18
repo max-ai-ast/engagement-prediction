@@ -869,7 +869,7 @@ def _prepare_split_data(
     history_df: pl.DataFrame,
     split: str,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -949,7 +949,7 @@ def _prepare_split_data(
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, np.array(target_dids), np.array(like_uris), np.array(neg_uris)
+    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
 
 
 # ---------------------------------------------------------------------------
