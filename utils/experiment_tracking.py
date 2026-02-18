@@ -116,7 +116,6 @@ class ClearMLExperimentTracker:
         )
 
     def log_artifact(self, name: str, path: Path) -> None:
-        from clearml import OutputModel
         p = Path(path)
         if not p.exists():
             return
