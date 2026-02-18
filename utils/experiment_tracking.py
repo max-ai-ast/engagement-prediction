@@ -120,7 +120,7 @@ class ClearMLExperimentTracker:
         p = Path(path)
         if not p.exists():
             return
-        OutputModel(task=self._task).update_weights(str(p))
+        self._task.upload_artifact(name=name, artifact_object=str(p))
 
     def log_params(self, params: Dict[str, Any]) -> None:
         self._task.connect(params)
