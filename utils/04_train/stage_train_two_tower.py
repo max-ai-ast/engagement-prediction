@@ -79,8 +79,7 @@ Inputs (from prior pipeline stages):
 
 Outputs under <run_dir>/04_train/<timestamp>/:
     - checkpoints/two_tower_best.pth (best-by-validation checkpoint during training)
-    - checkpoints/two_tower_<timestamp>.pt (final model checkpoint)
-    - checkpoints/two_tower_<timestamp>_ts.pt (TorchScript model)
+    - checkpoints/two_tower_<timestamp>.pth (final model checkpoint)
     - plots/training_history_*.png (loss and AUC curves)
     - plots/{train,val,holdout}_performance_*.png (precision-recall, ROC curves)
     - logs/ (training logs)
@@ -800,7 +799,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "dropout_rate": dropout_rate,
     }
     if save_model:
-        model_path = checkpoints_dir / f"two_tower_{timestamp}.pt"
+        model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
         torch.save(
             {
                 "model_state_dict": trained_model.state_dict(),
