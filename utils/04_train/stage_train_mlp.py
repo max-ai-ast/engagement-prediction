@@ -37,7 +37,7 @@ Both models are trained with:
     - Binary cross-entropy loss
     - Balanced positive/negative sampling (1:1 ratio)
     - AdamW optimizer with learning rate scheduling
-    - Early stopping based on validation loss
+    - Early stopping based on validation AUC
     - Comprehensive metrics tracking (loss, AUC, precision, recall)
 
 Inputs (from prior pipeline stages):
@@ -86,7 +86,6 @@ from utils.dataloaders import (
     get_summarizer,
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
-    sequence_collate_fn,
     TransformerDualPoolingEncoder,
     create_data_loaders,
 )
@@ -185,7 +184,7 @@ class SummarizedMLP(nn.Module):
         """
         feats = batch["features"].to(device)
         labels = batch["label"].to(device)
-        preds = self.forward(feats).squeeze(-1)
+        preds = self(feats).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
@@ -330,7 +329,7 @@ class AttentionMLP(nn.Module):
         history_mask = batch["history_mask"].to(device)
         target_emb = batch["target_post_embedding"].to(device)
         labels = batch["label"].to(device)
-        preds = self.forward(history_emb, history_mask, target_emb).squeeze(-1)
+        preds = self(history_emb, history_mask, target_emb).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
@@ -495,7 +494,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    collate_fn = None  # non-None only for sequence datasets
 
     # Worker settings (shared by all encoder types)
     num_workers = int(args.num_dataloader_workers)
@@ -530,16 +528,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             prefetch_factor=prefetch_factor,
         )
 
-    elif user_encoder == "attention":
+    elif user_encoder == "full_transformer":
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
-        logger.info("User encoder: attention (TransformerDualPoolingEncoder + MLP)")
+        logger.info("User encoder: full_transformer (TransformerDualPoolingEncoder + MLP)")
         max_history_len = int(args.max_history_len)
         user_hidden_dim = int(args.user_hidden_dim)
         user_output_dim = int(args.user_output_dim)
         num_attention_heads = int(args.num_attention_heads)
         num_attention_layers = int(args.num_attention_layers)
         attention_dropout = float(args.attention_dropout)
-        summarizer_name = "attention"  # for config logging
+        summarizer_name = "full_transformer"  # for config logging
         ema_alpha = 0.0
 
         log_operation_start("Create datasets (sequence)", STAGE_LOG_NAME, logger)
@@ -566,20 +564,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             attention_dropout=attention_dropout,
         )
 
-        collate_fn = sequence_collate_fn
         train_loader, val_loader, _ = create_data_loaders(
             train_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
-            collate_fn=collate_fn,
         )
         input_dim = user_output_dim + embed_dim  # for config logging
     else:
         raise ValueError(
             f"Unknown user_encoder '{user_encoder}' for MLP. "
-            "Choose 'summarized' or 'attention'."
+            "Choose 'summarized' or 'full_transformer'."
         )
 
     # --- train ---
@@ -625,7 +621,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
+    def _collect_predictions(ds: Dataset) -> tuple:
         loader_kw_: Dict[str, Any] = dict(
             batch_size=batch_size, shuffle=False, drop_last=False,
             num_workers=num_workers, pin_memory=pin_memory,
@@ -635,8 +631,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
             )
-        if collate_fn_ is not None:
-            loader_kw_["collate_fn"] = collate_fn_
         loader = DataLoader(ds, **loader_kw_)
         ys, ps = [], []
         trained_model.eval()
@@ -658,8 +652,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
         return m
 
-    y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
-    y_val, p_val = _collect_predictions(val_dataset, collate_fn_=collate_fn)
+    y_train, p_train = _collect_predictions(train_dataset)
+    y_val, p_val = _collect_predictions(val_dataset)
     train_metrics = _compute_metrics(y_train, p_train)
     val_metrics = _compute_metrics(y_val, p_val)
     logger.info(f"Train metrics: {train_metrics}")
@@ -726,7 +720,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            y_holdout, p_holdout = _collect_predictions(holdout_dataset, collate_fn_=collate_fn)
+            y_holdout, p_holdout = _collect_predictions(holdout_dataset)
             holdout_metrics = _compute_metrics(y_holdout, p_holdout)
             logger.info(f"Holdout metrics: {holdout_metrics}")
 

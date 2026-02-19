@@ -15,7 +15,9 @@ Core concept: Project users and posts into a SHARED EMBEDDING SPACE where
 engagement is predicted by computing similarity (dot product) between representations.
 
     User Tower:  history_sequence -> UserEncoder -> user_vector [shared_dim]
-    Post Tower:  post_embedding -> MLP -> post_vector [shared_dim]
+                (or "summarized": user_vector is provided by the dataset)
+    Post Tower:  post_embedding -> (optional) PostTower -> post_vector [shared_dim]
+                (or identity when use_post_encoder=False)
     Prediction:  sigmoid(user_vector · post_vector) -> engagement_probability
 
 Benefits:
@@ -28,9 +30,16 @@ Benefits:
 USER ENCODER OPTIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-This module supports TWO user encoder architectures, selected via user_encoder_type:
+This stage supports THREE user-history encoders, selected via `--user-encoder`:
 
-1. **"attention"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
+0. **"summarized"** - Hand-crafted summarization (no trainable user encoder)
+   ───────────────────────────────────────────────────────────────────────────
+   Uses `SummarizedEngagementDataset` to pre-compute a fixed-size user summary
+   vector (e.g. mean / EMA / linear recency). In this mode the "user tower" is
+   effectively the identity function at training time because the dataset has
+   already produced the user vector.
+
+1. **"full_transformer"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
    ───────────────────────────────────────────────────────────────────────────
    Uses transformer encoder with multi-head self-attention to capture complex
    inter-post relationships in user history. Best modeling capacity but highest
@@ -69,8 +78,8 @@ Inputs (from prior pipeline stages):
     - history_posts_*.parquet from 03_user_history
 
 Outputs under <run_dir>/04_train/<timestamp>/:
-    - checkpoints/two_tower_*.pth (full checkpoint with training state)
-    - checkpoints/two_tower_*_weights.pth (model weights only)
+    - checkpoints/two_tower_best.pth (best-by-validation checkpoint during training)
+    - checkpoints/two_tower_<timestamp>.pth (final model checkpoint)
     - plots/training_history_*.png (loss and AUC curves)
     - plots/{train,val,holdout}_performance_*.png (precision-recall, ROC curves)
     - logs/ (training logs)
@@ -108,10 +117,11 @@ from utils.helpers import (
 from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
-    sequence_collate_fn,
+    SummarizedEngagementDataset,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
     create_data_loaders,
+    get_summarizer,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -197,19 +207,23 @@ class TwoTowerModel(nn.Module):
     ranking systems.
     
     Architecture:
-        User Tower: TransformerDualPoolingEncoder OR CrossAttentionPoolingEncoder
-                    (history_sequence, mask) -> user_vector [shared_dim]
+        User Tower:
+            - "full_transformer": TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "summarized": user_vector is provided by SummarizedEngagementDataset
+              (the model treats the dataset-provided user summary as the user embedding)
         
-        Post Tower: PostTower (simple MLP)
-                    post_embedding -> post_vector [shared_dim]
+        Post Tower:
+            - use_post_encoder=True:  PostTower(post_embedding) -> post_vector [shared_dim]
+            - use_post_encoder=False: post_vector is the raw post embedding (identity)
         
         Scoring: dot_product(user_vector, post_vector) -> raw score
                  sigmoid(raw_score) -> engagement_probability
     
     Key characteristics:
-        - Shared embedding space: Both towers output same dimensionality
+        - Shared embedding space: Both towers output the same dimensionality for dot product
         - Independent computation: Towers never exchange information (until final dot product)
-        - Modular encoders: User tower can be "attention" or "cross_attention"
+        - Modular encoders: User tower can be "summarized", "full_transformer", or "cross_attention"
     
     Deployment pattern:
         1. Pre-compute post_vectors for all candidate posts
@@ -226,8 +240,8 @@ class TwoTowerModel(nn.Module):
         num_attention_layers: Transformer layers for TransformerDualPoolingEncoder
         max_history_len: Maximum history sequence length
         dropout_rate: Dropout probability
-        user_encoder_type: User tower architecture - "attention" (full transformer)
-                           or "cross_attention" (single-query cross-attention pooling)
+        user_encoder_type: User tower architecture - "summarized", "full_transformer", or "cross_attention"
+        use_post_encoder: If True, learn a post projection (PostTower). If False, use raw post embeddings.
     """
 
     def __init__(
@@ -241,11 +255,13 @@ class TwoTowerModel(nn.Module):
         max_history_len: int,
         dropout_rate: float,
         user_encoder_type: str,
+        use_post_encoder: bool,
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
         self.user_encoder_type = user_encoder_type
+        self.use_post_encoder = use_post_encoder
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -256,7 +272,7 @@ class TwoTowerModel(nn.Module):
                 max_seq_len=max_history_len,
                 dropout_rate=dropout_rate,
             )
-        elif user_encoder_type == "attention":
+        elif user_encoder_type == "full_transformer":
             self.user_tower = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
@@ -266,19 +282,38 @@ class TwoTowerModel(nn.Module):
                 max_seq_len=max_history_len,
                 dropout_rate=dropout_rate,
             )
+        elif user_encoder_type == "summarized":
+            # In "summarized" mode, the dataset provides the user vector directly
+            # (e.g., mean/EMA/linear-recency summary). The model treats the
+            # history input as an already-encoded user embedding.
+            def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
+                return history_embeddings
+            self.user_tower = _dummy_user_tower
+
+            # If we still learn a post projection (use_post_encoder=True), its output
+            # dimension must match the dataset-provided user embedding dimension.
+            if use_post_encoder and (shared_dim != post_embedding_dim):
+                raise ValueError(f"--shared-dim ({shared_dim}) and post embedding dim ({post_embedding_dim}) do not match! They must match for two tower with user summarization.")
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
-                "Choose 'attention' or 'cross_attention'."
+                "Choose 'summarized', 'full_transformer' or 'cross_attention'."
             )
 
-        # Post tower is the same regardless of user encoder type
-        self.post_tower = PostTower(
-            input_dim=post_embedding_dim,
-            hidden_dim=post_hidden_dim,
-            output_dim=shared_dim,
-            dropout_rate=dropout_rate,
-        )
+        if use_post_encoder:
+            # Post tower is the same regardless of user encoder type
+            self.post_tower = PostTower(
+                input_dim=post_embedding_dim,
+                hidden_dim=post_hidden_dim,
+                output_dim=shared_dim,
+                dropout_rate=dropout_rate,
+            )
+        else:
+            # just use the post embedding directly. note that the post_tower is not actually used in this case (see forward())
+            def _dummy_post_tower(post_embeddings: torch.Tensor):
+                return post_embeddings
+            self.post_tower = _dummy_post_tower
+
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
@@ -316,24 +351,33 @@ class TwoTowerModel(nn.Module):
         predicted engagement probability.
         
         Args:
-            history_embeddings: User history sequences [batch, seq_len, input_dim]
-            history_mask: History validity mask [batch, seq_len]
+            history_embeddings: User history input.
+                - summarized: user vectors [batch, embed_dim]
+                - otherwise: padded history sequences [batch, seq_len, input_dim]
+            history_mask: History validity mask [batch, seq_len] (None in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
         
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
+        if self.user_encoder_type == "summarized":
+            user_emb = history_embeddings
+        else:
+            user_emb = self.encode_user(history_embeddings, history_mask)
+
+        if self.use_post_encoder:
+            post_emb = self.encode_post(post_embeddings)
+        else:
+            post_emb = post_embeddings
+        
         # Dot product: element-wise multiply then sum over shared_dim
         return (user_emb * post_emb).sum(dim=-1)
 
     def compute_loss_and_preds(
         self,
-        history_embeddings: torch.Tensor,
-        history_mask: Optional[torch.Tensor],
-        post_embeddings: torch.Tensor,
-        labels: torch.Tensor,
+        batch: Dict[str, Any],
+        device: str,
+        embed_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute loss and predictions for a batch.
         
@@ -342,10 +386,12 @@ class TwoTowerModel(nn.Module):
         to get probabilities, and calculates binary cross-entropy loss.
         
         Args:
-            history_embeddings: User history sequences [batch, seq_len, input_dim]
-            history_mask: History validity mask [batch, seq_len]
-            post_embeddings: Target post embeddings [batch, input_dim]
-            labels: Binary engagement labels [batch]
+            batch: Batch dictionary. Expected keys depend on `user_encoder_type`:
+                - "summarized": {"features", "label"} where features is
+                  [B, 2*embed_dim] concatenated [user_summary || post_embedding]
+                - otherwise: {"history_embeddings", "history_mask", "target_post_embedding", "label"}
+            device: Device string (e.g. "cpu" or "cuda")
+            embed_dim: Post embedding dimensionality D (used only to split "features" in summarized mode)
         
         Returns:
             Tuple of (loss, scores):
@@ -356,6 +402,19 @@ class TwoTowerModel(nn.Module):
             Returns raw scores (not probabilities) for flexibility in evaluation.
             Apply sigmoid(scores) to get probabilities.
         """
+        # unpack inputs
+        if self.user_encoder_type == "summarized":
+            features = batch["features"].to(device) # [B, embed_dim*2]
+            history_embeddings = features[:, :embed_dim]
+            post_embeddings = features[:, embed_dim:]
+            history_mask = None
+            assert history_embeddings.shape[1] == post_embeddings.shape[1]
+        else:
+            history_embeddings = batch["history_embeddings"].to(device)
+            history_mask = batch["history_mask"].to(device)
+            post_embeddings = batch["target_post_embedding"].to(device)
+        labels = batch["label"].to(device)
+
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
         loss = F.binary_cross_entropy(probs, labels.float())
@@ -371,15 +430,16 @@ def train_two_tower_model(
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: str,
-    epochs: int = 100,
-    learning_rate: float = 1e-3,
-    weight_decay: float = 0.01,
-    patience: int = 20,
-    checkpoints_dir: Optional[Path] = None,
-    disable_progress: bool = False,
-    lr_scheduler_factor: float = 0.5,
-    lr_scheduler_patience: int = 5,
-    gradient_clip_max_norm: float = 1.0,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    patience: int,
+    checkpoints_dir: Optional[Path],
+    disable_progress: bool,
+    lr_scheduler_factor: float,
+    lr_scheduler_patience: int,
+    gradient_clip_max_norm: float,
+    embed_dim: int
 ) -> Dict[str, Any]:
     from tqdm import tqdm
 
@@ -403,13 +463,10 @@ def train_two_tower_model(
         train_labels: List[float] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            history_emb = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            target_emb = batch["target_post_embedding"].to(device)
             labels = batch["label"].to(device)
 
             optimizer.zero_grad()
-            loss, scores = model.compute_loss_and_preds(history_emb, history_mask, target_emb, labels)
+            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
@@ -426,12 +483,9 @@ def train_two_tower_model(
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                history_emb = batch["history_embeddings"].to(device)
-                history_mask = batch["history_mask"].to(device)
-                target_emb = batch["target_post_embedding"].to(device)
                 labels = batch["label"].to(device)
 
-                loss, scores = model.compute_loss_and_preds(history_emb, history_mask, target_emb, labels)
+                loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
                 val_losses.append(loss.item())
                 val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
@@ -482,10 +536,11 @@ def train_two_tower_model(
 # Evaluation
 # =============================================================================
 
-def evaluate_two_tower_model(
+def _evaluate_two_tower_model(
     model: TwoTowerModel,
     data_loader: DataLoader,
     device: str,
+    embed_dim: int,
 ) -> Dict[str, Any]:
     """Evaluate two-tower model and return metrics + predictions."""
     model = model.to(device)
@@ -498,18 +553,15 @@ def evaluate_two_tower_model(
 
     with torch.inference_mode():
         for batch in data_loader:
-            history_emb = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            target_emb = batch["target_post_embedding"].to(device)
             labels = batch["label"]
 
-            scores = model(history_emb, history_mask, target_emb)
+            _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             probs = torch.sigmoid(scores)
 
             all_preds.extend(probs.cpu().numpy().tolist())
             all_labels.extend(labels.numpy().tolist())
-            all_user_ids.extend(batch["user_ids"])
-            all_post_ids.extend(batch["post_ids"])
+            all_user_ids.extend(batch["user_id"])
+            all_post_ids.extend(batch["post_id"])
 
     y_true = np.array(all_labels)
     y_pred = np.array(all_preds)
@@ -529,8 +581,8 @@ def evaluate_two_tower_model(
     return {
         "metrics": metrics,
         "predictions": {
-            "user_ids": all_user_ids,
-            "post_ids": all_post_ids,
+            "user_id": all_user_ids,
+            "post_id": all_post_ids,
             "y_true": y_true,
             "y_pred": y_pred,
         },
@@ -590,6 +642,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     patience = int(args.patience)
     disable_progress = bool(args.disable_progress)
     user_encoder_type = args.user_encoder
+    use_post_encoder = args.use_post_encoder
     generate_plots = not bool(args.no_plots)
     save_model = not bool(args.no_save_model)
     lr_scheduler_factor = float(args.lr_scheduler_factor)
@@ -604,14 +657,29 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- datasets ---
     log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
-    train_dataset = SequenceEngagementDataset(
-        embeddings_mmap, target_posts_df, history_df, split="train",
-        max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-    )
-    val_dataset = SequenceEngagementDataset(
-        embeddings_mmap, target_posts_df, history_df, split="val",
-        max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-    )
+    if user_encoder_type == "summarized":
+        # get summarizer
+        summarizer_name = args.user_summarization
+        ema_alpha = float(args.ema_alpha)
+        summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
+        
+        train_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="train", 
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
+        val_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val", 
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
+    else:
+        train_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="train",
+            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+        )
+        val_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val",
+            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+        )
 
     # Create data loaders using centralized helper
     train_loader, val_loader, _ = create_data_loaders(
@@ -620,7 +688,6 @@ def run(context: Context, args) -> Dict[str, Any]:
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        collate_fn=sequence_collate_fn,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
@@ -638,51 +705,64 @@ def run(context: Context, args) -> Dict[str, Any]:
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
         user_encoder_type=user_encoder_type,
+        use_post_encoder=use_post_encoder,
     )
 
-    # --- train ---
-    log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    training_results = train_two_tower_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        patience=patience,
-        checkpoints_dir=checkpoints_dir,
-        disable_progress=disable_progress,
-        lr_scheduler_factor=lr_scheduler_factor,
-        lr_scheduler_patience=lr_scheduler_patience,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-    )
-    trained_model: TwoTowerModel = training_results["model"]
-    clear_cuda_memory()
+    if (not use_post_encoder) and (user_encoder_type == "summarized"):
+        logger.info(f"Creating a simple dot-product model, no need for training")
+        trained_model: TwoTowerModel = model
+        training_results = None
+    else:
+        # --- train ---
+        log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
+        training_results = train_two_tower_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            patience=patience,
+            checkpoints_dir=checkpoints_dir,
+            disable_progress=disable_progress,
+            lr_scheduler_factor=lr_scheduler_factor,
+            lr_scheduler_patience=lr_scheduler_patience,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            embed_dim=embed_dim,
+        )
+        trained_model: TwoTowerModel = training_results["model"]
+        clear_cuda_memory()
 
-    # --- plots & evaluation ---
-    hist = training_results["history"]
+        # --- plots & evaluation ---
+        hist = training_results["history"]
 
-    # experiment tracker scalars (always logged, regardless of --no-plots)
-    for e in range(len(hist["train_loss"])):
-        context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
+        # experiment tracker scalars (always logged, regardless of --no-plots)
+        for e in range(len(hist["train_loss"])):
+            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
+            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
+            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
+            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
-    if generate_plots:
-        try:
-            best_epoch = int(np.argmax(hist.get("val_auc", []))) + 1 if hist.get("val_auc") and len(hist.get("val_auc")) > 0 else None
-        except Exception as e:
-            logger.warning(f"Could not determine best epoch from training history: {e}")
-            best_epoch = None
-        plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
+        if generate_plots:
+            try:
+                best_epoch = int(np.argmax(hist.get("val_auc", []))) + 1 if hist.get("val_auc") and len(hist.get("val_auc")) > 0 else None
+            except Exception as e:
+                logger.warning(f"Could not determine best epoch from training history: {e}")
+                best_epoch = None
+            plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    train_eval = evaluate_two_tower_model(trained_model, train_loader, device)
-    val_eval = evaluate_two_tower_model(trained_model, val_loader, device)
+    train_eval = _evaluate_two_tower_model(trained_model, train_loader, device, embed_dim)
+    val_eval = _evaluate_two_tower_model(trained_model, val_loader, device, embed_dim)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
+
+    # calculate the best auc in the case that we didn't train a model (simple dot product version)
+    if training_results is not None:
+        best_val_auc = training_results["best_val_auc"]
+    else:
+        best_val_auc = roc_auc_score(val_eval["predictions"]["y_true"], val_eval["predictions"]["y_pred"])
 
     if generate_plots:
         try:
@@ -709,6 +789,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     config = {
         "model_type": "two_tower",
         "user_encoder_type": user_encoder_type,
+        "use_post_encoder": use_post_encoder,
         "post_embedding_dim": embed_dim,
         "shared_dim": shared_dim,
         "user_hidden_dim": user_hidden_dim,
@@ -724,9 +805,9 @@ def run(context: Context, args) -> Dict[str, Any]:
             {
                 "model_state_dict": trained_model.state_dict(),
                 "config": config,
-                "training_history": training_results["history"],
-                "best_val_auc": training_results["best_val_auc"],
-                "best_val_loss": training_results["best_val_loss"],
+                "training_history": training_results["history"] if training_results is not None else None,
+                "best_val_auc": best_val_auc,
+                "best_val_loss": training_results["best_val_loss"] if training_results is not None else None,
             },
             model_path,
         )
@@ -737,10 +818,16 @@ def run(context: Context, args) -> Dict[str, Any]:
     holdout_metrics: Dict[str, Any] = {}
     holdout_dir = out_dir / "holdout_eval"
     try:
-        holdout_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="holdout",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-        )
+        if user_encoder_type == "summarized":
+            holdout_dataset = SummarizedEngagementDataset(
+                embeddings_mmap, target_posts_df, history_df, split="holdout", 
+                summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+            )
+        else:
+            holdout_dataset = SequenceEngagementDataset(
+                embeddings_mmap, target_posts_df, history_df, split="holdout",
+                max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
             # Use centralized function for consistency (train_loader unused, just a placeholder)
@@ -751,9 +838,8 @@ def run(context: Context, args) -> Dict[str, Any]:
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
-                collate_fn=sequence_collate_fn,
             )
-            holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device)
+            holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
             holdout_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics: {holdout_metrics}")
 
@@ -762,8 +848,8 @@ def run(context: Context, args) -> Dict[str, Any]:
             # Save predictions
             import pandas as pd
             pred_df = pd.DataFrame({
-                "did": holdout_eval["predictions"]["user_ids"],
-                "post_id": holdout_eval["predictions"]["post_ids"],
+                "did": holdout_eval["predictions"]["user_id"],
+                "post_id": holdout_eval["predictions"]["post_id"],
                 "y_true": holdout_eval["predictions"]["y_true"],
                 "y_pred_proba": holdout_eval["predictions"]["y_pred"],
             })
@@ -799,7 +885,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
         "holdout_metrics": holdout_metrics,
-        "best_val_auc": training_results["best_val_auc"],
+        "best_val_auc": best_val_auc,
     }
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
@@ -813,7 +899,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
-        f"best_val_auc: {training_results['best_val_auc']:.4f}",
+        f"best_val_auc: {best_val_auc:.4f}",
     ]
     if holdout_metrics.get("auc_roc"):
         info_lines.append(f"holdout_auc: {holdout_metrics['auc_roc']:.4f}")

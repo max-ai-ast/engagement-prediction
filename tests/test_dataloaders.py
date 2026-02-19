@@ -8,7 +8,6 @@ from torch.utils.data import DataLoader
 from utils.dataloaders import (
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
-    sequence_collate_fn,
     create_data_loaders,
     MeanSummarizer,
 )
@@ -32,6 +31,7 @@ def mock_target_posts_df():
         "split": ["train"] * 8 + ["val"] * 4,
         "target_did": [f"user{i}" for i in range(12)],
         "like_uri": [f"post{i}" for i in range(12)],
+        "neg_uri": [f"neg{i}" for i in range(12)],
         "like_emb_idx": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         "neg_emb_idx": [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
     })
@@ -113,7 +113,7 @@ def test_summarized_dataset_item_shape(mock_embeddings_mmap, mock_target_posts_d
     assert neg_sample["features"].shape == (128,)
     assert neg_sample["label"].item() == 0.0
     assert neg_sample["user_id"] == "user0"
-    assert neg_sample["post_id"] == "neg_uri"
+    assert neg_sample["post_id"] == "neg0"
 
 
 def test_summarized_dataset_indexing_pattern(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
@@ -142,7 +142,6 @@ def test_summarized_dataset_indexing_pattern(mock_embeddings_mmap, mock_target_p
         
         # Post IDs should differ
         assert pos["post_id"] != neg["post_id"]
-        assert neg["post_id"] == "neg_uri"
 
 
 def test_summarized_dataset_empty_history(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
@@ -343,70 +342,6 @@ def test_sequence_dataset_positive_negative_labeling(mock_embeddings_mmap, mock_
 
 
 # =============================================================================
-# sequence_collate_fn Tests
-# =============================================================================
-
-def test_sequence_collate_fn_batch_stacking(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test sequence_collate_fn correctly stacks samples into batches."""
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=10,
-        embed_dim=64,
-    )
-    
-    # Get a few samples
-    batch_list = [dataset[i] for i in range(4)]
-    
-    # Collate them
-    batch = sequence_collate_fn(batch_list)
-    
-    # Check batch dimensions
-    assert batch["history_embeddings"].shape == (4, 10, 64)
-    assert batch["history_mask"].shape == (4, 10)
-    assert batch["target_post_embedding"].shape == (4, 64)
-    assert batch["label"].shape == (4,)
-    
-    # Check types
-    assert batch["history_embeddings"].dtype == torch.float32
-    assert batch["history_mask"].dtype == torch.bool
-    assert batch["target_post_embedding"].dtype == torch.float32
-    assert batch["label"].dtype == torch.float32
-    
-    # Check user_ids and post_ids remain as lists
-    assert isinstance(batch["user_ids"], list)
-    assert isinstance(batch["post_ids"], list)
-    assert len(batch["user_ids"]) == 4
-    assert len(batch["post_ids"]) == 4
-
-
-def test_sequence_collate_fn_preserves_data(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test sequence_collate_fn preserves individual sample data."""
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=10,
-        embed_dim=64,
-    )
-    
-    batch_list = [dataset[i] for i in range(3)]
-    batch = sequence_collate_fn(batch_list)
-    
-    # Verify each batched item matches original
-    for i, sample in enumerate(batch_list):
-        assert torch.equal(batch["history_embeddings"][i], sample["history_embeddings"])
-        assert torch.equal(batch["history_mask"][i], sample["history_mask"])
-        assert torch.equal(batch["target_post_embedding"][i], sample["target_post_embedding"])
-        assert batch["label"][i].item() == sample["label"].item()
-        assert batch["user_ids"][i] == sample["user_id"]
-        assert batch["post_ids"][i] == sample["post_id"]
-
-
-# =============================================================================
 # create_data_loaders Tests
 # =============================================================================
 
@@ -474,7 +409,6 @@ def test_create_data_loaders_with_collate_fn(mock_embeddings_mmap, mock_target_p
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         batch_size=4,
-        collate_fn=sequence_collate_fn,
         num_workers=0,
         pin_memory=False,
     )

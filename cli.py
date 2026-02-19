@@ -9,7 +9,7 @@ Subcommands:
 
 Usage examples:
     python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --user-encoder attention --model-type two-tower --config configs/pipeline.yml --foreground
+    python cli.py run-all --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
 """
 
 import argparse
@@ -69,6 +69,7 @@ DEFAULTS: Dict[str, Any] = {
     "shared_dim": 128,
     "user_hidden_dim": 256,
     "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
+    "use_post_encoder": True,  # True means using a transformation on the post embedding (e.g. single layer neural net). False uses the post embedding directly.
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
     "num_attention_layers": 2,
@@ -282,7 +283,7 @@ def _generate_run_name(args: argparse.Namespace) -> str:
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
-    """Run the 4-stage pipeline.
+    """Run the 5-stage pipeline.
 
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
     """
@@ -396,8 +397,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     # --- Validation for --user-encoder ---
     user_encoder = args.user_encoder
     valid_encoders = {
-        "mlp": ("summarized", "attention"),
-        "two-tower": ("attention", "cross_attention"),
+        "mlp": ("summarized", "full_transformer"),
+        "two-tower": ("summarized", "full_transformer", "cross_attention"),
     }
     allowed = valid_encoders.get(model_type, ())
     if user_encoder not in allowed:
@@ -412,8 +413,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         _mp, _folder = reg.get_stage_spec(key)
         stage_folder[key] = _folder
 
-    # Respect selective reruns
-    # Map 'train' to the actual train key BEFORE validation
+    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
     start_from = args.start_from
     if start_from == 'train':
         start_from = train_key
@@ -557,9 +557,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
     _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
-    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "attention", "cross_attention"],
-                          default=argparse.SUPPRESS,
-                          help_text="User encoder type (must match model-type: summarized for mlp, attention for two-tower, cross_attention for two-tower only)")
+    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention", "attention"],
+                          default=argparse.SUPPRESS, help_text="User encoder type (must match model-type: summarized for mlp; full_transformer/cross_attention for two-tower). "
+                          "Note: 'attention' is a deprecated alias for 'full_transformer'.")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options
@@ -571,6 +571,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
+    _add_arg_with_default(p_all, "--post-encoder", key="use_post_encoder", dest="use_post_encoder",
+                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable or disable a neural post-tower encoder. Use --post-encoder to enable, --no-post-encoder to disable")
     _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention heads")
     _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,

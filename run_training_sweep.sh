@@ -4,7 +4,7 @@
 # against a single shared data-prep run.
 #
 # MLP experiments run in parallel (lightweight, ~160 MiB GPU each).
-# Two-tower experiments run sequentially (heavy attention encoder).
+# Two-tower experiments run sequentially (heavy full-transformer encoder).
 #
 # Each invocation of cli.py creates its own ClearML experiment, so all
 # runs are tracked automatically.
@@ -33,12 +33,12 @@ MLP_EXPERIMENTS=(
   "summarized:mean"
   "summarized:ema"
   "summarized:linear_recency"
-  "attention:"
+  "full_transformer:"
 )
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
 TT_EXPERIMENTS=(
-  "attention:"
+  "full_transformer:"
   "cross_attention:"
 )
 

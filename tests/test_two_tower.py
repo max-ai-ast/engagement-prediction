@@ -142,8 +142,8 @@ def test_post_tower_eval_mode():
 # TwoTowerModel Tests - Initialization
 # =============================================================================
 
-def test_two_tower_model_attention_encoder():
-    """Test TwoTowerModel with attention encoder."""
+def test_two_tower_model_full_transformer_encoder():
+    """Test TwoTowerModel with full-transformer encoder."""
     model = TwoTowerModel(
         post_embedding_dim=384,
         shared_dim=128,
@@ -153,12 +153,13 @@ def test_two_tower_model_attention_encoder():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     assert model.shared_dim == 128
     assert model.post_embedding_dim == 384
-    assert model.user_encoder_type == "attention"
+    assert model.user_encoder_type == "full_transformer"
     assert hasattr(model, "user_tower")
     assert hasattr(model, "post_tower")
 
@@ -175,6 +176,7 @@ def test_two_tower_model_cross_attention_encoder():
         max_history_len=50,
         dropout_rate=0.3,
         user_encoder_type="cross_attention",
+        use_post_encoder=True,
     )
     
     assert model.user_encoder_type == "cross_attention"
@@ -195,6 +197,7 @@ def test_two_tower_model_invalid_encoder_type():
             max_history_len=50,
             dropout_rate=0.3,
             user_encoder_type="invalid_type",
+            use_post_encoder=True,
         )
 
 
@@ -218,7 +221,8 @@ def test_two_tower_encode_user_shape():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, input_dim)
@@ -244,7 +248,8 @@ def test_two_tower_encode_user_with_mask():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, 384)
@@ -271,7 +276,8 @@ def test_two_tower_encode_user_empty_history():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     # Empty history
@@ -303,7 +309,8 @@ def test_two_tower_encode_post_shape():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     post_embeddings = torch.randn(batch_size, input_dim)
@@ -325,7 +332,8 @@ def test_two_tower_encode_post_single():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     post_embedding = torch.randn(1, 384)
@@ -353,7 +361,8 @@ def test_two_tower_forward_shape():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, input_dim)
@@ -378,7 +387,8 @@ def test_two_tower_forward_dot_product():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.0,  # No dropout for deterministic test
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     model.eval()
@@ -407,7 +417,7 @@ def test_two_tower_forward_both_encoder_types():
     history_mask = torch.ones(batch_size, 30, dtype=torch.bool)
     post_embeddings = torch.randn(batch_size, 384)
     
-    for encoder_type in ["attention", "cross_attention"]:
+    for encoder_type in ["full_transformer", "cross_attention"]:
         model = TwoTowerModel(
             post_embedding_dim=384,
             shared_dim=128,
@@ -418,6 +428,7 @@ def test_two_tower_forward_both_encoder_types():
             max_history_len=30,
             dropout_rate=0.3,
             user_encoder_type=encoder_type,
+            use_post_encoder=True,
         )
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
@@ -439,7 +450,8 @@ def test_two_tower_compute_loss_and_preds():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     batch_size = 16
@@ -448,9 +460,13 @@ def test_two_tower_compute_loss_and_preds():
     post_embeddings = torch.randn(batch_size, 384)
     labels = torch.randint(0, 2, (batch_size,)).float()
     
-    loss, scores = model.compute_loss_and_preds(
-        history_embeddings, history_mask, post_embeddings, labels
-    )
+    batch = {
+        "history_embeddings": history_embeddings,
+        "history_mask": history_mask,
+        "target_post_embedding": post_embeddings,
+        "label": labels,
+    }
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=384)
     
     # Check loss
     assert loss.shape == ()
@@ -477,7 +493,8 @@ def test_two_tower_compute_loss_all_positive():
         num_attention_layers=1,
         max_history_len=20,
         dropout_rate=0.2,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     batch_size = 8
@@ -486,9 +503,13 @@ def test_two_tower_compute_loss_all_positive():
     post_embeddings = torch.randn(batch_size, 128)
     labels = torch.ones(batch_size)  # All positive
     
-    loss, scores = model.compute_loss_and_preds(
-        history_embeddings, history_mask, post_embeddings, labels
-    )
+    batch = {
+        "history_embeddings": history_embeddings,
+        "history_mask": history_mask,
+        "target_post_embedding": post_embeddings,
+        "label": labels,
+    }
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
     
     assert torch.isfinite(loss)
     assert loss.item() >= 0
@@ -505,7 +526,8 @@ def test_two_tower_compute_loss_all_negative():
         num_attention_layers=1,
         max_history_len=20,
         dropout_rate=0.2,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     batch_size = 8
@@ -514,9 +536,13 @@ def test_two_tower_compute_loss_all_negative():
     post_embeddings = torch.randn(batch_size, 128)
     labels = torch.zeros(batch_size)  # All negative
     
-    loss, scores = model.compute_loss_and_preds(
-        history_embeddings, history_mask, post_embeddings, labels
-    )
+    batch = {
+        "history_embeddings": history_embeddings,
+        "history_mask": history_mask,
+        "target_post_embedding": post_embeddings,
+        "label": labels,
+    }
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
     
     assert torch.isfinite(loss)
     assert loss.item() >= 0
@@ -537,7 +563,8 @@ def test_two_tower_backward_pass():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     batch_size = 8
@@ -546,9 +573,13 @@ def test_two_tower_backward_pass():
     post_embeddings = torch.randn(batch_size, 384)
     labels = torch.randint(0, 2, (batch_size,)).float()
     
-    loss, _ = model.compute_loss_and_preds(
-        history_embeddings, history_mask, post_embeddings, labels
-    )
+    batch = {
+        "history_embeddings": history_embeddings,
+        "history_mask": history_mask,
+        "target_post_embedding": post_embeddings,
+        "label": labels,
+    }
+    loss, _ = model.compute_loss_and_preds(batch, device="cpu", embed_dim=384)
     
     loss.backward()
     
@@ -573,7 +604,8 @@ def test_two_tower_eval_mode():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.5,  # High dropout
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     batch_size = 8
@@ -609,7 +641,8 @@ def test_two_tower_parameter_count():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -628,8 +661,8 @@ def test_two_tower_parameter_count():
 
 
 def test_two_tower_cross_attention_fewer_params():
-    """Test cross_attention encoder has fewer params than full attention."""
-    attention_model = TwoTowerModel(
+    """Test cross_attention encoder has fewer params than full_transformer."""
+    full_transformer_model = TwoTowerModel(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -638,7 +671,8 @@ def test_two_tower_cross_attention_fewer_params():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
-        user_encoder_type="attention",
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
     )
     
     cross_attention_model = TwoTowerModel(
@@ -651,9 +685,10 @@ def test_two_tower_cross_attention_fewer_params():
         max_history_len=50,
         dropout_rate=0.3,
         user_encoder_type="cross_attention",
+        use_post_encoder=True,
     )
     
-    attention_params = sum(p.numel() for p in attention_model.parameters())
+    attention_params = sum(p.numel() for p in full_transformer_model.parameters())
     cross_attention_params = sum(p.numel() for p in cross_attention_model.parameters())
     
     # Cross-attention should have fewer parameters
@@ -676,7 +711,8 @@ def test_two_tower_different_shared_dims():
             num_attention_layers=2,
             max_history_len=50,
             dropout_rate=0.3,
-            user_encoder_type="attention",
+            user_encoder_type="full_transformer",
+            use_post_encoder=True,
         )
         
         batch_size = 4
@@ -703,7 +739,8 @@ def test_two_tower_different_num_heads():
             num_attention_layers=2,
             max_history_len=50,
             dropout_rate=0.3,
-            user_encoder_type="attention",
+            user_encoder_type="full_transformer",
+            use_post_encoder=True,
         )
         
         batch_size = 4
