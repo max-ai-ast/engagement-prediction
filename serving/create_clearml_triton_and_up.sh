@@ -137,7 +137,7 @@ run_model_add() {
       --engine triton \
       --endpoint "$endpoint" \
       --model-id "$model_id" \
-      --input-size "[-1,768]" \
+      --input-size "[-1,-1]" \ 
       --input-name features \
       --input-type float32 \
       --output-size "[-1]" \
@@ -150,7 +150,7 @@ run_model_add() {
       --engine triton \
       --endpoint "$endpoint" \
       --model-id "$model_id" \
-      --input-size "[-1,20,384]" "[-1,20]" "[-1,384]" \
+      --input-size "[-1,-1,-1]" "[-1,-1]" "[-1,-1]" \
       --input-name history_embeddings history_mask post_embeddings\
       --input-type float32 int32 float32 \
       --output-size "[-1]" \
