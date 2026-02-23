@@ -23,7 +23,7 @@ usage() {
 Usage: $(basename "$0") --model-id <model_id> [options]
 
 Options:
-  --model-type <type>     Model type: "mlp" or "two-tower" (required)
+  --model-type <type>     Model type: "mlp", "post", or "user" (required)
   --only-model-add        Only run 'clearml-serving --id ... model add' (no create, no docker compose)
   --serving-id <id>       Existing serving service id (optional; otherwise read from serving/docker.env)
   --service-name <name>   ClearML Serving service name (default: "$service_name")
@@ -88,10 +88,11 @@ if [[ -z "$model_type" ]]; then
 fi
 
 case "$model_type" in
-  mlp|two-tower)
+  mlp|post|user)
     ;;
   *)
-    echo "error: invalid --model-type: $model_type (must be \"mlp\" or \"two-tower\")" >&2
+    echo "error: invalid --model-type: $model_type (must be \"mlp\", \"post\" or \"user\")" >&2
+
     exit 2
     ;;
 esac
@@ -108,8 +109,10 @@ fi
 if [[ -z "$preprocess_path" ]]; then
   if [[ "$model_type" == "mlp" ]]; then
     preprocess_path="serving/preprocess_mlp.py"
-  else
-    preprocess_path="serving/preprocess_two_tower.py"
+  elif [[ "$model_type" == "post" ]]; then
+    preprocess_path="serving/preprocess_post.py"
+  elif [[ "$model_type" == "user" ]]; then
+    preprocess_path="serving/preprocess_user.py"
   fi
 fi
 
@@ -131,8 +134,8 @@ run_model_add() {
   log "Model id: $model_id"
   log "Preprocess: $preprocess_path"
 
+  log "+ clearml-serving --id \"$serving_id\" model add --engine triton --endpoint \"$endpoint\" --model-id \"$model_id\" ..."
   if [[ "$model_type" == "mlp" ]]; then
-    log "+ clearml-serving --id \"$serving_id\" model add --engine triton --endpoint \"$endpoint\" --model-id \"$model_id\" ..."
     clearml-serving --id "$serving_id" model add \
       --engine triton \
       --endpoint "$endpoint" \
@@ -144,18 +147,29 @@ run_model_add() {
       --output-type float32 \
       --output-name probs \
       --preprocess "$preprocess_path"
-  else
-    log "+ clearml-serving --id \"$serving_id\" model add --engine triton --endpoint \"$endpoint\" --model-id \"$model_id\" ..."
+  elif [[ "$model_type" == "post" ]]; then
     clearml-serving --id "$serving_id" model add \
       --engine triton \
       --endpoint "$endpoint" \
       --model-id "$model_id" \
-      --input-size "[-1,-1,-1]" "[-1,-1]" "[-1,-1]" \
-      --input-name history_embeddings history_mask post_embeddings\
-      --input-type float32 int32 float32 \
-      --output-size "[-1]" \
+      --input-size "[-1,-1]" \
+      --input-name post_embeddings \
+      --input-type float32 \
+      --output-size "[-1,-1]" \
       --output-type float32 \
-      --output-name probs \
+      --output-name post_embeddings \
+      --preprocess "$preprocess_path"
+  elif [[ "$model_type" == "user" ]]; then
+    clearml-serving --id "$serving_id" model add \
+      --engine triton \
+      --endpoint "$endpoint" \
+      --model-id "$model_id" \
+      --input-size "[-1,-1,-1]" "[-1,-1]" \
+      --input-name history_embeddings history_mask \
+      --input-type float32 int32 \
+      --output-size "[-1,-1]" \
+      --output-type float32 \
+      --output-name user_embeddings \
       --preprocess "$preprocess_path"
   fi
 }
