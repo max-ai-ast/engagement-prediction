@@ -843,11 +843,17 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
         logger.info(f"Model saved to: {model_path}")
 
-        # save TorchScript file, which is the format needed for ClearML serving
-        torchscript_name = f"torchscript_two_tower_model_{timestamp}"
-        torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
-        torch.jit.script(trained_model).save(torchscript_path)
-        context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
+        # Save TorchScript file, which is the format needed for ClearML serving
+        # Save the post and user towers separately
+        torchscript_user_name = f"torchscript_user_tower_{timestamp}"
+        torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
+        torch.jit.script(trained_model.user_tower.cpu()).save(torchscript_user_path)
+        context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+
+        torchscript_post_name = f"torchscript_post_tower_{timestamp}"
+        torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
+        torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
+        context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
