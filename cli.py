@@ -4,12 +4,13 @@
 Unified CLI for Engagement Prediction Pipeline
 =============================================
 
-Subcommands:
-- run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
+Runs the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate).
+
+Note: The historical `run-all` subcommand is now optional (kept for backwards compatibility).
 
 Usage examples:
-    python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
+    python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
 """
 
 import argparse
@@ -487,15 +488,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Engagement Prediction Pipeline CLI",
         argument_default=argparse.SUPPRESS,
     )
+    # Backwards compatible vestige: `run-all` used to be a subcommand; now it's implicit.
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run-all",
+        choices=["run-all"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--config",
         type=str,
         help="YAML/JSON config file with run-all parameters (CLI flags override config)",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
     # run-all (modular 5-stage end-to-end)
-    p_all = subparsers.add_parser("run-all", help="Run all 5 stages end-to-end. Defaults to background with nohup.")
+    p_all = parser
     # Stage 1 options
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")

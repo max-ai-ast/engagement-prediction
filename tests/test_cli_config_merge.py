@@ -6,7 +6,16 @@ import pytest
 import cli
 
 
-def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # New behavior: `run-all` is optional.
+        ["--config", "{config}", "--epochs", "7", "--batch-size", "512"],
+        # Backwards compatible: still accepts `run-all`.
+        ["--config", "{config}", "run-all", "--epochs", "7", "--batch-size", "512"],
+    ],
+)
+def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path, argv):
     config_path = Path(tmp_path) / "config.yml"
     config_path.write_text(
         textwrap.dedent(
@@ -18,17 +27,7 @@ def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path):
     )
 
     parser = cli.build_parser()
-    args = parser.parse_args(
-        [
-            "--config",
-            str(config_path),
-            "run-all",
-            "--epochs",
-            "7",
-            "--batch-size",
-            "512",
-        ]
-    )
+    args = parser.parse_args([a.format(config=str(config_path)) for a in argv])
 
     merged = cli._merge_args_with_config(args)
 
@@ -38,12 +37,19 @@ def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path):
     assert merged.learning_rate == cli.DEFAULTS["learning_rate"]
 
 
-def test_merge_args_with_config_rejects_unknown_keys(tmp_path):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--config", "{config}"],
+        ["--config", "{config}", "run-all"],
+    ],
+)
+def test_merge_args_with_config_rejects_unknown_keys(tmp_path, argv):
     config_path = Path(tmp_path) / "invalid.yml"
     config_path.write_text("unknown_flag: true\n")
 
     parser = cli.build_parser()
-    args = parser.parse_args(["--config", str(config_path), "run-all"])
+    args = parser.parse_args([a.format(config=str(config_path)) for a in argv])
 
     with pytest.raises(ValueError):
         cli._merge_args_with_config(args)

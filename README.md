@@ -109,10 +109,10 @@ A retrieval-optimized architecture with separate user and post encoders:
 
 Below, replace paths with your actual workspace if different.  
 
-The `run-all` command can be run with command-line args (as in the examples below), or with a YAML config file, e.g.:
+The pipeline can be run with command-line args (as in the examples below), or with a YAML config file, e.g.:
 
 ```bash
-python cli.py --config config.yml run-all
+python cli.py --config config.yml
 ```
 
 Example config file:
@@ -130,12 +130,12 @@ model_type: "two-tower"
 1) Stage 1 — Get data (creates a run dir)  
 The default behavior is to use data from [Green Earth ingex](https://github.com/greenearth-social/ingex) with date filters. For example:
 ```bash
-python cli.py run-all --foreground --use-latest \
+python cli.py --foreground --use-latest \
   --posts-start 2026-01-04 --posts-end 2026-01-04T06:00:00 --likes-start 2026-01-04 --likes-end 2026-01-04T06:00:00
 ```
 Note that there is a default GCS Bucket but it can also be overridden using `--gcs-bucket`. To use Digital Ocean Spaces data instead, specify the data source, e.g.:
 ```bash
-python cli.py run-all --foreground --use-latest \
+python cli.py --foreground --use-latest \
   --data-source digitalocean --max-files-per-table 5 --max-posts-per-author 3 --image-mode auto
 ```
 Creates a run directory like `outputs/<timestamp>_run_d<files>_mppa<cap>/` 
@@ -197,7 +197,7 @@ The previous `src/preprocess.py` → `src/train.py` → `src/evaluate_full_feed_
 #### MLP Model (default)
 Run all six stages with the default MLP architecture:
 ```bash
-python cli.py run-all --user-encoder summarized \
+python cli.py --user-encoder summarized \
   --max-files-per-table 7 --max-posts-per-author 3 --image-mode auto \
   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10 \
   --epochs 300 --batch-size 256 --device cuda
@@ -206,7 +206,7 @@ python cli.py run-all --user-encoder summarized \
 #### Two-Tower Model
 Run all six stages with the two-tower architecture:
 ```bash
-python cli.py run-all --model-type two-tower --user-encoder full_transformer \
+python cli.py --model-type two-tower --user-encoder full_transformer \
   --max-files-per-table 7 --max-posts-per-author 3 --image-mode auto \
   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10 \
   --epochs 100 --batch-size 256 --device cuda
@@ -245,7 +245,7 @@ python utils/05_train/stage_train_two_tower.py \
   --epochs 100 --device cuda
 ```
 
-By default, `run-all` runs in the background with nohup and writes a log under `outputs/run-all_<ts>.log`, then mirrors it to `<run_dir>/run-all.log` once the run directory is created. Use `--foreground` to run interactively.
+By default, the pipeline runs in the background with nohup and writes a log under `outputs/run-all_<ts>.log`, then mirrors it to `<run_dir>/run-all.log` once the run directory is created. Use `--foreground` to run interactively.
 
 ### Two-Tower Output Structure
 
@@ -277,10 +277,10 @@ pytest -q
 
 Two-tower model:
 ```bash
-python cli.py run-all --model-type two-tower --user-encoder full_transformer   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
+python cli.py --model-type two-tower --user-encoder full_transformer   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
 ```
 
 MLP model:
 ```bash
-python cli.py run-all --model-type mlp --user-encoder summarized   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
+python cli.py --model-type mlp --user-encoder summarized   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
 ```
