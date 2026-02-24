@@ -1,22 +1,19 @@
+from __future__ import annotations
+
 import requests
 import numpy as np
 
 def main():
-    url = "http://127.0.0.1:8080/serve/two-tower"
+    url = "http://127.0.0.1:8080/serve/post"
     
     # input dimensions
     batch_size = 3
-    seq_len = 20
     embed_dim = 384
     
     # generate inputs
-    history_embeddings = (np.random.random((batch_size, seq_len, embed_dim,)) - 0.5).tolist()
-    history_mask = np.ones((batch_size, seq_len,)).tolist()
     post_embeddings = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
 
     payload = {
-        "history_embeddings": history_embeddings,
-        "history_mask": history_mask,
         "post_embeddings": post_embeddings
     }
 
