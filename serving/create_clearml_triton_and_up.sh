@@ -25,7 +25,7 @@ Usage: $(basename "$0") --model-id <model_id> [options]
 Options:
   --model-type <type>     Model type: "mlp", "post", or "user" (required)
   --only-model-add        Only run 'clearml-serving --id ... model add' (no create, no docker compose)
-  --serving-id <id>       Existing serving service id (optional; otherwise read from serving/docker.env)
+  --serving-id <id>       Existing serving service id (optional; otherwise read from model_serving/docker.env)
   --service-name <name>   ClearML Serving service name (default: "$service_name")
   --endpoint <endpoint>   Endpoint name (default: <model-type>)
   --preprocess <path>     Preprocess script path (default: based on --model-type)
@@ -108,11 +108,11 @@ fi
 
 if [[ -z "$preprocess_path" ]]; then
   if [[ "$model_type" == "mlp" ]]; then
-    preprocess_path="serving/preprocess_mlp.py"
+    preprocess_path="model_serving/preprocess_mlp.py"
   elif [[ "$model_type" == "post" ]]; then
-    preprocess_path="serving/preprocess_post.py"
+    preprocess_path="model_serving/preprocess_post.py"
   elif [[ "$model_type" == "user" ]]; then
-    preprocess_path="serving/preprocess_user.py"
+    preprocess_path="model_serving/preprocess_user.py"
   fi
 fi
 

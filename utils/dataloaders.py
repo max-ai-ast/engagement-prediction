@@ -393,7 +393,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
     def _forward_up_to_pos_embed(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
         """Project inputs, normalize mask, and add (recency-flipped) positional embeddings.
 
@@ -520,7 +520,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
         """Encode a padded history sequence into a fixed-size representation.
 
@@ -621,7 +621,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
@@ -705,7 +705,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
