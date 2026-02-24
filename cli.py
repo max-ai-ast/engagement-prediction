@@ -264,6 +264,22 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     return final_ns
 
 
+def _build_effective_config_for_background_run(
+    args: argparse.Namespace, *, run_dir: Path, initial_log: Path
+) -> Dict[str, Any]:
+    """Materialize an effective config to re-invoke run-all in the background.
+
+    We prefer passing a config file rather than reconstructing CLI flags from
+    argparse dest names, since some args intentionally use a different flag name
+    (e.g. `use_post_encoder` is controlled via `--post-encoder/--no-post-encoder`).
+    """
+    cfg: Dict[str, Any] = {k: getattr(args, k) for k in DEFAULTS.keys()}
+    cfg["output_dir"] = str(run_dir.resolve())
+    cfg["_initial_log"] = str(initial_log)
+    cfg["foreground"] = True
+    return cfg
+
+
 def _generate_run_name(args: argparse.Namespace) -> str:
     stages_str = "all"
     if args.start_from is not None or args.stop_after is not None:
@@ -316,24 +332,16 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     if not args.foreground:
         # Background via nohup by re-invoking run-all with --foreground and pinned --output-dir
         import shlex
-        cli_args = []
-        for k, v in vars(args).items():
-            if k in ("command", "foreground", "_initial_log", "output_dir", "func"):
-                continue
-            if v is None or v is False:
-                continue
-            opt = f"--{k.replace('_','-')}"
-            if isinstance(v, bool):
-                cli_args.append(opt)
-            elif isinstance(v, list):
-                cli_args.extend([opt] + [str(x) for x in v])
-            else:
-                cli_args.extend([opt, str(v)])
-        cli_args.extend(["--foreground", "--_initial-log", str(initial_log), "--output-dir", str(run_dir.resolve())])
+        effective_config = _build_effective_config_for_background_run(
+            args, run_dir=run_dir, initial_log=initial_log
+        )
+        effective_config_path = run_dir / "run-all.effective-config.json"
+        effective_config_path.write_text(json.dumps(effective_config, indent=2, sort_keys=True) + "\n")
+        cli_args = ["--config", str(effective_config_path)]
 
         py = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
-        args_str = ' '.join(shlex.quote(a) for a in (["run-all"] + cli_args))
+        args_str = ' '.join(shlex.quote(a) for a in cli_args)
         redir = shlex.quote(str(initial_log))
         cmd = f"nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
         print(f"▶️  Backgrounding run-all with nohup. Log: {initial_log}")
