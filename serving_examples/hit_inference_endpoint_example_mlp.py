@@ -9,12 +9,14 @@ def main():
     embed_dim = 384
     
     # generate inputs
-    user_embed = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
-    post_embed = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
+    user_summary = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
+    post_embeddings = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
 
     payload = {
-        "user": user_embed,
-        "post": post_embed
+        # summarized mode convention: pass [B, 1, D] history with summary at position 0
+        "history_embeddings": [[u] for u in user_summary],
+        # "history_mask" is optional when seq_len == 1
+        "post_embeddings": post_embeddings,
     }
 
     # hit api

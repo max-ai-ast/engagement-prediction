@@ -434,6 +434,28 @@ def test_two_tower_forward_both_encoder_types():
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
         assert scores.shape == (batch_size,)
 
+def test_two_tower_summarized_user_tower_torchscript():
+    """Test summarized user_tower can be TorchScript scripted (serving artifact)."""
+    embed_dim = 128
+    model = TwoTowerModel(
+        post_embedding_dim=embed_dim,
+        shared_dim=embed_dim,
+        user_hidden_dim=64,
+        post_hidden_dim=64,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=20,
+        dropout_rate=0.1,
+        user_encoder_type="summarized",
+        use_post_encoder=False,
+    )
+
+    scripted = torch.jit.script(model.user_tower)
+    history_embeddings = torch.randn(4, 1, embed_dim)
+    history_mask = torch.ones(4, 1, dtype=torch.bool)
+    out = scripted(history_embeddings, history_mask)
+    assert out.shape == (4, embed_dim)
+
 
 # =============================================================================
 # TwoTowerModel Tests - compute_loss_and_preds

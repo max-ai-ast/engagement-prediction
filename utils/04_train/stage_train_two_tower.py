@@ -118,6 +118,7 @@ from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
     SummarizedEngagementDataset,
+    SummarizedUserTower,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
     create_data_loaders,
@@ -197,31 +198,6 @@ class PostTower(nn.Module):
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
-
-class _SummarizedUserTower(nn.Module):
-    """User "tower" for summarized mode.
-
-    Serving/training convention: represent the summarized user vector as a
-    (possibly padded) length-T sequence where the summary lives at position 0:
-
-        history_embeddings[:, 0, :] == user_summary
-
-    This makes the model's `forward()` signature consistent across encoder types.
-    """
-
-    def forward(
-        self,
-        history_embeddings: torch.Tensor,
-        history_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if history_embeddings.ndim != 3:
-            raise ValueError(
-                f"Expected history_embeddings with shape [B, T, D] (or [B, D] for legacy), got {tuple(history_embeddings.shape)}"
-            )
-        # Summary lives in the first (unmasked) slot by convention.
-        return history_embeddings[:, 0, :]
-
-
 class TwoTowerModel(nn.Module):
     """Two-tower engagement prediction model with pluggable user encoders.
     
@@ -311,7 +287,7 @@ class TwoTowerModel(nn.Module):
             # (e.g., mean/EMA/linear-recency summary). The model treats the
             # history input as an already-encoded user embedding (placed at
             # position 0 in a padded sequence for a consistent forward() signature).
-            self.user_tower = _SummarizedUserTower()
+            self.user_tower = SummarizedUserTower()
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.

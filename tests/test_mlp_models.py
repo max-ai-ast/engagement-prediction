@@ -6,46 +6,60 @@ import torch.nn as nn
 
 # Import from module with numeric prefix
 stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
-SummarizedMLP = stage_train_mlp.SummarizedMLP
-AttentionMLP = stage_train_mlp.AttentionMLP
+MLPModel = stage_train_mlp.MLPModel
 
 
 # =============================================================================
-# SummarizedMLP Tests
+# MLPModel (summarized) Tests
 # =============================================================================
 
 def test_summarized_mlp_initialization():
-    """Test SummarizedMLP initializes with correct architecture."""
-    model = SummarizedMLP(
-        input_dim=768,
+    """Test summarized MLPModel initializes with correct architecture."""
+    model = MLPModel(
+        post_embedding_dim=384,
         hidden_dims=[512, 256, 128],
         dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=384,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
     # Check model has the expected structure
-    assert isinstance(model.network, nn.Sequential)
+    assert isinstance(model.mlp_head, nn.Sequential)
     
     # Count linear layers (should be len(hidden_dims) + 1 for output)
-    linear_layers = [m for m in model.network.modules() if isinstance(m, nn.Linear)]
+    linear_layers = [m for m in model.mlp_head.modules() if isinstance(m, nn.Linear)]
     assert len(linear_layers) == 4  # 3 hidden + 1 output
 
 
 def test_summarized_mlp_forward_shape():
-    """Test SummarizedMLP forward pass produces correct output shape."""
+    """Test summarized MLPModel forward pass produces correct output shape."""
     batch_size = 16
-    input_dim = 768
+    embed_dim = 384
     
-    model = SummarizedMLP(
-        input_dim=input_dim,
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[512, 256],
         dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=embed_dim,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    # Create random input
-    x = torch.randn(batch_size, input_dim)
+    history_embeddings = torch.randn(batch_size, 1, embed_dim)
+    history_mask = torch.ones(batch_size, 1, dtype=torch.bool)
+    post_embedding = torch.randn(batch_size, embed_dim)
     
     # Forward pass
-    output = model.forward(x)
+    output = model.forward(history_embeddings, history_mask, post_embedding)
     
     # Check output shape and range
     assert output.shape == (batch_size, 1)
@@ -54,43 +68,71 @@ def test_summarized_mlp_forward_shape():
 
 
 def test_summarized_mlp_single_hidden_layer():
-    """Test SummarizedMLP with single hidden layer."""
-    model = SummarizedMLP(
-        input_dim=256,
+    """Test summarized MLPModel with single hidden layer."""
+    embed_dim = 128
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[128],
         dropout_rate=0.2,
+        user_hidden_dim=64,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=20,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    x = torch.randn(8, 256)
-    output = model.forward(x)
+    history_embeddings = torch.randn(8, 1, embed_dim)
+    history_mask = torch.ones(8, 1, dtype=torch.bool)
+    post_embedding = torch.randn(8, embed_dim)
+    output = model.forward(history_embeddings, history_mask, post_embedding)
     
     assert output.shape == (8, 1)
 
 
 def test_summarized_mlp_multiple_hidden_layers():
-    """Test SummarizedMLP with multiple hidden layers."""
-    model = SummarizedMLP(
-        input_dim=1024,
+    """Test summarized MLPModel with multiple hidden layers."""
+    embed_dim = 512
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[512, 256, 128, 64],
         dropout_rate=0.4,
+        user_hidden_dim=256,
+        user_output_dim=embed_dim,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    x = torch.randn(4, 1024)
-    output = model.forward(x)
+    history_embeddings = torch.randn(4, 1, embed_dim)
+    history_mask = torch.ones(4, 1, dtype=torch.bool)
+    post_embedding = torch.randn(4, embed_dim)
+    output = model.forward(history_embeddings, history_mask, post_embedding)
     
     assert output.shape == (4, 1)
 
 
 def test_summarized_mlp_compute_loss_and_preds():
-    """Test SummarizedMLP compute_loss_and_preds method."""
-    model = SummarizedMLP(
-        input_dim=768,
+    """Test summarized MLPModel compute_loss_and_preds method (features path)."""
+    embed_dim = 384
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[256, 128],
         dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=embed_dim,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
     batch = {
-        "features": torch.randn(16, 768),
+        "features": torch.randn(16, 2 * embed_dim),
         "label": torch.randint(0, 2, (16,)).float(),
     }
     
@@ -108,18 +150,28 @@ def test_summarized_mlp_compute_loss_and_preds():
 
 
 def test_summarized_mlp_backward_pass():
-    """Test SummarizedMLP gradients flow correctly."""
-    model = SummarizedMLP(
-        input_dim=256,
+    """Test summarized MLPModel gradients flow correctly."""
+    embed_dim = 128
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[128, 64],
         dropout_rate=0.2,
+        user_hidden_dim=64,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=20,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    x = torch.randn(8, 256)
+    history_embeddings = torch.randn(8, 1, embed_dim)
+    history_mask = torch.ones(8, 1, dtype=torch.bool)
+    post_embedding = torch.randn(8, embed_dim)
     labels = torch.randint(0, 2, (8,)).float()
     
     # Forward
-    output = model.forward(x).squeeze(-1)
+    output = model.forward(history_embeddings, history_mask, post_embedding).squeeze(-1)
     loss = nn.functional.binary_cross_entropy(output, labels)
     
     # Backward
@@ -131,23 +183,33 @@ def test_summarized_mlp_backward_pass():
 
 
 def test_summarized_mlp_eval_mode():
-    """Test SummarizedMLP behaves differently in eval mode (dropout)."""
-    model = SummarizedMLP(
-        input_dim=256,
+    """Test summarized MLPModel behaves differently in eval mode (dropout)."""
+    embed_dim = 128
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[128],
         dropout_rate=0.5,  # High dropout for testing
+        user_hidden_dim=64,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=20,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    x = torch.randn(16, 256)
+    history_embeddings = torch.randn(16, 1, embed_dim)
+    history_mask = torch.ones(16, 1, dtype=torch.bool)
+    post_embedding = torch.randn(16, embed_dim)
     
     # Train mode - run multiple times, should get different results
     model.train()
-    outputs_train = [model.forward(x) for _ in range(3)]
+    outputs_train = [model.forward(history_embeddings, history_mask, post_embedding) for _ in range(3)]
     
     # Eval mode - should be deterministic
     model.eval()
     with torch.no_grad():
-        outputs_eval = [model.forward(x) for _ in range(3)]
+        outputs_eval = [model.forward(history_embeddings, history_mask, post_embedding) for _ in range(3)]
     
     # Eval outputs should be identical
     for i in range(len(outputs_eval) - 1):
@@ -155,27 +217,85 @@ def test_summarized_mlp_eval_mode():
 
 
 def test_summarized_mlp_zero_dropout():
-    """Test SummarizedMLP with zero dropout."""
-    model = SummarizedMLP(
-        input_dim=256,
+    """Test summarized MLPModel with zero dropout."""
+    embed_dim = 128
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[128, 64],
         dropout_rate=0.0,
+        user_hidden_dim=64,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=20,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    x = torch.randn(8, 256)
-    output = model.forward(x)
+    history_embeddings = torch.randn(8, 1, embed_dim)
+    history_mask = torch.ones(8, 1, dtype=torch.bool)
+    post_embedding = torch.randn(8, embed_dim)
+    output = model.forward(history_embeddings, history_mask, post_embedding)
     
     assert output.shape == (8, 1)
 
+def test_summarized_mlp_torchscript():
+    """Test summarized MLPModel can be TorchScript scripted (serving artifact)."""
+    embed_dim = 128
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[64],
+        dropout_rate=0.1,
+        user_hidden_dim=64,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=20,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
+    )
+
+    scripted = torch.jit.script(model)
+    history_embeddings = torch.randn(4, 1, embed_dim)
+    history_mask = torch.ones(4, 1, dtype=torch.bool)
+    post_embedding = torch.randn(4, embed_dim)
+    out = scripted(history_embeddings, history_mask, post_embedding)
+    assert out.shape == (4, 1)
+
+def test_full_transformer_mlp_torchscript_no_sdpa():
+    """TorchScript for full_transformer should avoid aten::scaled_dot_product_attention (Triton compatibility)."""
+    embed_dim = 128
+    seq_len = 10
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[64],
+        dropout_rate=0.1,
+        user_hidden_dim=64,
+        user_output_dim=32,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=seq_len,
+        attention_dropout=0.1,
+        user_encoder_type="full_transformer",
+    )
+
+    scripted = torch.jit.script(model)
+    assert "scaled_dot_product_attention" not in scripted.code
+
+    history_embeddings = torch.randn(2, seq_len, embed_dim)
+    history_mask = torch.ones(2, seq_len, dtype=torch.bool)
+    post_embedding = torch.randn(2, embed_dim)
+    out = scripted(history_embeddings, history_mask, post_embedding)
+    assert out.shape == (2, 1)
 
 # =============================================================================
-# AttentionMLP Tests
+# MLPModel (full_transformer) Tests
 # =============================================================================
 
 def test_attention_mlp_initialization():
-    """Test AttentionMLP initializes correctly."""
-    model = AttentionMLP(
-        embed_dim=384,
+    """Test full_transformer MLPModel initializes correctly."""
+    model = MLPModel(
+        post_embedding_dim=384,
         hidden_dims=[256, 128],
         dropout_rate=0.3,
         user_hidden_dim=256,
@@ -184,9 +304,10 @@ def test_attention_mlp_initialization():
         num_attention_layers=2,
         max_history_len=50,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
-    assert model.embed_dim == 384
+    assert model.post_embedding_dim == 384
     assert model.user_output_dim == 128
     assert hasattr(model, "user_encoder")
     assert hasattr(model, "mlp_head")
@@ -194,13 +315,13 @@ def test_attention_mlp_initialization():
 
 
 def test_attention_mlp_forward_shape():
-    """Test AttentionMLP forward pass produces correct output shape."""
+    """Test full_transformer MLPModel forward pass produces correct output shape."""
     batch_size = 16
     seq_len = 50
     embed_dim = 384
     
-    model = AttentionMLP(
-        embed_dim=embed_dim,
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[256, 128],
         dropout_rate=0.3,
         user_hidden_dim=256,
@@ -209,6 +330,7 @@ def test_attention_mlp_forward_shape():
         num_attention_layers=2,
         max_history_len=seq_len,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
     # Create random inputs
@@ -226,13 +348,13 @@ def test_attention_mlp_forward_shape():
 
 
 def test_attention_mlp_with_mask():
-    """Test AttentionMLP correctly uses history mask."""
+    """Test full_transformer MLPModel correctly uses history mask."""
     batch_size = 8
     seq_len = 20
     embed_dim = 128
     
-    model = AttentionMLP(
-        embed_dim=embed_dim,
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[64],
         dropout_rate=0.2,
         user_hidden_dim=64,
@@ -241,6 +363,7 @@ def test_attention_mlp_with_mask():
         num_attention_layers=1,
         max_history_len=seq_len,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
     # Create inputs with partial masking
@@ -255,13 +378,13 @@ def test_attention_mlp_with_mask():
 
 
 def test_attention_mlp_empty_history():
-    """Test AttentionMLP with empty history (all-False mask)."""
+    """Test full_transformer MLPModel with empty history (all-False mask)."""
     batch_size = 4
     seq_len = 20
     embed_dim = 128
     
-    model = AttentionMLP(
-        embed_dim=embed_dim,
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[64],
         dropout_rate=0.2,
         user_hidden_dim=64,
@@ -270,6 +393,7 @@ def test_attention_mlp_empty_history():
         num_attention_layers=1,
         max_history_len=seq_len,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
     # Empty history - all zeros with all-False mask
@@ -284,9 +408,9 @@ def test_attention_mlp_empty_history():
 
 
 def test_attention_mlp_compute_loss_and_preds():
-    """Test AttentionMLP compute_loss_and_preds method."""
-    model = AttentionMLP(
-        embed_dim=384,
+    """Test full_transformer MLPModel compute_loss_and_preds method."""
+    model = MLPModel(
+        post_embedding_dim=384,
         hidden_dims=[256, 128],
         dropout_rate=0.3,
         user_hidden_dim=256,
@@ -295,6 +419,7 @@ def test_attention_mlp_compute_loss_and_preds():
         num_attention_layers=2,
         max_history_len=50,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
     batch_size = 16
@@ -319,13 +444,13 @@ def test_attention_mlp_compute_loss_and_preds():
 
 
 def test_attention_mlp_different_sequence_lengths():
-    """Test AttentionMLP with different sequence lengths via masking."""
+    """Test full_transformer MLPModel with different sequence lengths via masking."""
     batch_size = 8
     seq_len = 30
     embed_dim = 128
     
-    model = AttentionMLP(
-        embed_dim=embed_dim,
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[64],
         dropout_rate=0.2,
         user_hidden_dim=64,
@@ -334,6 +459,7 @@ def test_attention_mlp_different_sequence_lengths():
         num_attention_layers=1,
         max_history_len=seq_len,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, embed_dim)
@@ -352,9 +478,9 @@ def test_attention_mlp_different_sequence_lengths():
 
 
 def test_attention_mlp_backward_pass():
-    """Test AttentionMLP gradients flow correctly."""
-    model = AttentionMLP(
-        embed_dim=128,
+    """Test full_transformer MLPModel gradients flow correctly."""
+    model = MLPModel(
+        post_embedding_dim=128,
         hidden_dims=[64],
         dropout_rate=0.2,
         user_hidden_dim=64,
@@ -363,6 +489,7 @@ def test_attention_mlp_backward_pass():
         num_attention_layers=1,
         max_history_len=20,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
     batch_size = 8
@@ -384,9 +511,9 @@ def test_attention_mlp_backward_pass():
 
 
 def test_attention_mlp_eval_mode():
-    """Test AttentionMLP behaves consistently in eval mode."""
-    model = AttentionMLP(
-        embed_dim=128,
+    """Test full_transformer MLPModel behaves consistently in eval mode."""
+    model = MLPModel(
+        post_embedding_dim=128,
         hidden_dims=[64],
         dropout_rate=0.5,
         user_hidden_dim=64,
@@ -395,6 +522,7 @@ def test_attention_mlp_eval_mode():
         num_attention_layers=1,
         max_history_len=20,
         attention_dropout=0.3,
+        user_encoder_type="full_transformer",
     )
     
     batch_size = 8
@@ -416,15 +544,15 @@ def test_attention_mlp_eval_mode():
 
 
 def test_attention_mlp_attention_heads():
-    """Test AttentionMLP with different numbers of attention heads."""
+    """Test full_transformer MLPModel with different numbers of attention heads."""
     embed_dim = 128
     
     for num_heads in [1, 2, 4, 8]:
         # user_hidden_dim must be divisible by num_heads
         user_hidden_dim = 64 if num_heads <= 4 else 128
         
-        model = AttentionMLP(
-            embed_dim=embed_dim,
+        model = MLPModel(
+            post_embedding_dim=embed_dim,
             hidden_dims=[64],
             dropout_rate=0.2,
             user_hidden_dim=user_hidden_dim,
@@ -433,6 +561,7 @@ def test_attention_mlp_attention_heads():
             num_attention_layers=1,
             max_history_len=20,
             attention_dropout=0.1,
+            user_encoder_type="full_transformer",
         )
         
         history_embeddings = torch.randn(4, 20, embed_dim)
@@ -444,12 +573,12 @@ def test_attention_mlp_attention_heads():
 
 
 def test_attention_mlp_attention_layers():
-    """Test AttentionMLP with different numbers of attention layers."""
+    """Test full_transformer MLPModel with different numbers of attention layers."""
     embed_dim = 128
     
     for num_layers in [1, 2, 3, 4]:
-        model = AttentionMLP(
-            embed_dim=embed_dim,
+        model = MLPModel(
+            post_embedding_dim=embed_dim,
             hidden_dims=[64],
             dropout_rate=0.2,
             user_hidden_dim=64,
@@ -458,6 +587,7 @@ def test_attention_mlp_attention_layers():
             num_attention_layers=num_layers,
             max_history_len=20,
             attention_dropout=0.1,
+            user_encoder_type="full_transformer",
         )
         
         history_embeddings = torch.randn(4, 20, embed_dim)
@@ -473,15 +603,22 @@ def test_attention_mlp_attention_layers():
 # =============================================================================
 
 def test_models_different_architectures():
-    """Test that SummarizedMLP and AttentionMLP have different architectures."""
-    summarized_mlp = SummarizedMLP(
-        input_dim=768,
+    """Test that summarized and full_transformer variants have different parameter counts."""
+    summarized_mlp = MLPModel(
+        post_embedding_dim=384,
         hidden_dims=[256, 128],
         dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=384,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    attention_mlp = AttentionMLP(
-        embed_dim=384,
+    attention_mlp = MLPModel(
+        post_embedding_dim=384,
         hidden_dims=[256, 128],
         dropout_rate=0.3,
         user_hidden_dim=256,
@@ -490,25 +627,34 @@ def test_models_different_architectures():
         num_attention_layers=2,
         max_history_len=50,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
-    # AttentionMLP should have more parameters due to encoder
+    # full_transformer variant should have more parameters due to encoder
     summarized_params = sum(p.numel() for p in summarized_mlp.parameters())
     attention_params = sum(p.numel() for p in attention_mlp.parameters())
     
-    assert attention_params > summarized_params, "AttentionMLP should have more parameters"
+    assert attention_params > summarized_params, "full_transformer variant should have more parameters"
 
 
 def test_models_output_same_type():
     """Test that both models produce compatible outputs."""
-    summarized_mlp = SummarizedMLP(
-        input_dim=768,
+    embed_dim = 384
+    summarized_mlp = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[256],
         dropout_rate=0.3,
+        user_hidden_dim=128,
+        user_output_dim=embed_dim,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=20,
+        attention_dropout=0.1,
+        user_encoder_type="summarized",
     )
     
-    attention_mlp = AttentionMLP(
-        embed_dim=384,
+    attention_mlp = MLPModel(
+        post_embedding_dim=embed_dim,
         hidden_dims=[256],
         dropout_rate=0.3,
         user_hidden_dim=128,
@@ -517,16 +663,19 @@ def test_models_output_same_type():
         num_attention_layers=1,
         max_history_len=20,
         attention_dropout=0.1,
+        user_encoder_type="full_transformer",
     )
     
-    # SummarizedMLP output
-    x1 = torch.randn(8, 768)
-    out1 = summarized_mlp.forward(x1)
+    # Summarized output (summary token at position 0)
+    history1 = torch.randn(8, 1, embed_dim)
+    mask1 = torch.ones(8, 1, dtype=torch.bool)
+    post1 = torch.randn(8, embed_dim)
+    out1 = summarized_mlp.forward(history1, mask1, post1)
     
-    # AttentionMLP output
-    history = torch.randn(8, 20, 384)
+    # Full transformer output
+    history = torch.randn(8, 20, embed_dim)
     mask = torch.ones(8, 20, dtype=torch.bool)
-    post = torch.randn(8, 384)
+    post = torch.randn(8, embed_dim)
     out2 = attention_mlp.forward(history, mask, post)
     
     # Both should produce same shape and type
