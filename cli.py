@@ -299,6 +299,22 @@ def _generate_run_name(args: argparse.Namespace) -> str:
     return stages_str
 
 
+def _resolve_run_dir(args: argparse.Namespace, *, outputs_dir: Path, run_name: str) -> Path:
+    """Resolve the effective run directory as an absolute path.
+
+    ClearML remote execution may run with a different working directory than local runs.
+    If `--output-dir` is provided as a relative path, interpret it relative to the repo root
+    (this file's directory) to keep behavior stable across environments.
+    """
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir:
+        p = Path(str(output_dir)).expanduser()
+        if not p.is_absolute():
+            p = (TINKERING_DIR / p)
+        return p.resolve()
+    return (Path(outputs_dir) / run_name).resolve()
+
+
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 5-stage pipeline.
 
@@ -310,14 +326,11 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     # Create run_dir deterministically up front
     run_name = f"{timestamp}_{_generate_run_name(args)}"
-    if args.output_dir:
-        run_dir = Path(args.output_dir)
-    else:
-        if args.run_name:
-            rn = str(args.run_name).strip().replace(' ', '_')
-            if rn:
-                run_name = f"{run_name}_{rn}"
-        run_dir = outputs_dir / run_name
+    if (not getattr(args, "output_dir", None)) and args.run_name:
+        rn = str(args.run_name).strip().replace(' ', '_')
+        if rn:
+            run_name = f"{run_name}_{rn}"
+    run_dir = _resolve_run_dir(args, outputs_dir=outputs_dir, run_name=run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose log path inside run_dir
@@ -375,6 +388,11 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
     args = tracker.connect_args(args)
+    # Re-resolve run_dir after ClearML connects args, since output_dir might have been overridden.
+    run_dir = _resolve_run_dir(args, outputs_dir=outputs_dir, run_name=run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure args.output_dir is set so subsequent stages use this run_dir (and so Context uses an absolute path).
+    setattr(args, 'output_dir', str(run_dir))
     tracking_payload = {
         "run": _build_tracking_params(args, run_dir),
         "overrides": _extract_overrides(args),
@@ -382,9 +400,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     tracker.log_params(normalize_params(tracking_payload))
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
     ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
-
-    # Ensure args.output_dir is set so subsequent stages use this run_dir
-    setattr(args, 'output_dir', str(run_dir.resolve()))
     return cmd__run_all_exec(args, ctx)
 
 
