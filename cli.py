@@ -154,68 +154,6 @@ def _extract_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     return overrides
 
 
-def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str, Any]:
-    return {
-        "meta": {
-            "run_dir": str(run_dir),
-            "run_tag": args.run_tag,
-            "start_from": args.start_from,
-            "stop_after": args.stop_after,
-            "cap_random_seed": args.cap_random_seed,
-            "random_seed": args.random_seed,
-            "foreground": args.foreground,
-        },
-        "data": {
-            "gcs_bucket": args.gcs_bucket,
-            "posts_start": args.posts_start,
-            "posts_end": args.posts_end,
-            "likes_start": args.likes_start,
-            "likes_end": args.likes_end,
-            "max_liking_users": args.max_liking_users,
-            "max_likes_per_user": args.max_likes_per_user,
-            "min_likes_per_user": args.min_likes_per_user,
-            "negative_posts_sample": args.negative_posts_sample,
-            "embedding_model": args.embedding_model,
-            "max_memory_gb": args.max_memory_gb,
-            "max_memory_pct": args.max_memory_pct,
-        },
-        "train": {
-            "user_summarization": args.user_summarization,
-            "ema_alpha": args.ema_alpha,
-            "user_encoder": args.user_encoder,
-            "model_type": args.model_type,
-            "shared_dim": args.shared_dim,
-            "user_hidden_dim": args.user_hidden_dim,
-            "post_hidden_dim": args.post_hidden_dim,
-            "num_attention_heads": args.num_attention_heads,
-            "num_attention_layers": args.num_attention_layers,
-            "max_history_len": args.max_history_len,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "weight_decay_mlp": args.weight_decay_mlp,
-            "weight_decay_two_tower": args.weight_decay_two_tower,
-            "hidden_dims": args.hidden_dims,
-            "dropout_rate_mlp": args.dropout_rate_mlp,
-            "dropout_rate_two_tower": args.dropout_rate_two_tower,
-            "prediction_posts_per_user": args.prediction_posts_per_user,
-            "patience": args.patience,
-            "device": args.device,
-            "num_dataloader_workers": args.num_dataloader_workers,
-            "dataloader_pin_memory": args.dataloader_pin_memory,
-            "dataloader_persistent_workers": args.dataloader_persistent_workers,
-            "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
-            "lr_scheduler_factor": args.lr_scheduler_factor,
-            "lr_scheduler_patience": args.lr_scheduler_patience,
-            "gradient_clip_max_norm": args.gradient_clip_max_norm,
-        },
-        "eval": {
-            "eval_batch_size": args.eval_batch_size,
-            "eval_max_users": args.eval_max_users,
-        },
-    }
-
-
 def _load_config_file(path_str: str) -> Dict[str, Any]:
     """Load a YAML (or JSON) config file mapping CLI args to values."""
     path = Path(path_str).expanduser()
@@ -392,20 +330,11 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # Foreground execution: initialize experiment tracker and run
     # Only initialize ClearML here (not before backgrounding) to avoid creating
     # a task in the parent process that gets "aborted" when the parent exits.
-    tags = args.experiment_tags
-    if tags is None:
-        tags_list = []
-    elif isinstance(tags, str):
-        tags_list = [tags]
-    else:
-        tags_list = list(tags)
-    tags_list.append(f"run_ts:{run_timestamp}")
-    
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
         task_name=args.experiment_task or run_name,
-        tags=tags_list,
+        tags=args.experiment_tags,
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
@@ -415,11 +344,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     # Ensure args.output_dir is set so subsequent stages use this run_dir (and so Context uses an absolute path).
     setattr(args, 'output_dir', str(run_dir))
-    tracking_payload = {
-        "run": _build_tracking_params(args, run_dir),
-        "overrides": _extract_overrides(args),
-    }
-    tracker.log_params(normalize_params(tracking_payload))
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
     ctx = Context(run_dir=run_dir, run_timestamp=run_timestamp, use_latest=True, tracker=tracker)
     return cmd__run_all_exec(args, ctx)
