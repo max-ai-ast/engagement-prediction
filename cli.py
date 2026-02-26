@@ -10,7 +10,7 @@ Note: The historical `run-all` subcommand is now optional (kept for backwards co
 
 Usage examples:
     python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
+    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml
 """
 
 import argparse
@@ -110,7 +110,8 @@ DEFAULTS: Dict[str, Any] = {
     "stop_after": None,
     "pick_prior": False,
     # Execution behavior
-    "foreground": False,
+    # Default is foreground execution (recommended for ClearML remote execution).
+    "background": False,
     "_initial_log": None,
     # Experiment tracking
     "experiment_tracker": "clearml",
@@ -214,7 +215,8 @@ def _build_effective_config_for_background_run(
     cfg: Dict[str, Any] = {k: getattr(args, k) for k in DEFAULTS.keys()}
     cfg["output_dir"] = str(run_dir.resolve())
     cfg["_initial_log"] = str(initial_log)
-    cfg["foreground"] = True
+    # Prevent recursive backgrounding: the child process should run in the foreground.
+    cfg["background"] = False
     return cfg
 
 
@@ -257,7 +259,7 @@ def _resolve_run_dir(args: argparse.Namespace, *, outputs_dir: Path, run_name: s
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 5-stage pipeline.
 
-    Creates a run directory up front and backgrounds itself with nohup unless --foreground.
+    Creates a run directory up front and backgrounds itself with nohup if --background.
     """
     outputs_dir = OUTPUTS_DIR
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -288,8 +290,9 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
-    if not args.foreground:
-        # Background via nohup by re-invoking run-all with --foreground and pinned --output-dir
+    if bool(args.background):
+        # Background via nohup by re-invoking run-all in the foreground (background disabled)
+        # with a pinned --output-dir.
         import shlex
         effective_config = _build_effective_config_for_background_run(
             args, run_dir=run_dir, initial_log=initial_log
@@ -412,7 +415,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         if len(subdirs) <= 1:
             return
         # Prompt only in foreground mode
-        if not bool(args.foreground):
+        if bool(args.background):
             return
         subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         print(f"\nPick prior output for stage '{stage_key}' under {base}:")
@@ -627,8 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
-    _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Run in foreground (default: background with nohup)")
+    _add_arg_with_default(p_all, "--background", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Run in background with nohup (default: foreground)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     # Experiment tracking
     _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,

@@ -121,7 +121,7 @@ posts_start: "2026-01-04"
 posts_end: "2026-01-04T02:00:00"
 likes_start: "2026-01-04"
 likes_end: "2026-01-04T02:00:00"
-foreground: true
+background: false
 output_dir: "/path/to/outputs"
 start_from: "train"
 model_type: "two-tower" 
@@ -130,12 +130,12 @@ model_type: "two-tower"
 1) Stage 1 — Get data (creates a run dir)  
 The default behavior is to use data from [Green Earth ingex](https://github.com/greenearth-social/ingex) with date filters. For example:
 ```bash
-python cli.py --foreground --use-latest \
+python cli.py --use-latest \
   --posts-start 2026-01-04 --posts-end 2026-01-04T06:00:00 --likes-start 2026-01-04 --likes-end 2026-01-04T06:00:00
 ```
 Note that there is a default GCS Bucket but it can also be overridden using `--gcs-bucket`. To use Digital Ocean Spaces data instead, specify the data source, e.g.:
 ```bash
-python cli.py --foreground --use-latest \
+python cli.py --use-latest \
   --data-source digitalocean --max-files-per-table 5 --max-posts-per-author 3 --image-mode auto
 ```
 Creates a run directory like `outputs/<timestamp>_run_d<files>_mppa<cap>/` 
@@ -245,7 +245,7 @@ python utils/05_train/stage_train_two_tower.py \
   --epochs 100 --device cuda
 ```
 
-By default, the pipeline runs in the background with nohup and writes a log under `outputs/run-all_<ts>.log`, then mirrors it to `<run_dir>/run-all.log` once the run directory is created. Use `--foreground` to run interactively.
+By default, the pipeline runs in the foreground. Use `--background` to run with nohup and write a log under `outputs/run-all_<ts>.log` (mirrored to `<run_dir>/run-all.log` once the run directory is created).
 
 ### Two-Tower Output Structure
 

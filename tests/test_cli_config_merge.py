@@ -67,7 +67,7 @@ def test_background_effective_config_preserves_no_post_encoder(tmp_path):
     )
 
     assert cfg["use_post_encoder"] is False
-    assert cfg["foreground"] is True
+    assert cfg["background"] is False
     assert cfg["output_dir"] == str(run_dir.resolve())
     assert cfg["_initial_log"] == str(initial_log)
 

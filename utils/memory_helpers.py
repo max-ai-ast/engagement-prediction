@@ -1072,7 +1072,6 @@ def _build_cli_args(params: Dict[str, Any], experiment_name: str, tags: List[str
         else:
             args.extend([flag, str(value)])
     
-    args.append('--foreground')
     return args
 
 
