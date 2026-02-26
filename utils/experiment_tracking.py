@@ -200,7 +200,7 @@ class ClearMLExperimentTracker:
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         self._task.connect(params, name=name)
 
-    def connect_args(self, args: argparse.Namespace, name: Optional[str]) -> argparse.Namespace:
+    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
         """Connect an argparse.Namespace to ClearML and return the (possibly) updated args.
 
         This is useful for ClearML remote execution where parameter values might be overridden
