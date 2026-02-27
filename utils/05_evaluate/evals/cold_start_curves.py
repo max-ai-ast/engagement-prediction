@@ -12,7 +12,6 @@ made.  Predictions are binned by that per-row value so the analysis operates at
 the post level, not the user level.
 
 For each performance metric one plot is produced showing:
-- A thin gray curve per user (that user's binned metric values)
 - One bold aggregate curve computed across all predictions in each bin
 
 Only precision, recall, and F1 are plotted.  Accuracy and AUC-ROC are
@@ -137,10 +136,6 @@ class ColdStartCurvesModule(EvalModule):
         binned_path = out_dir / "binned_metrics.csv"
         binned_metrics.to_csv(binned_path, index=False)
 
-        # Per-user metrics per bin
-        print(f"    Computing per-user binned metrics for {n_users} users...")
-        per_user_binned = self._compute_per_user_binned_metrics(predictions_df, bin_edges)
-
         # One plot per metric
         print("    Generating cold start curve plots (one per metric)...")
         plot_paths = {}
@@ -154,7 +149,6 @@ class ColdStartCurvesModule(EvalModule):
             self._plot_cold_start_per_metric(
                 metric=metric,
                 binned_metrics=binned_metrics,
-                per_user_binned=per_user_binned,
                 save_path=plot_path,
             )
             plot_paths[f"{metric}_plot_path"] = str(plot_path)
@@ -342,42 +336,6 @@ class ColdStartCurvesModule(EvalModule):
 
         return pd.DataFrame(rows)
 
-    def _compute_per_user_binned_metrics(
-        self,
-        predictions_df: pd.DataFrame,
-        bin_edges: List[float],
-    ) -> Dict[str, pd.DataFrame]:
-        """
-        For each user compute the same metrics per bin (only for bins where
-        they have predictions).
-
-        Returns:
-            Dict mapping did -> DataFrame with columns [bin, <metric>, ...]
-            using the same bin ordering as the aggregate table.
-        """
-        bin_labels = self._make_bin_labels(bin_edges)
-        result: Dict[str, pd.DataFrame] = {}
-
-        for did, user_df in predictions_df.groupby('did'):
-            rows = []
-            for bin_label in bin_labels:
-                bin_data = user_df[user_df['likes_bin'] == bin_label]
-                if len(bin_data) == 0:
-                    continue
-
-                y_true = bin_data['y_true'].values
-                y_pred_proba = bin_data['y_pred_proba'].values
-                metrics = self._compute_metrics_for_group(y_true, y_pred_proba)
-
-                row: Dict[str, Any] = {'bin': str(bin_label), 'n_predictions': len(bin_data)}
-                row.update(metrics)
-                rows.append(row)
-
-            if rows:
-                result[str(did)] = pd.DataFrame(rows)
-
-        return result
-
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
@@ -386,51 +344,26 @@ class ColdStartCurvesModule(EvalModule):
         self,
         metric: str,
         binned_metrics: pd.DataFrame,
-        per_user_binned: Dict[str, pd.DataFrame],
         save_path: Path,
     ) -> None:
-        """
-        Plot one cold-start curve for a single metric.
-
-        - Thin gray lines: per-user curves (only bins where the user has data)
-        - Bold colored line with markers: post-level aggregate across all users
-        """
-        # Filter aggregate to bins that have data for this metric
+        """Plot one cold-start curve: post-level aggregate across all predictions."""
         agg_df = binned_metrics[binned_metrics[f'{metric}_n'] > 0].copy()
         if len(agg_df) == 0:
             return
 
-        # Map bin label -> x position from the aggregate ordering
         bin_order = list(agg_df['bin'])
-        bin_to_x = {b: i for i, b in enumerate(bin_order)}
-
-        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
-
-        # --- per-user gray curves ---
-        for did, user_df in per_user_binned.items():
-            if metric not in user_df.columns:
-                continue
-            # Keep only bins present in the aggregate ordering
-            user_plot = user_df[user_df['bin'].isin(bin_to_x)].copy()
-            user_plot = user_plot.dropna(subset=metric)
-            if len(user_plot) < 2:
-                continue
-            xs = [bin_to_x[b] for b in user_plot['bin']]
-            ys = user_plot[metric].values
-            ax.plot(xs, ys, color='gray', linewidth=0.7, alpha=0.35, zorder=1)
-
-        # --- aggregate bold curve ---
         agg_x = list(range(len(agg_df)))
         agg_y = agg_df[metric].values
         color = self.METRIC_COLORS.get(metric, '#333333')
 
+        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
+
         ax.plot(
             agg_x, agg_y,
             color=color, linewidth=2.5, marker='o', markersize=7,
-            zorder=3, label='Aggregate (all posts)',
+            label='Aggregate (all posts)',
         )
 
-        # Annotate with prediction counts
         for xi, yi, n in zip(agg_x, agg_y, agg_df['n_predictions'].values):
             if not np.isnan(yi):
                 ax.annotate(
@@ -447,17 +380,7 @@ class ColdStartCurvesModule(EvalModule):
             f'Cold Start: {metric.replace("_", " ").title()} vs. History Length',
             fontsize=13,
         )
-
-        n_users_shown = sum(
-            1 for df in per_user_binned.values()
-            if metric in df.columns and df.dropna(subset=[metric])['bin'].isin(bin_to_x).sum() >= 2
-        )
-        ax.legend(
-            loc='lower right', fontsize=10,
-            title=f'{n_users_shown} user curves shown',
-            title_fontsize=8,
-        )
-
+        ax.legend(loc='lower right', fontsize=10)
         ax.grid(True, alpha=0.3)
         if metric in ('precision', 'recall', 'f1'):
             ax.set_ylim(0, 1.05)
