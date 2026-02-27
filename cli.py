@@ -60,7 +60,9 @@ DEFAULTS: Dict[str, Any] = {
     "neg_sample_bucket": "1h",
     "train_start": None,
     "val_start": None,
-    "holdout_start": None,
+    "holdout_user_fraction": 0.2,
+    "holdout_user_seed": 42,
+    "holdout_end": None,
     # Stage 4 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
@@ -545,8 +547,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of validation dataset window. Must be >= train-start")
-    _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
+    _add_arg_with_default(p_all, "--holdout-user-fraction", type=float, default=argparse.SUPPRESS,
+                          help_text="Fraction of users to hold out for evaluation (0-1). Users are assigned deterministically via hashing.")
+    _add_arg_with_default(p_all, "--holdout-user-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Seed for deterministic holdout user assignment (combined with user ID in hash)")
+    _add_arg_with_default(p_all, "--holdout-end", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for end of holdout window. Holdout rows with seen_at >= this date get split=None. Default: no upper bound.")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
