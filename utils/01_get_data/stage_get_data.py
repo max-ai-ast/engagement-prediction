@@ -133,13 +133,15 @@ from utils.helpers import (
     parse_one_ts,
     validate_dataframe_schema,
     apply_time_filter,
-    get_embed_dim,
-    get_embedding_dim_for_model,
-    get_embeddings_list_col,
 )
 from utils.memory_helpers import (
     check_data_load_safe,
     MemoryTracker,
+)
+from model_serving.input_data_helpers import (
+    get_embed_dim,
+    get_embedding_dim_for_model,
+    get_embeddings_list_col,
 )
 
 # ----------------------------------------
