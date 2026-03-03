@@ -494,6 +494,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
+    eval_holdout_type = str(args.eval_holdout_type)
+    holdout_split = f"holdout_{eval_holdout_type}"
 
     # Worker settings (shared by all encoder types)
     num_workers = int(args.num_dataloader_workers)
@@ -714,12 +716,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     try:
         if user_encoder == "summarized":
             holdout_dataset = SummarizedEngagementDataset(
-                embeddings_mmap, target_posts_df, history_df, split="holdout",
+                embeddings_mmap, target_posts_df, history_df, split=holdout_split,
                 summarizer=summarizer, embed_dim=embed_dim, logger=logger,
             )
         else:
             holdout_dataset = SequenceEngagementDataset(
-                embeddings_mmap, target_posts_df, history_df, split="holdout",
+                embeddings_mmap, target_posts_df, history_df, split=holdout_split,
                 max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
             )
         if len(holdout_dataset) > 0:

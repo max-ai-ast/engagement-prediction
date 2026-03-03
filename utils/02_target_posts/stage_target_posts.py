@@ -4,10 +4,17 @@
 Stage 2: Build the target-posts dataset by pairing likes with sampled negatives and
 assigning train/val/holdout splits.
 
-The holdout set is defined by a **user split**: a deterministic fraction of users
-(controlled by ``holdout_user_fraction`` and ``holdout_user_seed``) is held out for
-evaluation.  All rows belonging to holdout users receive ``split="holdout"``.
-The remaining users are split temporally into train/val using ``val_start``.
+Two distinct holdout sets are produced:
+
+* **holdout_unseen_users** – a deterministic fraction of users (controlled by
+  ``holdout_user_fraction`` and ``holdout_user_seed``) whose rows are *never*
+  seen during training or validation.  Bounded above by ``holdout_end``.
+* **holdout_seen_users** – rows for the *remaining* (train/val) users that fall
+  after ``holdout_start`` (i.e. after the validation window).  Bounded above by
+  ``holdout_end``.
+
+The remaining rows for non-holdout users are split temporally into train/val
+using ``train_start`` / ``val_start`` / ``holdout_start``.
 
 Inputs:
 - posts_core_* (from 01_get_data)
@@ -333,13 +340,20 @@ def _apply_splits(
     lf: pl.LazyFrame,
     logger: logging.Logger,
 ) -> pl.LazyFrame:
-    """Assign ``split`` column: user-based holdout, temporal train/val.
+    """Assign ``split`` column with two distinct holdout sets.
 
-    Holdout users are selected by a deterministic hash of
-    ``(holdout_user_seed, target_did)``.  All of their rows receive
-    ``split = "holdout"`` (optionally bounded by ``holdout_end``).
-    The remaining users are split temporally using ``train_start`` and
-    ``val_start``.
+    **holdout_unseen_users** – rows for users selected by a deterministic
+    hash of ``(holdout_user_seed, target_did)``.  Bounded above by
+    ``holdout_end`` when set.
+
+    **holdout_seen_users** – rows for non-holdout (train/val) users whose
+    ``seen_at >= holdout_start``.  Bounded above by ``holdout_end`` when
+    set.  Only produced when ``holdout_start`` is supplied.
+
+    Non-holdout users are otherwise split temporally:
+    ``train`` (``train_start <= seen_at < val_start``) and ``val``
+    (``val_start <= seen_at < holdout_start``, or unbounded when
+    ``holdout_start`` is ``None``).
 
     Only the unique ``target_did`` values are collected to determine the
     holdout set; the full dataset remains lazy so it can be streamed to
@@ -357,7 +371,14 @@ def _apply_splits(
 
     holdout_fraction: float = float(args.holdout_user_fraction)
     holdout_seed: int = int(args.holdout_user_seed)
+    holdout_start: Optional[datetime] = parse_one_ts(args.holdout_start)
     holdout_end: Optional[datetime] = parse_one_ts(args.holdout_end)
+
+    if holdout_start is not None and holdout_start <= val_start:
+        raise ValueError(
+            "holdout_start must be after val_start "
+            f"(got holdout_start={holdout_start}, val_start={val_start})"
+        )
 
     if not 0.0 < holdout_fraction < 1.0:
         raise ValueError(
@@ -370,23 +391,36 @@ def _apply_splits(
     n_holdout = len(holdout_dids)
     n_trainval = len(all_dids) - n_holdout
     logger.info(
-        f"User split: {n_holdout} holdout users, "
+        f"User split: {n_holdout} holdout (unseen) users, "
         f"{n_trainval} train/val users "
         f"(fraction={holdout_fraction}, seed={holdout_seed})"
     )
 
     is_holdout_user = pl.col("target_did").is_in(holdout_dids)
+    before_end = (pl.col(ts_col) < pl.lit(holdout_end)) if holdout_end is not None else pl.lit(True)
 
-    if holdout_end is not None:
-        holdout_expr = (
-            pl.when(is_holdout_user & (pl.col(ts_col) < pl.lit(holdout_end)))
-            .then(pl.lit("holdout"))
+    # --- unseen-users holdout ---
+    unseen_expr = pl.when(is_holdout_user & before_end).then(pl.lit("holdout_unseen_users"))
+
+    # --- seen-users holdout (only when holdout_start is set) ---
+    if holdout_start is not None:
+        after_holdout_start = pl.col(ts_col) >= pl.lit(holdout_start)
+        seen_holdout_expr = (
+            unseen_expr
+            .when(~is_holdout_user & after_holdout_start & before_end)
+            .then(pl.lit("holdout_seen_users"))
         )
     else:
-        holdout_expr = pl.when(is_holdout_user).then(pl.lit("holdout"))
+        seen_holdout_expr = unseen_expr
+
+    # --- val window upper bound ---
+    if holdout_start is not None:
+        val_upper = pl.col(ts_col) < pl.lit(holdout_start)
+    else:
+        val_upper = pl.lit(True)
 
     split_expr = (
-        holdout_expr
+        seen_holdout_expr
         .when(
             ~is_holdout_user
             & (pl.col(ts_col) >= pl.lit(train_start))
@@ -396,6 +430,7 @@ def _apply_splits(
         .when(
             ~is_holdout_user
             & (pl.col(ts_col) >= pl.lit(val_start))
+            & val_upper
         )
         .then(pl.lit("val"))
         .otherwise(None)

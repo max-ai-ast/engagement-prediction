@@ -163,6 +163,7 @@ def enrich_predictions_with_history_len(
     predictions_df: pd.DataFrame,
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
+    holdout_split: str = "holdout_unseen_users",
 ) -> pd.DataFrame:
     """
     Add a per-row ``num_embedding_likes`` column to ``predictions_df``.
@@ -186,7 +187,7 @@ def enrich_predictions_with_history_len(
     Returns:
         Copy of ``predictions_df`` with ``num_embedding_likes`` column added.
     """
-    holdout_targets = target_posts_df.filter(pl.col("split") == "holdout")
+    holdout_targets = target_posts_df.filter(pl.col("split") == holdout_split)
 
     joined = holdout_targets.join(
         history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
@@ -222,6 +223,7 @@ def compute_user_metadata(
     predictions_df: pd.DataFrame,
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
+    holdout_split: str = "holdout_unseen_users",
 ) -> pd.DataFrame:
     """
     Compute per-user metadata including number of embedding likes.
@@ -237,7 +239,7 @@ def compute_user_metadata(
     holdout_user_ids = set(predictions_df['did'].astype(str).unique())
 
     # Get holdout target rows
-    holdout_targets = target_posts_df.filter(pl.col("split") == "holdout")
+    holdout_targets = target_posts_df.filter(pl.col("split") == holdout_split)
 
     # Join with history to get prior_emb_indices
     joined = holdout_targets.join(
@@ -308,6 +310,8 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- hyperparams ---
     eval_batch_size = int(args.eval_batch_size)
+    eval_holdout_type = str(args.eval_holdout_type)
+    holdout_split = f"holdout_{eval_holdout_type}"
     skip_modules = getattr(args, 'skip_modules', None)
     if skip_modules and isinstance(skip_modules, str):
         skip_modules = [m.strip() for m in skip_modules.split(',')]
@@ -328,6 +332,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / 'stage.log')
     log_operation_start('Stage 5: Evaluation', STAGE_LOG_NAME, logger)
     logger.info(f"Training output dir: {train_dir}")
+    logger.info(f"Holdout type for evaluation: {eval_holdout_type} (split={holdout_split})")
 
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
@@ -335,18 +340,18 @@ def run(context: Context, args) -> Dict[str, Any]:
         run_dir, context, logger=logger,
     )
 
-    holdout_target_rows = target_posts_df.filter(pl.col("split") == "holdout")
+    holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
     holdout_users = holdout_target_rows["target_did"].unique().to_list()
     holdout_users = [str(u) for u in holdout_users]
 
     if not holdout_users:
         raise RuntimeError(
-            "No holdout users found in target_posts (no rows with split='holdout'). "
-            "Did the target_posts stage produce a holdout split? "
-            "Check --holdout-start in your pipeline configuration."
+            f"No holdout users found in target_posts (no rows with split='{holdout_split}'). "
+            f"Did the target_posts stage produce a {eval_holdout_type} holdout split? "
+            f"Check --holdout-user-fraction and --holdout-start in your pipeline configuration."
         )
-    logger.info(f"Holdout users: {len(holdout_users)}")
-    logger.info(f"Holdout target rows: {len(holdout_target_rows)}")
+    logger.info(f"Holdout users ({eval_holdout_type}): {len(holdout_users)}")
+    logger.info(f"Holdout target rows ({eval_holdout_type}): {len(holdout_target_rows)}")
 
     # Step 2: Load holdout predictions
     log_operation_start('Load holdout predictions', STAGE_LOG_NAME, logger)
@@ -366,6 +371,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         predictions_df=predictions_df,
         target_posts_df=target_posts_df,
         history_df=history_df,
+        holdout_split=holdout_split,
     )
     logger.info(f"Enriched predictions with num_embedding_likes (post-level history length)")
 
@@ -375,6 +381,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         predictions_df=predictions_df,
         target_posts_df=target_posts_df,
         history_df=history_df,
+        holdout_split=holdout_split,
     )
     logger.info(f"Computed metadata for {len(user_metadata_df)} users")
 

@@ -266,6 +266,7 @@ def _make_split_args(**overrides):
         val_start="2024-01-15T00:00:00",
         holdout_user_fraction=0.5,
         holdout_user_seed=42,
+        holdout_start=None,
         holdout_end=None,
     )
     defaults.update(overrides)
@@ -296,13 +297,13 @@ def _multi_user_df():
 
 
 def test_apply_splits_user_based_holdout(stage_target_posts_module, dummy_logger):
-    """Holdout users get split='holdout' on ALL their rows; others get train/val."""
+    """Holdout users get split='holdout_unseen_users' on ALL their rows; others get train/val."""
     df = _multi_user_df()
     args = _make_split_args()
     out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
 
     holdout_users = set(
-        out.filter(pl.col("split") == "holdout")["target_did"].unique().to_list()
+        out.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list()
     )
     train_users = set(
         out.filter(pl.col("split") == "train")["target_did"].unique().to_list()
@@ -318,8 +319,8 @@ def test_apply_splits_user_based_holdout(stage_target_posts_module, dummy_logger
 
     for uid in holdout_users:
         user_splits = out.filter(pl.col("target_did") == uid)["split"].to_list()
-        assert all(s == "holdout" for s in user_splits), (
-            f"All rows for holdout user {uid} should be 'holdout', got {user_splits}"
+        assert all(s == "holdout_unseen_users" for s in user_splits), (
+            f"All rows for holdout user {uid} should be 'holdout_unseen_users', got {user_splits}"
         )
 
 
@@ -330,7 +331,7 @@ def test_apply_splits_temporal_trainval(stage_target_posts_module, dummy_logger)
     out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
 
     holdout_users = set(
-        out.filter(pl.col("split") == "holdout")["target_did"].unique().to_list()
+        out.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list()
     )
     trainval = out.filter(~pl.col("target_did").is_in(holdout_users))
     val_start = _dt(2024, 1, 15)
@@ -343,13 +344,13 @@ def test_apply_splits_temporal_trainval(stage_target_posts_module, dummy_logger)
 
 
 def test_apply_splits_no_leakage(stage_target_posts_module, dummy_logger):
-    """No user ID appears in both holdout and train/val."""
+    """No user ID appears in both holdout_unseen_users and train/val."""
     df = _multi_user_df()
     args = _make_split_args()
     out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
 
     holdout_dids = set(
-        out.filter(pl.col("split") == "holdout")["target_did"].unique().to_list()
+        out.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list()
     )
     trainval_dids = set(
         out.filter(pl.col("split").is_in(["train", "val"]))["target_did"].unique().to_list()
@@ -367,8 +368,8 @@ def test_apply_splits_reproducibility(stage_target_posts_module, dummy_logger):
 
     args_diff = _make_split_args(holdout_user_seed=999)
     out3 = stage_target_posts_module._apply_splits(args_diff, df.lazy(), dummy_logger).collect()
-    h1 = set(out1.filter(pl.col("split") == "holdout")["target_did"].unique().to_list())
-    h3 = set(out3.filter(pl.col("split") == "holdout")["target_did"].unique().to_list())
+    h1 = set(out1.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list())
+    h3 = set(out3.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list())
     assert h1 != h3, "Different seeds should (almost certainly) produce different assignments"
 
 
@@ -379,7 +380,7 @@ def test_apply_splits_holdout_end(stage_target_posts_module, dummy_logger):
     out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
 
     holdout_users = set(
-        out.filter(pl.col("split") == "holdout")["target_did"].unique().to_list()
+        out.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list()
     )
     assert len(holdout_users) > 0
 
@@ -387,7 +388,7 @@ def test_apply_splits_holdout_end(stage_target_posts_module, dummy_logger):
         user_rows = out.filter(pl.col("target_did") == uid)
         for row in user_rows.iter_rows(named=True):
             if row["seen_at"] < _dt(2024, 1, 16):
-                assert row["split"] == "holdout"
+                assert row["split"] == "holdout_unseen_users"
             else:
                 assert row["split"] is None, (
                     f"Holdout user {uid} row at {row['seen_at']} should be None "
@@ -423,6 +424,12 @@ def test_apply_splits_validation_checks(stage_target_posts_module, dummy_logger)
             lf, dummy_logger,
         )
 
+    with pytest.raises(ValueError, match="holdout_start must be after val_start"):
+        stage_target_posts_module._apply_splits(
+            _make_split_args(holdout_start="2024-01-10T00:00:00"),
+            lf, dummy_logger,
+        )
+
 
 def test_apply_splits_rows_before_train_start_are_none(stage_target_posts_module, dummy_logger):
     """Rows before train_start for non-holdout users get split=None."""
@@ -439,5 +446,67 @@ def test_apply_splits_rows_before_train_start_are_none(stage_target_posts_module
     args = _make_split_args(holdout_user_fraction=0.01, holdout_user_seed=9999)
     out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
     splits = out["split"].to_list()
-    if splits[0] != "holdout":
+    if splits[0] != "holdout_unseen_users":
         assert splits[0] is None, "Row before train_start should be None for non-holdout user"
+
+
+def test_apply_splits_seen_users_holdout(stage_target_posts_module, dummy_logger):
+    """When holdout_start is set, non-holdout users' rows after it become holdout_seen_users."""
+    df = _multi_user_df()
+    # holdout_start at Jan 18 means rows at Jan 20 for non-holdout users → holdout_seen_users
+    args = _make_split_args(holdout_start="2024-01-18T00:00:00")
+    out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
+
+    unseen_users = set(
+        out.filter(pl.col("split") == "holdout_unseen_users")["target_did"].unique().to_list()
+    )
+    seen_holdout_rows = out.filter(pl.col("split") == "holdout_seen_users")
+    assert seen_holdout_rows.height > 0, "Expected some holdout_seen_users rows"
+
+    # holdout_seen_users rows must belong to non-holdout (train/val) users
+    seen_holdout_users = set(seen_holdout_rows["target_did"].unique().to_list())
+    assert seen_holdout_users.isdisjoint(unseen_users), (
+        "holdout_seen_users must not include unseen holdout users"
+    )
+
+    # All seen holdout rows must be at/after holdout_start
+    holdout_start_ts = _dt(2024, 1, 18)
+    for row in seen_holdout_rows.iter_rows(named=True):
+        assert row["seen_at"] >= holdout_start_ts, (
+            f"holdout_seen_users row at {row['seen_at']} should be >= holdout_start"
+        )
+
+    # Val rows for non-holdout users should be < holdout_start
+    val_rows = out.filter(pl.col("split") == "val")
+    for row in val_rows.iter_rows(named=True):
+        assert row["seen_at"] < holdout_start_ts, (
+            f"Val row at {row['seen_at']} should be < holdout_start when holdout_start is set"
+        )
+
+
+def test_apply_splits_seen_users_holdout_with_holdout_end(stage_target_posts_module, dummy_logger):
+    """holdout_end bounds both seen and unseen holdout sets."""
+    df = _multi_user_df()
+    args = _make_split_args(
+        holdout_start="2024-01-18T00:00:00",
+        holdout_end="2024-01-19T00:00:00",
+    )
+    out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
+
+    # Rows at Jan 20 should be None for all users (past holdout_end)
+    jan20_rows = out.filter(pl.col("seen_at") == _dt(2024, 1, 20))
+    for row in jan20_rows.iter_rows(named=True):
+        assert row["split"] is None, (
+            f"Row at {row['seen_at']} for {row['target_did']} should be None (past holdout_end), "
+            f"got {row['split']}"
+        )
+
+
+def test_apply_splits_no_seen_holdout_without_holdout_start(stage_target_posts_module, dummy_logger):
+    """Without holdout_start, no holdout_seen_users rows are produced."""
+    df = _multi_user_df()
+    args = _make_split_args()  # holdout_start=None by default
+    out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
+
+    seen_holdout = out.filter(pl.col("split") == "holdout_seen_users")
+    assert seen_holdout.height == 0, "No holdout_seen_users expected when holdout_start is None"
