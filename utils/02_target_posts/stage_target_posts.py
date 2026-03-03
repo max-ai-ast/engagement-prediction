@@ -330,9 +330,9 @@ def _select_holdout_users(
 
 def _apply_splits(
     args: argparse.Namespace,
-    df: pl.DataFrame,
+    lf: pl.LazyFrame,
     logger: logging.Logger,
-) -> pl.DataFrame:
+) -> pl.LazyFrame:
     """Assign ``split`` column: user-based holdout, temporal train/val.
 
     Holdout users are selected by a deterministic hash of
@@ -340,6 +340,10 @@ def _apply_splits(
     ``split = "holdout"`` (optionally bounded by ``holdout_end``).
     The remaining users are split temporally using ``train_start`` and
     ``val_start``.
+
+    Only the unique ``target_did`` values are collected to determine the
+    holdout set; the full dataset remains lazy so it can be streamed to
+    disk via ``sink_parquet`` without materializing all rows in memory.
     """
     ts_col = "seen_at"
 
@@ -360,7 +364,7 @@ def _apply_splits(
             f"holdout_user_fraction must be in (0, 1), got {holdout_fraction}"
         )
 
-    all_dids = df["target_did"].unique().to_list()
+    all_dids = lf.select("target_did").unique().collect()["target_did"].to_list()
     holdout_dids = _select_holdout_users(all_dids, holdout_seed, holdout_fraction)
 
     n_holdout = len(holdout_dids)
@@ -398,13 +402,7 @@ def _apply_splits(
         .alias("split")
     )
 
-    result = df.with_columns(split_expr)
-
-    split_counts = result.group_by("split").len().sort("split")
-    for row in split_counts.iter_rows(named=True):
-        logger.info(f"  split={row['split']!s:>10s}: {row['len']:>8,} rows")
-
-    return result
+    return lf.with_columns(split_expr)
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -452,12 +450,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'neg_author_did': str,
     })
 
-    target_posts_df: pl.DataFrame = target_posts_lf.collect()
-    target_posts_df = _apply_splits(args, target_posts_df, logger)
+    target_posts_lf = _apply_splits(args, target_posts_lf, logger)
 
-    # Write out result
+    # Write out result (streaming to avoid full materialization in memory)
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
-    target_posts_df.write_parquet(target_posts_output_path)
+    target_posts_lf.sink_parquet(target_posts_output_path)
+
+    # Log split counts from the written file
+    split_counts = (
+        pl.scan_parquet(target_posts_output_path)
+        .group_by("split")
+        .len()
+        .sort("split")
+        .collect()
+    )
+    for row in split_counts.iter_rows(named=True):
+        logger.info(f"  split={row['split']!s:>10s}: {row['len']:>8,} rows")
 
     # Stage info
     info_lines = [
