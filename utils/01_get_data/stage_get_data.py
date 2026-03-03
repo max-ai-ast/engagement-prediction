@@ -139,10 +139,39 @@ from utils.memory_helpers import (
     MemoryTracker,
 )
 from model_serving.input_data_helpers import (
-    infer_embed_dim_from_first_row_polars,
     get_embedding_dim_for_known_model,
-    get_embeddings_list_col_polars,
+    get_expanded_embedding_vector,
 )
+
+
+# ----------------------------------------
+# Embeddings helpers
+# ----------------------------------------
+
+def get_embeddings_list_col_polars(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    """
+    Adds a column with a list of floats representing the embedding vector for the given model, 
+    extracted from the raw `embeddings` struct/list column.
+    """
+    return lf.with_columns(
+        pl.col("embeddings").map_elements(
+            lambda x: get_expanded_embedding_vector(x, embedding_model),
+            return_dtype=pl.List(pl.Float32)
+        ).cast(pl.List(pl.Float32)).alias("_emb_vec")
+    )
+
+
+def _infer_embed_dim_from_first_row_polars(lf: pl.LazyFrame, embedding_model: str) -> int:
+    lf_with_emb = get_embeddings_list_col_polars(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
+    )
+
 
 # ----------------------------------------
 # Data IO helpers (Green Earth Ingex + GCS)
@@ -540,7 +569,7 @@ def _load_posts_core_polars(
     random_seed: int,
     logger: logging.Logger,
     # the below inputs are for testing
-    get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = infer_embed_dim_from_first_row_polars,
+    get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = _infer_embed_dim_from_first_row_polars,
     embed_dim_override: Optional[int] = None,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
     """

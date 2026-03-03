@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Tuple, Dict, List, Optional
 import numpy as np
-import polars as pl
 import base64
 import struct
 import zlib
@@ -40,7 +39,7 @@ def get_embedding_dim_for_known_model(embedding_model: str) -> int:
         raise ValueError(
             f"Unknown embedding model '{embedding_model}'. "
             f"Known models: {known_models}. "
-            f"Add new models to EMBEDDING_MODEL_DIMS in helpers.py."
+            f"Add new models to EMBEDDING_MODEL_DIMS in input_data_helpers.py."
         )
     return EMBEDDING_MODEL_DIMS[embedding_model]
 
@@ -97,11 +96,13 @@ def _decompress_and_unpack_embedding(s: str, decompress: Optional[bool] = None) 
         except zlib.error:
             if decompress:
                 raise
+    
+    if len(bs) % 4 != 0:
+        raise ValueError(f"Byte length {len(bs)} is not a multiple of 4, cannot unpack into floats")
+    return list(struct.unpack(f'<{len(bs) // 4}f', bs))
 
-    return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
 
-
-def _get_expanded_embedding_vector(embedding_input: Any, embedding_model: str) -> Optional[list[float]]:
+def get_expanded_embedding_vector(embedding_input: Any, embedding_model: str) -> Optional[list[float]]:
     """
     Takes a single raw embeddings input, which might have embeddings from multiple models. 
     Extracts the correct compressed embedding for the given model.
@@ -111,31 +112,6 @@ def _get_expanded_embedding_vector(embedding_input: Any, embedding_model: str) -
     if compressed_embedding is None:
         return None
     return _decompress_and_unpack_embedding(compressed_embedding, decompress=True)
-
-
-def get_embeddings_list_col_polars(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
-    """
-    Adds a column with a list of floats representing the embedding vector for the given model, 
-    extracted from the raw `embeddings` struct/list column.
-    """
-    return lf.with_columns(
-        pl.col("embeddings").map_elements(
-            lambda x: _get_expanded_embedding_vector(x, embedding_model),
-            return_dtype=pl.List(pl.Float32)
-        ).cast(pl.List(pl.Float32)).alias("_emb_vec")
-    )
-
-
-def infer_embed_dim_from_first_row_polars(lf: pl.LazyFrame, embedding_model: str) -> int:
-    lf_with_emb = get_embeddings_list_col_polars(lf, embedding_model)
-    return (
-        lf_with_emb
-        .select(pl.col("_emb_vec").list.len().alias("dim"))
-        .filter(pl.col("dim").is_not_null())
-        .head(1)
-        .collect(engine="streaming")
-        .item()
-    )
 
 
 # ----------------------------------------
@@ -208,7 +184,7 @@ def get_user_tower_input_from_raw_history_embeddings(
     embed_dim: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Take a list of raw embedding inputs and get them in the format needed for input into the user tower model.
+    Take a list of (reverse-chron-ordered) raw embedding inputs and get them in the format needed for input into the user tower model.
     First extracts the raw compressed embedding for the given model from the dict-like input.
     Then adds padding and builds a mask to get fixed-length numpy arrays for the user tower input.
     This is the function that should be used in the inference scenario.
@@ -216,7 +192,8 @@ def get_user_tower_input_from_raw_history_embeddings(
     Args:
         raw_history_embeddings:
             A list of raw embedding inputs (e.g. from a Polars struct/list column) containing the compressed embedding data for each history item.
-             The function will extract the relevant embedding for the specified `embedding_model`.
+            The function will extract the relevant embedding for the specified `embedding_model`.
+            Note: These should be ordered *most-recent-first* (reverse chronological order) since the user tower typically attends more to recent history, and the padding will be added to the end of the sequence.
         embedding_model: 
             The name of the embedding model to extract from the raw input (e.g. "all-MiniLM-L6-v2").
         max_history_len:
@@ -234,5 +211,8 @@ def get_user_tower_input_from_raw_history_embeddings(
             indicates a real (non-padding) history position.
 
     """
-    history_embeddings = _get_expanded_embedding_vector(raw_history_embeddings, embedding_model)
+    history_embeddings = [
+        vec for vec in (get_expanded_embedding_vector(rhe, embedding_model) for rhe in raw_history_embeddings)
+        if vec is not None
+    ]
     return get_padded_embedding_history_and_mask(history_embeddings, max_history_len=max_history_len, embed_dim=embed_dim)

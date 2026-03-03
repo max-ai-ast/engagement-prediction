@@ -906,7 +906,7 @@ def load_training_data(
     logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
-    # Contains the chronologically-ordered list of post indices each user engaged with
+    # Contains the (most-recent-first-ordered) list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
     history_dir = _resolve_prior(
         run_dir, context,
