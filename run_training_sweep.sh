@@ -78,7 +78,7 @@ run_one() {
   local CMD=(
     python3 cli.py run-all --foreground
     --output-dir "$DATA_DIR_ABS"
-    --start-from train --stop-after train
+    --start-from train --stop-after evaluate
     --model-type "$MODEL_TYPE"
     --user-encoder "$USER_ENCODER"
     --run-tag "$RUN_TAG"
