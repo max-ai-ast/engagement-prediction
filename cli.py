@@ -361,6 +361,14 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # Foreground execution: initialize experiment tracker and run
     # Only initialize ClearML here (not before backgrounding) to avoid creating
     # a task in the parent process that gets "aborted" when the parent exits.
+    #
+    # Pre-import torch so it's fully cached in sys.modules before ClearML patches
+    # builtins.__import__. ClearML's patched importer breaks torch's internal
+    # circular import chain (torch.jit._async -> torch.utils.set_module).
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
