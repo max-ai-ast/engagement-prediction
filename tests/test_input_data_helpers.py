@@ -5,7 +5,7 @@ import zlib
 import polars as pl
 import pytest
 
-from model_serving.input_data_helpers import get_embeddings_list_col, _get_embedding_value_for_model
+from model_serving.input_data_helpers import get_embeddings_list_col_polars, _extract_compressed_embedding_vector_from_struct
 
 
 def _encode_embedding(vec: list[float]) -> str:
@@ -19,8 +19,8 @@ def test_get_embedding_value_for_model_dicts():
         {"key": "other", "value": "x"},
         {"key": "target", "value": "y"},
     ]
-    assert _get_embedding_value_for_model(embeddings, "target") == "y"
-    assert _get_embedding_value_for_model(embeddings, "missing") is None
+    assert _extract_compressed_embedding_vector_from_struct(embeddings, "target") == "y"
+    assert _extract_compressed_embedding_vector_from_struct(embeddings, "missing") is None
 
 
 def test_get_embedding_value_for_model_list_or_tuple_items():
@@ -28,13 +28,13 @@ def test_get_embedding_value_for_model_list_or_tuple_items():
         ("other", "x"),
         ("target", "y"),
     ]
-    assert _get_embedding_value_for_model(embeddings_tuples, "target") == "y"
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_tuples, "target") == "y"
 
     embeddings_lists = [
         ["other", "x"],
         ["target", "y"],
     ]
-    assert _get_embedding_value_for_model(embeddings_lists, "target") == "y"
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_lists, "target") == "y"
 
 
 def test_get_embeddings_list_col_extracts_and_decodes():
@@ -54,7 +54,7 @@ def test_get_embeddings_list_col_extracts_and_decodes():
         }
     )
 
-    out = get_embeddings_list_col(df.lazy(), target_model).collect()
+    out = get_embeddings_list_col_polars(df.lazy(), target_model).collect()
     got = out["_emb_vec"].to_list()
 
     assert got[0] == pytest.approx(expected_vec, rel=1e-6, abs=1e-6)

@@ -7,66 +7,6 @@ import base64
 import struct
 import zlib
 
-
-def get_padded_vector_and_mask(
-    history: Any,
-    max_history_len: int, 
-    embed_dim: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Pad/truncate a variable-length history of embedding vectors and build a mask.
-
-    This helper is used when a model expects a fixed-length sequence input
-    (e.g. a transformer-style user-history encoder), but the available user
-    history is variable length.
-
-    Args:
-        history:
-            Either a 2D numpy array with shape ``[T, embed_dim]`` or a sequence
-            (e.g. list) of length ``T`` containing 1D arrays/lists of length
-            ``embed_dim``.
-        max_history_len:
-            The fixed sequence length to emit. If ``T > max_history_len``,
-            the history is truncated.
-        embed_dim:
-            Embedding dimension (width) for each history vector.
-
-    Returns:
-        padded:
-            A float32 numpy array of shape ``[max_history_len, embed_dim]``.
-            Entries beyond the available history are zero-padded.
-        mask:
-            A boolean numpy array of shape ``[max_history_len]`` where ``True``
-            indicates a real (non-padding) history position.
-
-    Notes:
-        - Truncation keeps the *first* ``max_history_len`` entries in ``history``.
-          If you want the most recent entries, pass ``history[-max_history_len:]``.
-    """
-    hist_len = len(history)
-
-    # validate input data 
-    if hist_len > 0:
-        for h in history:
-            if len(h) != embed_dim:
-                raise ValueError(
-                    f"History embedding length ({len(h)}) and embed_dim ({embed_dim}) do not match"
-                )
-            
-    seq_len = min(hist_len, max_history_len)
-    
-    # Initialize padded array
-    padded = np.zeros((max_history_len, embed_dim), dtype=np.float32)
-    mask = np.zeros(max_history_len, dtype=bool)
-
-    if seq_len > 0:
-        # Truncate to max_history_len if needed, load from memmap
-        padded[:seq_len] = history[: max_history_len]
-        mask[:seq_len] = True
-
-    return padded, mask
-
-
 # ----------------------------------------
 # Embeddings helpers
 # ----------------------------------------
@@ -82,7 +22,7 @@ EMBEDDING_MODEL_DIMS: Dict[str, int] = {
 }
 
 
-def get_embedding_dim_for_model(embedding_model: str) -> int:
+def get_embedding_dim_for_known_model(embedding_model: str) -> int:
     """
     Get the embedding dimension for a known model name.
     
@@ -105,7 +45,7 @@ def get_embedding_dim_for_model(embedding_model: str) -> int:
     return EMBEDDING_MODEL_DIMS[embedding_model]
 
 
-def _get_embedding_value_for_model(embeddings: Any, embedding_model: str) -> Optional[str]:
+def _extract_compressed_embedding_vector_from_struct(embeddings: Any, embedding_model: str) -> Optional[str]:
     """
     Extract the base85-encoded embedding string for a given model from a single row's
     `embeddings` value.
@@ -137,30 +77,6 @@ def _get_embedding_value_for_model(embeddings: Any, embedding_model: str) -> Opt
     return None
 
 
-def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
-    emb_vec = pl.col("embeddings").map_elements(
-        lambda embeddings: (
-            _decompress_and_unpack_embedding(s, decompress=True)
-            if (s := _get_embedding_value_for_model(embeddings, embedding_model)) is not None
-            else None
-        ),
-        return_dtype=pl.List(pl.Float32),
-    )
-    return lf.with_columns(emb_vec.alias("_emb_vec"))
-
-
-def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
-    lf_with_emb = get_embeddings_list_col(lf, embedding_model)
-    return (
-        lf_with_emb
-        .select(pl.col("_emb_vec").list.len().alias("dim"))
-        .filter(pl.col("dim").is_not_null())
-        .head(1)
-        .collect(engine="streaming")
-        .item()
-    )
-
-
 def _decompress_and_unpack_embedding(s: str, decompress: Optional[bool] = None) -> list[float]:
     """
     Convert an embedding from a base85-encoded string to a list of floats.
@@ -183,3 +99,140 @@ def _decompress_and_unpack_embedding(s: str, decompress: Optional[bool] = None) 
                 raise
 
     return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
+
+
+def _get_expanded_embedding_vector(embedding_input: Any, embedding_model: str) -> Optional[list[float]]:
+    """
+    Takes a single raw embeddings input, which might have embeddings from multiple models. 
+    Extracts the correct compressed embedding for the given model.
+    Then decompresses it and unpacks it into a list of floats.
+    """
+    compressed_embedding = _extract_compressed_embedding_vector_from_struct(embedding_input, embedding_model)
+    if compressed_embedding is None:
+        return None
+    return _decompress_and_unpack_embedding(compressed_embedding, decompress=True)
+
+
+def get_embeddings_list_col_polars(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    """
+    Adds a column with a list of floats representing the embedding vector for the given model, 
+    extracted from the raw `embeddings` struct/list column.
+    """
+    return lf.with_columns(
+        pl.col("embeddings").map_elements(
+            lambda x: _get_expanded_embedding_vector(x, embedding_model),
+            return_dtype=pl.List(pl.Float32)
+        ).cast(pl.List(pl.Float32)).alias("_emb_vec")
+    )
+
+
+def infer_embed_dim_from_first_row_polars(lf: pl.LazyFrame, embedding_model: str) -> int:
+    lf_with_emb = get_embeddings_list_col_polars(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
+    )
+
+
+# ----------------------------------------
+# Input data shape helpers
+# ----------------------------------------
+
+def get_padded_embedding_history_and_mask(
+    history_embeddings: Any,
+    max_history_len: int, 
+    embed_dim: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Pad/truncate a variable-length history of embedding vectors and build a mask.
+
+    This helper is used when a model expects a fixed-length sequence input
+    (e.g. a transformer-style user-history encoder), but the available user
+    history is variable length.
+
+    Args:
+        history:
+            Either a 2D numpy array with shape ``[T, embed_dim]`` or a sequence
+            (e.g. list) of length ``T`` containing 1D arrays/lists of length
+            ``embed_dim``.
+        max_history_len:
+            The fixed sequence length to emit. If ``T > max_history_len``,
+            the history is truncated.
+        embed_dim:
+            Embedding dimension (width) for each history vector.
+
+    Returns:
+        padded:
+            A float32 numpy array of shape ``[max_history_len, embed_dim]``.
+            Entries beyond the available history are zero-padded.
+        mask:
+            A boolean numpy array of shape ``[max_history_len]`` where ``True``
+            indicates a real (non-padding) history position.
+    """
+    hist_len = len(history_embeddings)
+
+    # validate input data 
+    if hist_len > 0:
+        for h in history_embeddings:
+            if len(h) != embed_dim:
+                raise ValueError(
+                    f"History embedding length ({len(h)}) and embed_dim ({embed_dim}) do not match"
+                )
+            
+    seq_len = min(hist_len, max_history_len)
+    
+    # Initialize padded array
+    padded = np.zeros((max_history_len, embed_dim), dtype=np.float32)
+    mask = np.zeros(max_history_len, dtype=bool)
+
+    if seq_len > 0:
+        # Truncate to max_history_len if needed, load from memmap
+        padded[:seq_len] = history_embeddings[: max_history_len]
+        mask[:seq_len] = True
+
+    return padded, mask
+
+
+# ----------------------------------------
+# Inference helpers
+# ----------------------------------------
+
+def get_user_tower_input_from_raw_history_embeddings(
+    raw_history_embeddings: List[Any],
+    embedding_model: str,
+    max_history_len: int,
+    embed_dim: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Take a list of raw embedding inputs and get them in the format needed for input into the user tower model.
+    First extracts the raw compressed embedding for the given model from the dict-like input.
+    Then adds padding and builds a mask to get fixed-length numpy arrays for the user tower input.
+    This is the function that should be used in the inference scenario.
+
+    Args:
+        raw_history_embeddings:
+            A list of raw embedding inputs (e.g. from a Polars struct/list column) containing the compressed embedding data for each history item.
+             The function will extract the relevant embedding for the specified `embedding_model`.
+        embedding_model: 
+            The name of the embedding model to extract from the raw input (e.g. "all-MiniLM-L6-v2").
+        max_history_len:
+            The fixed sequence length to emit. If ``T > max_history_len``,
+            the history is truncated.
+        embed_dim:
+            Embedding dimension (width) for each history vector.
+
+    Returns:
+        padded:
+            A float32 numpy array of shape ``[max_history_len, embed_dim]``.
+            Entries beyond the available history are zero-padded.
+        mask:
+            A boolean numpy array of shape ``[max_history_len]`` where ``True``
+            indicates a real (non-padding) history position.
+
+    """
+    history_embeddings = _get_expanded_embedding_vector(raw_history_embeddings, embedding_model)
+    return get_padded_embedding_history_and_mask(history_embeddings, max_history_len=max_history_len, embed_dim=embed_dim)

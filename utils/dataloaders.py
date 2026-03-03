@@ -120,7 +120,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
-from model_serving.input_data_helpers import get_padded_vector_and_mask
+from model_serving.input_data_helpers import get_padded_embedding_history_and_mask
 
 
 # ---------------------------------------------------------------------------
@@ -1370,7 +1370,7 @@ class SequenceEngagementDataset(Dataset):
         # the raw sequence here rather than using a pre-computed summary
         hist_indices = self.prior_emb_indices[row_idx]
         hist_embeddings = self.embeddings[hist_indices]
-        padded, mask = get_padded_vector_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
+        padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:
