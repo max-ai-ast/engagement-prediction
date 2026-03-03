@@ -886,7 +886,7 @@ def _prepare_split_data(
     Args:
         target_posts_df: Full target posts DataFrame with all splits
         history_df: User engagement history DataFrame
-        split: Split name to filter to ("train", "val", or "holdout")
+        split: Split name to filter to ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         logger: Optional logger for progress reporting
     
     Returns:
@@ -999,7 +999,7 @@ class SummarizedEngagementDataset(Dataset):
         embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
         target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
         history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", or "holdout")
+        split: Split to load ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         summarizer: UserSummarizer instance for aggregating engagement history
         embed_dim: Embedding dimensionality D
         logger: Optional logger for progress reporting
@@ -1167,7 +1167,7 @@ class SequenceEngagementDataset(Dataset):
         embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
         target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
         history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", or "holdout")
+        split: Split to load ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         max_history_len: Maximum sequence length for padding (truncate if longer)
         embed_dim: Embedding dimensionality D
         logger: Optional logger for progress reporting

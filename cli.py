@@ -62,6 +62,7 @@ DEFAULTS: Dict[str, Any] = {
     "val_start": None,
     "holdout_user_fraction": 0.2,
     "holdout_user_seed": 42,
+    "holdout_start": None,
     "holdout_end": None,
     # Stage 4 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
@@ -105,6 +106,7 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 5 (eval)
     "eval_batch_size": 8192,
     "eval_max_users": None,
+    "eval_holdout_type": "unseen_users",
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
@@ -359,6 +361,14 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # Foreground execution: initialize experiment tracker and run
     # Only initialize ClearML here (not before backgrounding) to avoid creating
     # a task in the parent process that gets "aborted" when the parent exits.
+    #
+    # Pre-import torch so it's fully cached in sys.modules before ClearML patches
+    # builtins.__import__. ClearML's patched importer breaks torch's internal
+    # circular import chain (torch.jit._async -> torch.utils.set_module).
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
@@ -551,8 +561,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Fraction of users to hold out for evaluation (0-1). Users are assigned deterministically via hashing.")
     _add_arg_with_default(p_all, "--holdout-user-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Seed for deterministic holdout user assignment (combined with user ID in hash)")
+    _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of seen-users holdout window. Non-holdout users' rows at/after this date become holdout_seen_users. Must be after val-start.")
     _add_arg_with_default(p_all, "--holdout-end", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for end of holdout window. Holdout rows with seen_at >= this date get split=None. Default: no upper bound.")
+                          help_text="ISO date string for end of holdout window. Applies to both holdout_seen_users and holdout_unseen_users. Rows at/after this date get split=None. Default: no upper bound.")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
@@ -641,6 +653,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Batch size for evaluation")
     _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
                           help_text="None = all eligible users for evaluation")
+    _add_arg_with_default(p_all, "--eval-holdout-type", type=str, default=argparse.SUPPRESS,
+                          choices=["unseen_users", "seen_users"],
+                          help_text="Which holdout set to use for evaluation: unseen_users (user-split) or seen_users (temporal after val period)")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")
