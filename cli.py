@@ -108,7 +108,6 @@ DEFAULTS: Dict[str, Any] = {
     "eval_max_users": None,
     "eval_holdout_type": "unseen_users",
     "skip_modules": None,  # Comma-separated eval module names to skip (None = run all)
-    "cold_start_bin_edges": None,  # Custom bin edges for cold-start curves (None = module default)
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
@@ -660,8 +659,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Which holdout set to use for evaluation: unseen_users (user-split) or seen_users (temporal after val period)")
     _add_arg_with_default(p_all, "--skip-modules", type=str, default=argparse.SUPPRESS,
                           help_text="Comma-separated list of evaluation module names to skip (e.g. cold_start_curves,performance_inequality)")
-    _add_arg_with_default(p_all, "--cold-start-bin-edges", type=float, nargs="+", default=argparse.SUPPRESS,
-                          help_text="Custom bin edges for cold-start curves (space-separated floats; None = module default)")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")

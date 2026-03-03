@@ -315,7 +315,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     skip_modules = args.skip_modules
     if skip_modules and isinstance(skip_modules, str):
         skip_modules = [m.strip() for m in skip_modules.split(',')]
-    cold_start_bin_edges = args.cold_start_bin_edges
 
     # Resolve training output first so we can nest eval outputs inside it
     train_dir = resolve_train_output(run_dir, context)
@@ -392,8 +391,6 @@ def run(context: Context, args) -> Dict[str, Any]:
         'batch_size': eval_batch_size,
         'embed_dim': embed_dim,
     }
-    if cold_start_bin_edges is not None:
-        eval_config['cold_start_bin_edges'] = cold_start_bin_edges
 
     ctx = EvalContext(
         predictions_df=predictions_df,
