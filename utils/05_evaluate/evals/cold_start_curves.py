@@ -60,11 +60,11 @@ class ColdStartCurvesModule(EvalModule):
     description = "Analyzes model performance as a function of per-prediction history length (embedding likes count)"
 
     # Default bin edges for number of embedding likes.
-    # Half-integer boundaries from -0.5 through 10.5 ensure that each
-    # integer value 0–10 falls cleanly in its own bin.  After 10 the
-    # edges are whole integers so subsequent bins cover ranges like 11-20.
+    # Integer boundaries with right=False (left-closed, right-open [low, high))
+    # ensure each integer 0–10 falls cleanly in its own bin, while later
+    # edges define wider ranges like [10, 20), [20, 50), etc.
     DEFAULT_BIN_EDGES = [
-        -0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
         20, 50, 100, 500, float('inf'),
     ]
 
@@ -120,7 +120,7 @@ class ColdStartCurvesModule(EvalModule):
             predictions_df['num_embedding_likes'],
             bins=bin_edges,
             labels=bin_labels,
-            include_lowest=True,
+            right=False,  # left-closed intervals [low, high)
         )
 
         # Diagnostics
@@ -172,35 +172,21 @@ class ColdStartCurvesModule(EvalModule):
     # ------------------------------------------------------------------
 
     def _make_bin_labels(self, bin_edges: List[float]) -> List[str]:
-        """Create human-readable bin labels.
+        """Create human-readable bin labels for left-closed, right-open [low, high) intervals.
 
-        Works correctly with non-integer edge values (e.g. -0.5, 0.5, 1.5 …)
-        by deriving the lowest and highest integers that fall inside each
-        half-open interval (low, high], with the first interval treated as
-        closed on both sides when include_lowest=True.
+        Expects integer-valued edges.  For a single-integer bin (width 1) the
+        label is just that integer; for wider bins the label is ``low-high_inclusive``;
+        for the final open-ended bin the label is ``low+``.
         """
-        import math
         labels = []
-        for i, (low_edge, high_edge) in enumerate(
-            zip(bin_edges[:-1], bin_edges[1:])
-        ):
-            if high_edge == float('inf'):
-                low_int = math.ceil(low_edge)
+        for low, high in zip(bin_edges[:-1], bin_edges[1:]):
+            low_int = int(low)
+            if high == float('inf'):
                 labels.append(f"{low_int}+")
-                continue
-
-            high_int = math.floor(high_edge)
-            if i == 0:
-                # First bin is closed on the left: [low_edge, high_edge]
-                low_int = math.ceil(low_edge)
-            else:
-                # Subsequent bins are left-open: (low_edge, high_edge]
-                low_int = math.floor(low_edge) + 1
-
-            if low_int == high_int:
+            elif int(high) - low_int == 1:
                 labels.append(str(low_int))
             else:
-                labels.append(f"{low_int}-{high_int}")
+                labels.append(f"{low_int}-{int(high) - 1}")
         return labels
 
     # ------------------------------------------------------------------
