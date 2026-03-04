@@ -27,11 +27,8 @@ from utils.pipeline.core import Context, generate_run_timestamp
 
 # Avoid heavy imports at module import time; import lazily inside handlers
 
-TINKERING_DIR = Path(__file__).parent
-OUTPUTS_DIR = TINKERING_DIR / "outputs"
-CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints"
-PROCESSED_DATA_DIR = TINKERING_DIR / "processed_data"
-RESULTS_DIR = OUTPUTS_DIR / "holdout_evaluation_results"
+CLI_FILE_DIR = Path(__file__).parent
+DEFAULT_OUTPUTS_DIR = CLI_FILE_DIR / "outputs"
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -50,7 +47,6 @@ DEFAULTS: Dict[str, Any] = {
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
     "output_dir": None,
-    "run_name": None,
     "debug": False,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L6_v2",
@@ -239,21 +235,21 @@ def _generate_run_name(args: argparse.Namespace) -> str:
     return stages_str
 
 
-def _resolve_run_dir(args: argparse.Namespace, *, outputs_dir: Path, run_name: str) -> Path:
+def _resolve_run_dir(args: argparse.Namespace, run_timestamp: str) -> Path:
     """Resolve the effective run directory as an absolute path.
 
     ClearML remote execution may run with a different working directory than local runs.
     If `--output-dir` is provided as a relative path, interpret it relative to the repo root
     (this file's directory) to keep behavior stable across environments.
     """
-    output_dir = getattr(args, "output_dir", None)
+    output_dir = args.output_dir
     if output_dir:
         p = Path(str(output_dir)).expanduser()
         if not p.is_absolute():
-            p = (TINKERING_DIR / p)
+            p = (CLI_FILE_DIR / p)
         return p.resolve()
     # Default: write directly under ./outputs (no per-run subdirectory).
-    return Path(outputs_dir).resolve()
+    return (Path(DEFAULT_OUTPUTS_DIR) / run_timestamp).resolve()
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
@@ -261,20 +257,16 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     Creates a run directory up front and backgrounds itself with nohup if --background.
     """
-    outputs_dir = OUTPUTS_DIR
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    output_dir = getattr(args, "output_dir", None)
+    # Get the specified output directory. If not provided, create an outputs/ directory in the same directory as this cli.py file.
+    output_dir = args.output_dir
+    if output_dir is None:
+        DEFAULT_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     # Create run_dir deterministically up front
-    run_name = _generate_run_name(args)
-    if (not output_dir) and args.run_name:
-        rn = str(args.run_name).strip().replace(' ', '_')
-        if rn:
-            run_name = f"{run_name}_{rn}"
-    run_dir = _resolve_run_dir(args, outputs_dir=outputs_dir, run_name=run_name)
+    run_dir = _resolve_run_dir(args, run_timestamp=run_timestamp)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose log path inside run_dir
@@ -336,14 +328,14 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
-        task_name=args.experiment_task or run_name,
+        task_name=args.experiment_task or _generate_run_name(args),
         tags=args.experiment_tags,
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
     args = tracker.connect_args(args, "Args")
     # Re-resolve run_dir after ClearML connects args, since output_dir might have been overridden.
-    run_dir = _resolve_run_dir(args, outputs_dir=outputs_dir, run_name=run_name)
+    run_dir = _resolve_run_dir(args, run_timestamp=run_timestamp)
     run_dir.mkdir(parents=True, exist_ok=True)
     # Ensure args.output_dir is set so subsequent stages use this run_dir (and so Context uses an absolute path).
     setattr(args, 'output_dir', str(run_dir))
@@ -506,8 +498,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
-    _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,
-                          help_text="Optional suffix for Stage 1 run dir name")
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
