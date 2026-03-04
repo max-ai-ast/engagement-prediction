@@ -104,6 +104,7 @@ class ClearMLExperimentTracker:
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
             auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
+            output_uri=True,
         )
         self._logger = self._task.get_logger()
 
@@ -116,10 +117,11 @@ class ClearMLExperimentTracker:
         )
 
     def log_artifact(self, name: str, path: Path) -> None:
+        from clearml import OutputModel
         p = Path(path)
         if not p.exists():
             return
-        self._task.upload_artifact(name=name, artifact_object=str(p))
+        OutputModel(task=self._task, name=name).update_weights(str(p))
 
     def log_params(self, params: Dict[str, Any]) -> None:
         self._task.connect(params)

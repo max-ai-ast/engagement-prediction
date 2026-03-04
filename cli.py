@@ -68,7 +68,7 @@ DEFAULTS: Dict[str, Any] = {
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
-    "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
+    "user_output_dim": 128,  # Output dim for MLPModel's user encoder in full_transformer mode; separate from shared_dim used in TwoTower
     "use_post_encoder": True,  # True means using a transformation on the post embedding (e.g. single layer neural net). False uses the post embedding directly.
     "post_hidden_dim": 256,
     "num_attention_heads": 4,

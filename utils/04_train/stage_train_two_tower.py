@@ -118,6 +118,7 @@ from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
     SummarizedEngagementDataset,
+    SummarizedUserTower,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
     create_data_loaders,
@@ -197,7 +198,6 @@ class PostTower(nn.Module):
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
-
 class TwoTowerModel(nn.Module):
     """Two-tower engagement prediction model with pluggable user encoders.
     
@@ -285,10 +285,9 @@ class TwoTowerModel(nn.Module):
         elif user_encoder_type == "summarized":
             # In "summarized" mode, the dataset provides the user vector directly
             # (e.g., mean/EMA/linear-recency summary). The model treats the
-            # history input as an already-encoded user embedding.
-            def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
-                return history_embeddings
-            self.user_tower = _dummy_user_tower
+            # history input as an already-encoded user embedding (placed at
+            # position 0 in a padded sequence for a consistent forward() signature).
+            self.user_tower = SummarizedUserTower()
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
@@ -300,6 +299,16 @@ class TwoTowerModel(nn.Module):
                 "Choose 'summarized', 'full_transformer' or 'cross_attention'."
             )
 
+        # If we don't project posts, then `post_embeddings` stays in the raw embedding
+        # space and must match the user embedding dim for dot product scoring.
+        #
+        # In summarized mode, the user embedding is also in the raw embedding space.
+        if (not use_post_encoder) and (user_encoder_type != "summarized") and (shared_dim != post_embedding_dim):
+            raise ValueError(
+                f"use_post_encoder=False requires --shared-dim ({shared_dim}) to equal post embedding dim ({post_embedding_dim}) "
+                f"(or set use_post_encoder=True to project posts to shared_dim)."
+            )
+
         if use_post_encoder:
             # Post tower is the same regardless of user encoder type
             self.post_tower = PostTower(
@@ -309,13 +318,10 @@ class TwoTowerModel(nn.Module):
                 dropout_rate=dropout_rate,
             )
         else:
-            # just use the post embedding directly. note that the post_tower is not actually used in this case (see forward())
-            def _dummy_post_tower(post_embeddings: torch.Tensor):
-                return post_embeddings
-            self.post_tower = _dummy_post_tower
+            self.post_tower = nn.Identity()
 
 
-    def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
@@ -334,14 +340,16 @@ class TwoTowerModel(nn.Module):
             post_embeddings: Raw post embeddings [batch, input_dim]
         
         Returns:
-            Post vectors in shared space [batch, shared_dim]
+            Post vectors for dot product scoring.
+                - use_post_encoder=True: [batch, shared_dim]
+                - otherwise: [batch, post_embedding_dim] (identity)
         """
         return self.post_tower(post_embeddings)
 
     def forward(
         self,
         history_embeddings: torch.Tensor,
-        history_mask: Optional[torch.Tensor],
+        history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
@@ -352,23 +360,17 @@ class TwoTowerModel(nn.Module):
         
         Args:
             history_embeddings: User history input.
-                - summarized: user vectors [batch, embed_dim]
-                - otherwise: padded history sequences [batch, seq_len, input_dim]
-            history_mask: History validity mask [batch, seq_len] (None in summarized mode)
+                - all modes: padded history sequences [batch, seq_len, input_dim]
+                  In "summarized" mode, the user summary is expected to be placed
+                  at position 0 (and optionally padded to seq_len > 1).
+            history_mask: History validity mask [batch, seq_len] (optional in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
         
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        if self.user_encoder_type == "summarized":
-            user_emb = history_embeddings
-        else:
-            user_emb = self.encode_user(history_embeddings, history_mask)
-
-        if self.use_post_encoder:
-            post_emb = self.encode_post(post_embeddings)
-        else:
-            post_emb = post_embeddings
+        user_emb = self.encode_user(history_embeddings, history_mask)
+        post_emb = self.encode_post(post_embeddings)
         
         # Dot product: element-wise multiply then sum over shared_dim
         return (user_emb * post_emb).sum(dim=-1)
@@ -405,10 +407,14 @@ class TwoTowerModel(nn.Module):
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device) # [B, embed_dim*2]
-            history_embeddings = features[:, :embed_dim]
+            history_embeddings = features[:, :embed_dim].unsqueeze(1)  # [B, 1, D] (summary token at position 0)
             post_embeddings = features[:, embed_dim:]
-            history_mask = None
-            assert history_embeddings.shape[1] == post_embeddings.shape[1]
+            history_mask = torch.ones(
+                (history_embeddings.shape[0], history_embeddings.shape[1]),
+                dtype=torch.bool,
+                device=device,
+            )
+            assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
             history_embeddings = batch["history_embeddings"].to(device)
             history_mask = batch["history_mask"].to(device)
@@ -812,7 +818,18 @@ def run(context: Context, args) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
-        context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
+
+        # Save TorchScript file, which is the format needed for ClearML serving
+        # Save the post and user towers separately
+        torchscript_user_name = f"torchscript_user_tower_{timestamp}"
+        torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
+        torch.jit.script(trained_model.user_tower.cpu()).save(torchscript_user_path)
+        context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+
+        torchscript_post_name = f"torchscript_post_tower_{timestamp}"
+        torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
+        torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
+        context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
