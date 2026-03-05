@@ -25,8 +25,9 @@ notebooks/
 *.pid
 nohup.out
 
-# Environment
+# Environment (include *.env so files like serving_examples/docker.env with secrets are not committed)
 .env
+*.env
 .venv/
 venv/
 ENV/
