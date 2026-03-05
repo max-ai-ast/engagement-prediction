@@ -27,7 +27,7 @@ import logging
 import polars as pl
 import time
 
-from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
+from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
 from utils.memory_helpers import MemoryTracker
 
@@ -300,7 +300,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     post embedding indices for efficient on-the-fly lookup during training.
     """
     run_dir = Path(context.run_dir).resolve()
-    out_dir = new_stage_timestamp_dir(run_dir, '03_user_history')
+    out_dir = context.new_stage_dir('03_user_history')
 
     # Initialize logger and memory tracker
     logger = get_stage_logger('STAGE_03_USER_HISTORY', log_file=out_dir / 'stage.log')

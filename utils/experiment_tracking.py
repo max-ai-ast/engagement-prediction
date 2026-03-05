@@ -6,6 +6,8 @@ Experiment tracking abstraction with a ClearML implementation.
 
 from __future__ import annotations
 
+import argparse
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, TYPE_CHECKING, Union
 
@@ -20,7 +22,10 @@ class ExperimentTracker(Protocol):
     def log_artifact(self, name: str, path: Path) -> None:
         ...
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
+        ...
+
+    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
         ...
 
     def log_single_value(self, name: str, value: float) -> None:
@@ -58,8 +63,11 @@ class NoOpExperimentTracker:
     def log_artifact(self, name: str, path: Path) -> None:
         return None
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         return None
+
+    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
+        return args
 
     def log_single_value(self, name: str, value: float) -> None:
         return None
@@ -104,8 +112,75 @@ class ClearMLExperimentTracker:
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
             auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
+            output_uri=True,
         )
         self._logger = self._task.get_logger()
+
+    @staticmethod
+    def _coerce_like(value: Any, template: Any) -> Any:
+        if template is None:
+            return value
+
+        # bool must be checked before int (since bool is a subclass of int)
+        if isinstance(template, bool):
+            if isinstance(value, str):
+                v = value.strip().lower()
+                if v in ("true", "1", "yes", "y", "t", "on"):
+                    return True
+                if v in ("false", "0", "no", "n", "f", "off"):
+                    return False
+            return bool(value)
+
+        if isinstance(template, int):
+            if isinstance(value, str):
+                try:
+                    return int(value)
+                except Exception:
+                    try:
+                        return int(float(value))
+                    except Exception:
+                        return value
+            try:
+                return int(value)
+            except Exception:
+                return value
+
+        if isinstance(template, float):
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except Exception:
+                    return value
+            try:
+                return float(value)
+            except Exception:
+                return value
+
+        if isinstance(template, list):
+            if isinstance(value, str):
+                s = value.strip()
+                try:
+                    parsed = json.loads(s)
+                    return parsed if isinstance(parsed, list) else [parsed]
+                except Exception:
+                    return [x.strip() for x in s.split(",") if x.strip()]
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            return value
+
+        if isinstance(template, dict):
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                    return parsed if isinstance(parsed, dict) else value
+                except Exception:
+                    return value
+            return value
+
+        if isinstance(template, str):
+            return str(value)
+
+        return value
 
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         self._logger.report_scalar(
@@ -116,13 +191,48 @@ class ClearMLExperimentTracker:
         )
 
     def log_artifact(self, name: str, path: Path) -> None:
+        from clearml import OutputModel
         p = Path(path)
         if not p.exists():
             return
-        self._task.upload_artifact(name=name, artifact_object=str(p))
+        OutputModel(task=self._task, name=name).update_weights(str(p))
 
-    def log_params(self, params: Dict[str, Any]) -> None:
-        self._task.connect(params)
+    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
+        self._task.connect(params, name=name)
+
+    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
+        """Connect an argparse.Namespace to ClearML and return the (possibly) updated args.
+
+        This is useful for ClearML remote execution where parameter values might be overridden
+        from the server/UI and need to be reflected in the running process.
+        """
+        original = vars(args).copy()
+
+        # Remove non-serializable argparse metadata if present
+        if callable(original.get("func")):
+            original.pop("func", None)
+
+        connected = self._task.connect(original, name=name)
+        connected_dict: Dict[str, Any]
+        if connected is None:
+            connected_dict = original
+        else:
+            try:
+                connected_dict = dict(connected)  # type: ignore[arg-type]
+            except Exception:
+                connected_dict = original
+
+        updated: Dict[str, Any] = vars(args).copy()
+        for key, connected_value in connected_dict.items():
+            template = updated.get(key, None)
+            updated[key] = self._coerce_like(connected_value, template)
+
+        new_args = argparse.Namespace(**updated)
+        # Preserve original metadata (even if it was not connected)
+        for meta_key in ("command", "func"):
+            if hasattr(args, meta_key):
+                setattr(new_args, meta_key, getattr(args, meta_key))
+        return new_args
 
     def log_single_value(self, name: str, value: float) -> None:
         self._logger.report_single_value(name=name, value=value)

@@ -70,8 +70,8 @@ ARCHITECTURE PATTERNS
 
 The modular design supports multiple training approaches:
 
-    MLP + Summarizer             : SummarizedEngagementDataset + SummarizedMLP
-    MLP + Attention Encoder      : SequenceEngagementDataset + AttentionMLP
+    MLP + Summarizer             : SummarizedEngagementDataset + MLPModel(user_encoder_type="summarized")
+    MLP + Attention Encoder      : SequenceEngagementDataset + MLPModel(user_encoder_type="full_transformer")
     Two-Tower + Full Transformer : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="full_transformer")
     Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="cross_attention")
 
@@ -120,11 +120,31 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
+from model_serving.input_data_helpers import get_padded_vector_and_mask
 
 
 # ---------------------------------------------------------------------------
 # User Summarizer strategies
 # ---------------------------------------------------------------------------
+
+class SummarizedUserTower(nn.Module):
+    """User "tower" for summarized mode.
+
+    Serving/training convention: represent the summarized user vector as a
+    (possibly padded) length-T sequence where the summary lives at position 0:
+
+        history_embeddings[:, 0, :] == user_summary
+
+    This keeps model `forward(history_embeddings, history_mask, ...)` signatures
+    consistent across encoder types.
+    """
+
+    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+        if history_embeddings.dim() != 3:
+            # Keep error message TorchScript-friendly (no dynamic shape formatting).
+            raise RuntimeError("Expected history_embeddings with shape [B, T, D].")
+        return history_embeddings[:, 0, :]
+
 
 class UserSummarizer(ABC):
     """Base class for hand-crafted user-history summarization strategies.
@@ -392,7 +412,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
     def _forward_up_to_pos_embed(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
         """Project inputs, normalize mask, and add (recency-flipped) positional embeddings.
 
@@ -474,15 +494,17 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # Compute raw dot-product scores between the query and each sequence element.
         attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
 
-        # Prevent padded (ignored) positions from contributing by assigning -inf
-        # before softmax. This forces their probability mass to 0.
-        attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        # Handle the edge case where the entire sequence is masked (e.g., a user
-        # with no valid history in the current batch). In that case, softmax can
-        # produce NaNs (all -inf). We replace NaNs with a uniform distribution.
-        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
+        # TorchScript / backend compatibility note:
+        # Avoid `-inf` + `softmax` + `nan_to_num` patterns that can create
+        # version-sensitive graphs. Instead, use a finite large negative for
+        # masked positions and explicitly renormalize.
+        neg_inf = -1.0e9
+        scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), neg_inf)
+        max_scores = scores.max(dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - max_scores)
+        exp_scores = exp_scores.masked_fill(attn_mask_inv.unsqueeze(1), 0.0)
+        denom = exp_scores.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        attn_weights = exp_scores / denom
 
         # Weighted sum of values (the same `x` sequence) -> one vector per example.
         attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
@@ -519,7 +541,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
         """Encode a padded history sequence into a fixed-size representation.
 
@@ -539,6 +561,76 @@ class BaseAttentionEncoder(nn.Module, ABC):
             Encoded user representations `[B, output_dim]`.
         """
         ...
+
+
+class _TS_TransformerBlock(nn.Module):
+    """TorchScript-friendly transformer encoder block.
+
+    Implements multi-head self-attention + FFN using basic tensor ops
+    (matmul/softmax) to avoid `aten::scaled_dot_product_attention`, which can be
+    missing in some libtorch builds shipped with serving stacks (e.g. Triton).
+    """
+
+    def __init__(self, hidden_dim: int, num_attention_heads: int, dropout_rate: float):
+        super().__init__()
+        if hidden_dim % num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
+            )
+        self.num_attention_heads = int(num_attention_heads)
+        self.head_dim = int(hidden_dim // num_attention_heads)
+
+        self.qkv_proj = nn.Linear(hidden_dim, 3 * hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.attn_dropout = nn.Dropout(dropout_rate)
+
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        self.ff1 = nn.Linear(hidden_dim, hidden_dim * 4)
+        self.ff2 = nn.Linear(hidden_dim * 4, hidden_dim)
+        self.ff_dropout = nn.Dropout(dropout_rate)
+        self.resid_dropout1 = nn.Dropout(dropout_rate)
+        self.resid_dropout2 = nn.Dropout(dropout_rate)
+
+    def forward(self, x: torch.Tensor, attn_mask_inv: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D], attn_mask_inv: [B, T] where True means "ignore" (key padding mask)
+        B, T, D = x.shape
+        H = self.num_attention_heads
+        Hd = self.head_dim
+        scale = 1.0 / (float(Hd) ** 0.5)
+        neg_inf = -1.0e9
+
+        qkv = self.qkv_proj(x)  # [B, T, 3D]
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # [B, H, T, Hd]
+        q = q.view(B, T, H, Hd).permute(0, 2, 1, 3)
+        k = k.view(B, T, H, Hd).permute(0, 2, 1, 3)
+        v = v.view(B, T, H, Hd).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, T, T]
+        scores = scores.masked_fill(attn_mask_inv[:, None, None, :], neg_inf)
+
+        # Stable masked softmax (no -inf / nan_to_num).
+        max_scores = scores.max(dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - max_scores)
+        exp_scores = exp_scores.masked_fill(attn_mask_inv[:, None, None, :], 0.0)
+        denom = exp_scores.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        attn = exp_scores / denom
+        attn = self.attn_dropout(attn)
+
+        ctx = torch.matmul(attn, v)  # [B, H, T, Hd]
+        ctx = ctx.permute(0, 2, 1, 3).contiguous().view(B, T, D)  # [B, T, D]
+        attn_out = self.out_proj(ctx)
+
+        x = x + self.resid_dropout1(attn_out)
+        x = self.norm1(x)
+
+        ff = self.ff2(self.ff_dropout(F.gelu(self.ff1(x))))
+        x = x + self.resid_dropout2(ff)
+        x = self.norm2(x)
+        return x
 
 
 class TransformerDualPoolingEncoder(BaseAttentionEncoder):
@@ -577,7 +669,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
     
     Used by:
         - TwoTowerModel (user_encoder_type="full_transformer")
-        - AttentionMLP (user encoder component)
+        - MLPModel (user_encoder_type="full_transformer")
     
     Args:
         input_dim: Dimensionality of input post embeddings
@@ -600,19 +692,24 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         dropout_rate: float,
     ):
         super().__init__(input_dim, hidden_dim, output_dim, max_seq_len, dropout_rate)
+        if hidden_dim % num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
+            )
 
-        # Stack of transformer encoder layers (multi-head self-attention + FFN)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_attention_heads,
-            dim_feedforward=hidden_dim * 4,  # Standard 4x expansion in FFN
-            dropout=dropout_rate,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_attention_layers,
+        # Custom transformer stack (TorchScript / Triton-friendly).
+        # Avoid `nn.TransformerEncoderLayer` / `nn.MultiheadAttention` because
+        # some serving stacks ship libtorch builds that can't load graphs
+        # containing `aten::scaled_dot_product_attention`.
+        self.transformer_layers = nn.ModuleList(
+            [
+                _TS_TransformerBlock(
+                    hidden_dim=hidden_dim,
+                    num_attention_heads=num_attention_heads,
+                    dropout_rate=dropout_rate,
+                )
+                for _ in range(num_attention_layers)
+            ]
         )
 
         self._init_weights()
@@ -620,7 +717,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
@@ -633,9 +730,11 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         """
         B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
-        # Pass through transformer (note: PyTorch uses inverted mask convention)
-        attn_mask_inv = ~history_mask  # Convert to PyTorch convention: True = ignore
-        x = self.transformer_encoder(x, src_key_padding_mask=attn_mask_inv)
+        # Pass through custom transformer layers.
+        # `attn_mask_inv` uses PyTorch convention: True = ignore.
+        attn_mask_inv = ~history_mask
+        for layer in self.transformer_layers:
+            x = layer(x, attn_mask_inv)
 
         # ─── Attention-weighted pooling ───
         # Use learned query to compute content-aware weights over sequence
@@ -704,7 +803,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        history_mask: torch.Tensor,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
@@ -1270,17 +1369,8 @@ class SequenceEngagementDataset(Dataset):
         # This is the key difference from SummarizedEngagementDataset: we load
         # the raw sequence here rather than using a pre-computed summary
         hist_indices = self.prior_emb_indices[row_idx]
-        seq_len = min(len(hist_indices), self.max_history_len)
-
-        # Initialize padded arrays
-        padded = np.zeros((self.max_history_len, self.embed_dim), dtype=np.float32)
-        mask = np.zeros(self.max_history_len, dtype=bool)
-
-        if seq_len > 0:
-            # Truncate to max_history_len if needed, load from memmap
-            used_indices = hist_indices[: self.max_history_len]
-            padded[:seq_len] = self.embeddings[used_indices]
-            mask[:seq_len] = True
+        hist_embeddings = self.embeddings[hist_indices]
+        padded, mask = get_padded_vector_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:

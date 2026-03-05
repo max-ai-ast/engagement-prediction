@@ -26,17 +26,14 @@ Outputs under <train_dir>/evals/<timestamp>/
 from __future__ import annotations
 
 import json
-import time
-from datetime import datetime
+import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Any, Optional, Tuple, List
 
 import pandas as pd
 import polars as pl
 
 from utils.pipeline.core import select_prior_output, Context
-from utils.helpers import get_stage_logger, log_operation_start
-from utils.dataloaders import load_training_data
 
 # ---------------------------------------------------------------------------
 # Import evaluation framework
@@ -66,18 +63,19 @@ def _import_evals_module():
     spec.loader.exec_module(evals)
     return evals
 
+        mode = str(getattr(args, 'mode', 'heterogeneity'))  # 'heterogeneity' | 'pairs' | 'matrix' | 'global_unliked'
+    out_dir = context.new_stage_dir('06_evaluate')
+    # Rename directory to include mode for clarity
+    mode_dir = out_dir.parent / f"{out_dir.name}_{mode}"
+    out_dir.rename(mode_dir)
+    out_dir = mode_dir
 
 _evals = _import_evals_module()
 EvalContext = _evals.EvalContext
 discover_modules = _evals.discover_modules
 run_all_modules = _evals.run_all_modules
 
-STAGE_LOG_NAME = 'STAGE_05_EVALUATE'
-
-
-# ---------------------------------------------------------------------------
-# Asset resolution
-# ---------------------------------------------------------------------------
+    timestamp = context.run_timestamp
 
 def resolve_train_output(
     run_dir: Path,
