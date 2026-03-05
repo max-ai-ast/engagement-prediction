@@ -4,7 +4,7 @@ import zlib
 
 import pytest
 
-from model_serving.input_data_helpers import (
+from shared.input_data_helpers import (
     _extract_compressed_embedding_vector_from_struct,
     get_user_tower_input_from_raw_history_embeddings,
 )

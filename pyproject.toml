@@ -1,18 +1,18 @@
 # This repo primarily uses conda (see `environment.yml`) for reproducible environments.
-# This `pyproject.toml` exists to make the lightweight `model_serving` helpers pip-installable if desired.
+# This `pyproject.toml` exists to make the lightweight `shared` helpers pip-installable if desired.
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "model-serving"
+name = "shared"
 version = "0.1.0"
-description = "Reusable model-serving helpers from the engagement-prediction repo."
+description = "Reusable shared helpers from the engagement-prediction repo."
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.23"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["model_serving*"]
+include = ["shared*"]
 

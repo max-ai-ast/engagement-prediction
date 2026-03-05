@@ -120,7 +120,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
-from model_serving.input_data_helpers import get_padded_embedding_history_and_mask
+from shared.input_data_helpers import get_padded_embedding_history_and_mask
 
 
 # ---------------------------------------------------------------------------

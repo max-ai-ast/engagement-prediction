@@ -138,7 +138,7 @@ from utils.memory_helpers import (
     check_data_load_safe,
     MemoryTracker,
 )
-from model_serving.input_data_helpers import (
+from shared.input_data_helpers import (
     get_embedding_dim_for_known_model,
     get_expanded_embedding_vector,
 )

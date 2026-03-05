@@ -64,7 +64,7 @@ What it does:
 - `--model-type` must be one of: `mlp`, `post`, `user`
 - `--endpoint` defaults to the model type (e.g. `mlp`), so the URL will typically be:
   - `http://127.0.0.1:8080/serve/<endpoint>`
-- `--preprocess` can override the default preprocess script (defaults are under `model_serving/`)
+- `--preprocess` can override the default preprocess script (defaults are under `serving_examples/`)
 
 ## Hitting the endpoint (examples)
 
