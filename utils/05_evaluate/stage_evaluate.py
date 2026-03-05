@@ -22,12 +22,11 @@ import json
 import argparse
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
-from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
+from utils.pipeline.core import select_prior_output, Context
 
 # Shared helpers
 from utils.helpers import (
@@ -129,7 +128,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
 
     mode = str(getattr(args, 'mode', 'heterogeneity'))  # 'heterogeneity' | 'pairs' | 'matrix' | 'global_unliked'
-    out_dir = new_stage_timestamp_dir(run_dir, '06_evaluate')
+    out_dir = context.new_stage_dir('06_evaluate')
     # Rename directory to include mode for clarity
     mode_dir = out_dir.parent / f"{out_dir.name}_{mode}"
     out_dir.rename(mode_dir)
@@ -183,7 +182,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if not holdout_users:
         raise RuntimeError("No holdout users in splits file")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = context.run_timestamp
 
     # Build disjoint sets per user similar to training and construct pairs (pairs/matrix helper reuse)
     import time
@@ -534,4 +533,3 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'output_dir': out_dir,
         'artifacts': summary,
     }
-

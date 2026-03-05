@@ -125,7 +125,6 @@ import numpy as np
 from tqdm import tqdm
 
 from utils.pipeline.core import (
-    new_stage_timestamp_dir, 
     Context,
 )
 from utils.helpers import (
@@ -721,7 +720,7 @@ def _build_posts_candidate_lf(
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
-    out_dir = new_stage_timestamp_dir(run_dir, '01_get_data')
+    out_dir = context.new_stage_dir('01_get_data')
 
     # Initialize logger
     logger = get_stage_logger('01_GET_DATA', log_file=out_dir / 'stage.log')

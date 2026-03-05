@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 import logging
 
-from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
+from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import (
     get_stage_logger, 
     log_operation_start, 
@@ -349,7 +349,7 @@ def _apply_temporal_splits(
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
-    out_dir = new_stage_timestamp_dir(run_dir, '02_target_posts')
+    out_dir = context.new_stage_dir('02_target_posts')
 
     # Initialize logger
     logger: logging.Logger = get_stage_logger(STAGE_NAME_FOR_LOGGING, log_file=out_dir / 'stage.log')

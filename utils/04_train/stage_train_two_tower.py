@@ -93,7 +93,6 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -104,7 +103,7 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
 from torch.utils.data import DataLoader, Dataset
 
-from utils.pipeline.core import new_stage_timestamp_dir, Context
+from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
@@ -607,11 +606,11 @@ def run(context: Context, args) -> Dict[str, Any]:
     """Pipeline entry point for two-tower training."""
     run_dir = Path(context.run_dir).resolve()
     device = get_device(args.device)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = context.run_timestamp
 
     # --- output dirs ---
     run_tag = args.run_tag or ""
-    out_dir = new_stage_timestamp_dir(run_dir, "04_train", tag=run_tag)
+    out_dir = context.new_stage_dir("04_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"

@@ -4,33 +4,31 @@
 Unified CLI for Engagement Prediction Pipeline
 =============================================
 
-Subcommands:
-- run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
+Runs the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate).
+
+Note: The historical `run-all` subcommand is now optional (kept for backwards compatibility).
 
 Usage examples:
-    python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
+    python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 import json
-import time
 import copy
 
 from utils.experiment_tracking import build_experiment_tracker, normalize_params
-from utils.pipeline.core import Context
+from utils.pipeline.core import Context, generate_run_timestamp
 
 
 # Avoid heavy imports at module import time; import lazily inside handlers
 
-TINKERING_DIR = Path(__file__).parent
-OUTPUTS_DIR = TINKERING_DIR / "outputs"
-CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints"
-PROCESSED_DATA_DIR = TINKERING_DIR / "processed_data"
-RESULTS_DIR = OUTPUTS_DIR / "holdout_evaluation_results"
+CLI_FILE_DIR = Path(__file__).parent
+DEFAULT_OUTPUTS_DIR = CLI_FILE_DIR / "outputs"
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -49,7 +47,6 @@ DEFAULTS: Dict[str, Any] = {
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
     "output_dir": None,
-    "run_name": None,
     "debug": False,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L6_v2",
@@ -109,7 +106,8 @@ DEFAULTS: Dict[str, Any] = {
     "stop_after": None,
     "pick_prior": False,
     # Execution behavior
-    "foreground": False,
+    # Default is foreground execution (recommended for ClearML remote execution).
+    "background": False,
     "_initial_log": None,
     # Experiment tracking
     "experiment_tracker": "clearml",
@@ -151,68 +149,6 @@ def _extract_overrides(args: argparse.Namespace) -> Dict[str, Any]:
             if value != default:
                 overrides[key] = value
     return overrides
-
-
-def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str, Any]:
-    return {
-        "meta": {
-            "run_dir": str(run_dir),
-            "run_tag": getattr(args, "run_tag", None),
-            "start_from": args.start_from,
-            "stop_after": args.stop_after,
-            "cap_random_seed": args.cap_random_seed,
-            "random_seed": args.random_seed,
-            "foreground": args.foreground,
-        },
-        "data": {
-            "gcs_bucket": args.gcs_bucket,
-            "posts_start": args.posts_start,
-            "posts_end": args.posts_end,
-            "likes_start": args.likes_start,
-            "likes_end": args.likes_end,
-            "max_liking_users": args.max_liking_users,
-            "max_likes_per_user": args.max_likes_per_user,
-            "min_likes_per_user": args.min_likes_per_user,
-            "negative_posts_sample": args.negative_posts_sample,
-            "embedding_model": args.embedding_model,
-            "max_memory_gb": args.max_memory_gb,
-            "max_memory_pct": args.max_memory_pct,
-        },
-        "train": {
-            "user_summarization": args.user_summarization,
-            "ema_alpha": args.ema_alpha,
-            "user_encoder": args.user_encoder,
-            "model_type": args.model_type,
-            "shared_dim": args.shared_dim,
-            "user_hidden_dim": args.user_hidden_dim,
-            "post_hidden_dim": args.post_hidden_dim,
-            "num_attention_heads": args.num_attention_heads,
-            "num_attention_layers": args.num_attention_layers,
-            "max_history_len": args.max_history_len,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "weight_decay_mlp": args.weight_decay_mlp,
-            "weight_decay_two_tower": args.weight_decay_two_tower,
-            "hidden_dims": args.hidden_dims,
-            "dropout_rate_mlp": args.dropout_rate_mlp,
-            "dropout_rate_two_tower": args.dropout_rate_two_tower,
-            "prediction_posts_per_user": args.prediction_posts_per_user,
-            "patience": args.patience,
-            "device": args.device,
-            "num_dataloader_workers": args.num_dataloader_workers,
-            "dataloader_pin_memory": args.dataloader_pin_memory,
-            "dataloader_persistent_workers": args.dataloader_persistent_workers,
-            "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
-            "lr_scheduler_factor": args.lr_scheduler_factor,
-            "lr_scheduler_patience": args.lr_scheduler_patience,
-            "gradient_clip_max_norm": args.gradient_clip_max_norm,
-        },
-        "eval": {
-            "eval_batch_size": args.eval_batch_size,
-            "eval_max_users": args.eval_max_users,
-        },
-    }
 
 
 def _load_config_file(path_str: str) -> Dict[str, Any]:
@@ -263,6 +199,23 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     return final_ns
 
 
+def _build_effective_config_for_background_run(
+    args: argparse.Namespace, *, run_dir: Path, initial_log: Path
+) -> Dict[str, Any]:
+    """Materialize an effective config to re-invoke run-all in the background.
+
+    We prefer passing a config file rather than reconstructing CLI flags from
+    argparse dest names, since some args intentionally use a different flag name
+    (e.g. `use_post_encoder` is controlled via `--post-encoder/--no-post-encoder`).
+    """
+    cfg: Dict[str, Any] = {k: getattr(args, k) for k in DEFAULTS.keys()}
+    cfg["output_dir"] = str(run_dir.resolve())
+    cfg["_initial_log"] = str(initial_log)
+    # Prevent recursive backgrounding: the child process should run in the foreground.
+    cfg["background"] = False
+    return cfg
+
+
 def _generate_run_name(args: argparse.Namespace) -> str:
     stages_str = "all"
     if args.start_from is not None or args.stop_after is not None:
@@ -282,65 +235,80 @@ def _generate_run_name(args: argparse.Namespace) -> str:
     return stages_str
 
 
+def _resolve_run_dir(args: argparse.Namespace, run_timestamp: str) -> Path:
+    """Resolve the effective run directory as an absolute path.
+
+    ClearML remote execution may run with a different working directory than local runs.
+    If `--output-dir` is provided as a relative path, interpret it relative to the repo root
+    (this file's directory) to keep behavior stable across environments.
+    """
+    output_dir = args.output_dir
+    if output_dir:
+        p = Path(str(output_dir)).expanduser()
+        if not p.is_absolute():
+            p = (CLI_FILE_DIR / p)
+        return p.resolve()
+    # Default: write directly under ./outputs (no per-run subdirectory).
+    return (Path(DEFAULT_OUTPUTS_DIR) / run_timestamp).resolve()
+
+
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 5-stage pipeline.
 
-    Creates a run directory up front and backgrounds itself with nohup unless --foreground.
+    Creates a run directory up front and backgrounds itself with nohup if --background.
     """
-    outputs_dir = OUTPUTS_DIR
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # Get the specified output directory. If not provided, create an outputs/ directory in the same directory as this cli.py file.
+    output_dir = args.output_dir
+    if output_dir is None:
+        DEFAULT_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Store the single timestamp in Context; for background runs we pass it via env.
+    run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     # Create run_dir deterministically up front
-    run_name = f"{timestamp}_{_generate_run_name(args)}"
-    if args.output_dir:
-        run_dir = Path(args.output_dir)
-    else:
-        if args.run_name:
-            rn = str(args.run_name).strip().replace(' ', '_')
-            if rn:
-                run_name = f"{run_name}_{rn}"
-        run_dir = outputs_dir / run_name
+    run_dir = _resolve_run_dir(args, run_timestamp=run_timestamp)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose log path inside run_dir
-    initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
+    if args._initial_log:
+        initial_log = Path(args._initial_log)
+    else:
+        # If we're writing directly into ./outputs, avoid collisions between runs.
+        initial_log = (run_dir / f"run-all_{run_timestamp}.log") if (not output_dir) else (run_dir / "run-all.log")
     try:
         initial_log.parent.mkdir(parents=True, exist_ok=True)
         with open(initial_log, 'a') as f:
-            f.write(f"run-all started at {timestamp}\n")
+            f.write(f"run-all started at {run_timestamp}\n")
     except Exception:
         pass
 
-    if not args.foreground:
-        # Background via nohup by re-invoking run-all with --foreground and pinned --output-dir
+    if bool(args.background):
+        # Background via nohup by re-invoking run-all in the foreground (background disabled)
+        # with a pinned --output-dir.
         import shlex
-        cli_args = []
-        for k, v in vars(args).items():
-            if k in ("command", "foreground", "_initial_log", "output_dir", "func"):
-                continue
-            if v is None or v is False:
-                continue
-            opt = f"--{k.replace('_','-')}"
-            if isinstance(v, bool):
-                cli_args.append(opt)
-            elif isinstance(v, list):
-                cli_args.extend([opt] + [str(x) for x in v])
-            else:
-                cli_args.extend([opt, str(v)])
-        cli_args.extend(["--foreground", "--_initial-log", str(initial_log), "--output-dir", str(run_dir.resolve())])
+        effective_config = _build_effective_config_for_background_run(
+            args, run_dir=run_dir, initial_log=initial_log
+        )
+        effective_config_path = (
+            run_dir / f"run-all_{run_timestamp}.effective-config.json"
+            if (not output_dir)
+            else (run_dir / "run-all.effective-config.json")
+        )
+        effective_config_path.write_text(json.dumps(effective_config, indent=2, sort_keys=True) + "\n")
+        cli_args = ["--config", str(effective_config_path)]
 
         py = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
-        args_str = ' '.join(shlex.quote(a) for a in (["run-all"] + cli_args))
+        args_str = ' '.join(shlex.quote(a) for a in cli_args)
         redir = shlex.quote(str(initial_log))
-        cmd = f"nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
+        env_prefix = f"ENGAGEMENT_RUN_TIMESTAMP={shlex.quote(run_timestamp)}"
+        cmd = f"{env_prefix} nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
         print(f"▶️  Backgrounding run-all with nohup. Log: {initial_log}")
         import subprocess as sp
         proc = sp.run(["bash", "-lc", cmd], stdout=sp.PIPE, stderr=sp.PIPE, text=True)
         if proc.returncode == 0:
             pid_str = (proc.stdout or "").strip().splitlines()[-1] if (proc.stdout or "").strip() else None
-            pid_file = run_dir / "run-all.pid"
+            pid_file = (run_dir / f"run-all_{run_timestamp}.pid") if (not output_dir) else (run_dir / "run-all.pid")
             if pid_str and pid_str.isdigit():
                 try:
                     with open(pid_file, "w") as f:
@@ -360,19 +328,19 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
-        task_name=args.experiment_task or run_name,
+        task_name=args.experiment_task or _generate_run_name(args),
         tags=args.experiment_tags,
     )
-    tracking_payload = {
-        "run": _build_tracking_params(args, run_dir),
-        "overrides": _extract_overrides(args),
-    }
-    tracker.log_params(normalize_params(tracking_payload))
+    # ClearML remote execution can override parameters on the server/UI.
+    # Connect args and rehydrate a Namespace so downstream code sees the updated values.
+    args = tracker.connect_args(args, "Args")
+    # Re-resolve run_dir after ClearML connects args, since output_dir might have been overridden.
+    run_dir = _resolve_run_dir(args, run_timestamp=run_timestamp)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure args.output_dir is set so subsequent stages use this run_dir (and so Context uses an absolute path).
+    setattr(args, 'output_dir', str(run_dir))
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
-
-    # Ensure args.output_dir is set so subsequent stages use this run_dir
-    setattr(args, 'output_dir', str(run_dir.resolve()))
+    ctx = Context(run_dir=run_dir, run_timestamp=run_timestamp, use_latest=True, tracker=tracker)
     return cmd__run_all_exec(args, ctx)
 
 
@@ -439,7 +407,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         if len(subdirs) <= 1:
             return
         # Prompt only in foreground mode
-        if not bool(args.foreground):
+        if bool(args.background):
             return
         subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         print(f"\nPick prior output for stage '{stage_key}' under {base}:")
@@ -487,15 +455,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Engagement Prediction Pipeline CLI",
         argument_default=argparse.SUPPRESS,
     )
+    # Backwards compatible vestige: `run-all` used to be a subcommand; now it's implicit.
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run-all",
+        choices=["run-all"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--config",
         type=str,
         help="YAML/JSON config file with run-all parameters (CLI flags override config)",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
     # run-all (modular 5-stage end-to-end)
-    p_all = subparsers.add_parser("run-all", help="Run all 5 stages end-to-end. Defaults to background with nohup.")
+    p_all = parser
     # Stage 1 options
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
@@ -524,8 +498,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
-    _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,
-                          help_text="Optional suffix for Stage 1 run dir name")
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
@@ -648,8 +620,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
-    _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Run in foreground (default: background with nohup)")
+    _add_arg_with_default(p_all, "--background", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Run in background with nohup (default: foreground)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     # Experiment tracking
     _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,
