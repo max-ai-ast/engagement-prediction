@@ -109,6 +109,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -964,34 +965,34 @@ def _resolve_prior(
 # ---------------------------------------------------------------------------
 
 def _prepare_split_data(
-    target_posts_df: pd.DataFrame,
-    history_df: pd.DataFrame,
+    target_posts_df,
+    history_df,
     split: str,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
     """Filter data to a single split and return aligned numpy arrays.
-    
+
     This internal helper performs the core data preparation logic shared by both
     SummarizedEngagementDataset and SequenceEngagementDataset. It:
     1. Filters target_posts to the requested split (train/val/holdout)
     2. Drops rows with missing negative samples
     3. Joins with user history to get engagement sequences
     4. Converts to numpy arrays for fast indexing
-    
+
     The returned arrays are **row-aligned**: position i in each array corresponds
     to the same user-post interaction. This alignment is critical for dataset
     __getitem__ to efficiently construct training samples.
-    
+
     Args:
-        target_posts_df: Full target posts DataFrame with all splits
-        history_df: User engagement history DataFrame
+        target_posts_df: Full target posts DataFrame (polars or pandas) with all splits.
+        history_df: User engagement history DataFrame (polars or pandas).
         split: Split name to filter to ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         logger: Optional logger for progress reporting
-    
+
     Returns:
-        Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list, 
+        Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list,
                   target_dids, like_uris, neg_uris):
-        
+
         - like_emb_idx: Indices into embeddings memmap for positive posts [N]
         - neg_emb_idx: Indices into embeddings memmap for negative posts [N]
         - prior_emb_indices_list: List of N variable-length arrays, each containing
@@ -1000,9 +1001,9 @@ def _prepare_split_data(
         - target_dids: User IDs as string array [N]
         - like_uris: Liked post URIs as string array [N]
         - neg_uris: Non-liked post URIs as string array [N]
-        
+
         Where N = number of target posts in the requested split (after filtering).
-    
+
     Note:
         Each target post row produces TWO training samples (positive + negative),
         so dataset length will be 2*N. This function returns N-length arrays that
@@ -1011,44 +1012,32 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    # Normalize to pandas: tests and some callers may pass Polars DataFrames
-    if hasattr(target_posts_df, "to_pandas"):
-        target_posts_df = target_posts_df.to_pandas()
-    if hasattr(history_df, "to_pandas"):
-        history_df = history_df.to_pandas()
+    # Normalize to polars (load_training_data returns pandas; tests pass polars)
+    if not isinstance(target_posts_df, pl.DataFrame):
+        target_posts_df = pl.from_pandas(target_posts_df)
+    if not isinstance(history_df, pl.DataFrame):
+        history_df = pl.from_pandas(history_df)
 
-    # Filter to requested split and drop rows missing negative samples
-    # (negative samples may be missing if the negative sampling stage failed
-    # to find a suitable negative for that user-post pair)
-    tp = target_posts_df[
-        (target_posts_df["split"] == split) & target_posts_df["neg_emb_idx"].notna()
-    ]
-    logger.info(f"  Split '{split}': {len(tp):,} target rows (after dropping null neg_emb_idx)")
+    tp = target_posts_df.filter(
+        (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
+    )
+    logger.info(f"  Split '{split}': {tp.height:,} target rows (after dropping null neg_emb_idx)")
 
-    # Join target posts with user history on (user_id, post_uri) to get the
-    # engagement sequence for each target. History is pre-filtered to exclude
-    # the target post itself (temporal validity).
-    history_sub = history_df[["target_did", "like_uri", "prior_emb_indices"]]
-    joined = tp.merge(history_sub, on=["target_did", "like_uri"], how="left")
+    history_sub = history_df.select("target_did", "like_uri", "prior_emb_indices")
+    joined = tp.join(history_sub, on=["target_did", "like_uri"], how="left")
 
-    # Extract embedding indices for positive and negative posts
     like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
     neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
-    target_dids = joined["target_did"].tolist()
-    like_uris = joined["like_uri"].tolist()
-    neg_uris = joined["neg_uri"].tolist()
+    target_dids = joined["target_did"].to_list()
+    like_uris = joined["like_uri"].to_list()
+    neg_uris = joined["neg_uri"].to_list()
 
-    # Convert list column to Python list of numpy arrays (pandas may have list/array/object dtype)
-    prior_col = joined["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
-    for row_val in prior_col.tolist():
-        try:
-            if row_val is None or len(row_val) == 0:
-                prior_emb_indices_list.append(np.array([], dtype=np.uint32))
-            else:
-                prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
-        except (TypeError, ValueError):
+    for row_val in joined["prior_emb_indices"].to_list():
+        if row_val is None or len(row_val) == 0:
             prior_emb_indices_list.append(np.array([], dtype=np.uint32))
+        else:
+            prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
     return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
 
@@ -1121,8 +1110,8 @@ class SummarizedEngagementDataset(Dataset):
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df: pd.DataFrame,
-        history_df: pd.DataFrame,
+        target_posts_df,
+        history_df,
         split: str,
         summarizer: UserSummarizer,
         embed_dim: int,
@@ -1294,8 +1283,8 @@ class SequenceEngagementDataset(Dataset):
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df: pd.DataFrame,
-        history_df: pd.DataFrame,
+        target_posts_df,
+        history_df,
         split: str,
         max_history_len: int,
         embed_dim: int,
