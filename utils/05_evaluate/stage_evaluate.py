@@ -322,11 +322,9 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_pl, history_pl, embed_dim = load_training_data(
+    _, target_posts_df, history_df, embed_dim = load_training_data(
         run_dir, context, logger=logger,
     )
-    target_posts_df = target_posts_pl.to_pandas()
-    history_df = history_pl.to_pandas()
 
     holdout_target_rows = target_posts_df[target_posts_df["split"] == holdout_split]
     holdout_users = [str(u) for u in holdout_target_rows["target_did"].unique().tolist()]

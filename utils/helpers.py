@@ -95,13 +95,18 @@ def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
     subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
 
 
-def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
-    # Load the most recent *.parquet found in the given directory
-    import polars as pl
+def get_latest_parquet_path(prior_path: Path, prefix: str) -> Path:
+    """Return the path to the most recent {prefix}*.parquet in the given directory."""
     candidates = sorted(prior_path.glob(f"{prefix}*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
-    return pl.scan_parquet(candidates[0])
+    return candidates[0]
+
+
+def load_parquet_from_prior(prior_path: Path, prefix: str) -> "pl.LazyFrame":
+    """Load the most recent {prefix}*.parquet as a Polars LazyFrame."""
+    import polars as pl
+    return pl.scan_parquet(get_latest_parquet_path(prior_path, prefix))
 
 
 # ----------------------------------------

@@ -108,7 +108,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import polars as pl
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -117,7 +117,7 @@ from torch.utils.data import Dataset
 from utils.pipeline.core import Context, select_prior_output
 from utils.helpers import (
     get_stage_logger,
-    load_parquet_from_prior,
+    get_latest_parquet_path,
     log_operation_start,
 )
 
@@ -742,7 +742,7 @@ def load_training_data(
     run_dir: Path,
     context: Context,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
+) -> Tuple[np.ndarray, pd.DataFrame, pd.DataFrame, int]:
     """Locate and load the three upstream pipeline artifacts needed for training.
     
     This function abstracts away the complexity of finding prior stage outputs,
@@ -767,8 +767,8 @@ def load_training_data(
     Returns:
         Tuple of (embeddings_mmap, target_posts_df, history_df, embed_dim):
             - embeddings_mmap: Read-only numpy memmap [n_posts, D]
-            - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
-            - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
+            - target_posts_df: Pandas DataFrame with split, like_emb_idx, neg_emb_idx
+            - history_df: Pandas DataFrame with target_did, like_uri, prior_emb_indices
             - embed_dim: Integer embedding dimensionality D
     
     Raises:
@@ -803,7 +803,7 @@ def load_training_data(
     # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
-    target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
+    target_posts_df = pd.read_parquet(get_latest_parquet_path(target_posts_dir, "target_posts_"))
     logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
@@ -815,7 +815,7 @@ def load_training_data(
         folder="03_user_history",
         fallback_folder="02_featurize",  # Legacy compatibility
     )
-    history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
+    history_df = pd.read_parquet(get_latest_parquet_path(history_dir, "history_posts_"))
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
     return embeddings_mmap, target_posts_df, history_df, embed_dim
@@ -865,8 +865,8 @@ def _resolve_prior(
 # ---------------------------------------------------------------------------
 
 def _prepare_split_data(
-    target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
+    target_posts_df: pd.DataFrame,
+    history_df: pd.DataFrame,
     split: str,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
@@ -915,39 +915,35 @@ def _prepare_split_data(
     # Filter to requested split and drop rows missing negative samples
     # (negative samples may be missing if the negative sampling stage failed
     # to find a suitable negative for that user-post pair)
-    tp = target_posts_df.filter(
-        (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
-    )
+    tp = target_posts_df[
+        (target_posts_df["split"] == split) & target_posts_df["neg_emb_idx"].notna()
+    ]
     logger.info(f"  Split '{split}': {len(tp):,} target rows (after dropping null neg_emb_idx)")
 
     # Join target posts with user history on (user_id, post_uri) to get the
     # engagement sequence for each target. History is pre-filtered to exclude
     # the target post itself (temporal validity).
-    joined = tp.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
-        on=["target_did", "like_uri"],
-        how="left",
-    )
+    history_sub = history_df[["target_did", "like_uri", "prior_emb_indices"]]
+    joined = tp.merge(history_sub, on=["target_did", "like_uri"], how="left")
 
     # Extract embedding indices for positive and negative posts
     like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
     neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
-    target_dids = joined["target_did"].to_list()
-    like_uris = joined["like_uri"].to_list()
-    neg_uris = joined["neg_uri"].to_list()
+    target_dids = joined["target_did"].tolist()
+    like_uris = joined["like_uri"].tolist()
+    neg_uris = joined["neg_uri"].tolist()
 
-    # Convert Polars List[UInt32] column to Python list of numpy arrays
-    # This allows each user to have a different history length (variable-length)
-    # while still supporting fast numpy indexing into the embeddings memmap
+    # Convert list column to Python list of numpy arrays (pandas may have list/array/object dtype)
     prior_col = joined["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
-    for row_val in prior_col.to_list():
-        if row_val is None or len(row_val) == 0:
-            # Users with no history get an empty array (will become zero vector
-            # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
+    for row_val in prior_col.tolist():
+        try:
+            if row_val is None or len(row_val) == 0:
+                prior_emb_indices_list.append(np.array([], dtype=np.uint32))
+            else:
+                prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
+        except (TypeError, ValueError):
             prior_emb_indices_list.append(np.array([], dtype=np.uint32))
-        else:
-            prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
     return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
 
@@ -1020,8 +1016,8 @@ class SummarizedEngagementDataset(Dataset):
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df: pl.DataFrame,
-        history_df: pl.DataFrame,
+        target_posts_df: pd.DataFrame,
+        history_df: pd.DataFrame,
         split: str,
         summarizer: UserSummarizer,
         embed_dim: int,
@@ -1193,8 +1189,8 @@ class SequenceEngagementDataset(Dataset):
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df: pl.DataFrame,
-        history_df: pl.DataFrame,
+        target_posts_df: pd.DataFrame,
+        history_df: pd.DataFrame,
         split: str,
         max_history_len: int,
         embed_dim: int,
