@@ -76,7 +76,7 @@ run_one() {
   local STATUS_FILE="$7"
 
   local CMD=(
-    python3 cli.py run-all --foreground
+    python3 cli.py --foreground
     --output-dir "$DATA_DIR_ABS"
     --start-from train --stop-after evaluate
     --model-type "$MODEL_TYPE"

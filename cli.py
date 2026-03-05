@@ -4,12 +4,11 @@
 Unified CLI for Engagement Prediction Pipeline
 =============================================
 
-Subcommands:
-- run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
+Runs the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate).
 
 Usage examples:
-    python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
+    python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
 """
 
 import argparse
@@ -32,7 +31,7 @@ CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints"
 PROCESSED_DATA_DIR = TINKERING_DIR / "processed_data"
 RESULTS_DIR = OUTPUTS_DIR / "holdout_evaluation_results"
 
-# Central default map for all run-all parameters
+# Central default map for all pipeline parameters
 DEFAULTS: Dict[str, Any] = {
     # Stage 1: Data filtering
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
@@ -247,7 +246,6 @@ def _load_config_file(path_str: str) -> Dict[str, Any]:
 def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     """Apply defaults, then config file values, then CLI overrides."""
     args_dict = vars(raw_args).copy()
-    command = args_dict.get("command")
     func = args_dict.get("func")
     config_path = args_dict.pop("config", None)
     config_data: Dict[str, Any] = {}
@@ -260,10 +258,8 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
         if unknown_keys:
             raise ValueError(f"Unknown config keys: {', '.join(sorted(unknown_keys))}")
         merged.update(config_data)
-    merged.update({k: v for k, v in args_dict.items() if k not in ("command", "func")})
+    merged.update({k: v for k, v in args_dict.items() if k != "func"})
     final_ns = argparse.Namespace(**merged)
-    # Preserve argparse-injected metadata
-    setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
     return final_ns
 
@@ -318,11 +314,11 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         pass
 
     if not args.foreground:
-        # Background via nohup by re-invoking run-all with --foreground and pinned --output-dir
+        # Background via nohup by re-invoking with --foreground and pinned --output-dir
         import shlex
         cli_args = []
         for k, v in vars(args).items():
-            if k in ("command", "foreground", "_initial_log", "output_dir", "func"):
+            if k in ("foreground", "_initial_log", "output_dir", "func"):
                 continue
             if v is None or v is False:
                 continue
@@ -337,7 +333,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
         py = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
-        args_str = ' '.join(shlex.quote(a) for a in (["run-all"] + cli_args))
+        args_str = ' '.join(shlex.quote(a) for a in cli_args)
         redir = shlex.quote(str(initial_log))
         cmd = f"nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
         print(f"▶️  Backgrounding run-all with nohup. Log: {initial_log}")
@@ -497,18 +493,15 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Engagement Prediction Pipeline CLI",
+        description="Engagement Prediction Pipeline CLI — runs the 5-stage pipeline end-to-end.",
         argument_default=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--config",
         type=str,
-        help="YAML/JSON config file with run-all parameters (CLI flags override config)",
+        help="YAML/JSON config file with pipeline parameters (CLI flags override config)",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # run-all (modular 5-stage end-to-end)
-    p_all = subparsers.add_parser("run-all", help="Run all 5 stages end-to-end. Defaults to background with nohup.")
+    p_all = parser
     # Stage 1 options
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
@@ -659,7 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Comma-separated list of evaluation module names to skip (e.g. cold_start_curves,performance_inequality)")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
-                          help_text="(Deprecated) Always enabled during sequential run-all")
+                          help_text="(Deprecated) Always enabled during sequential pipeline execution")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
                           choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
@@ -682,7 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Experiment tracking task name")
     _add_arg_with_default(p_all, "--experiment-tags", type=str, nargs="*", default=argparse.SUPPRESS,
                           help_text="Optional tags for the experiment tracker")
-    p_all.set_defaults(func=cmd_run_all)
+    parser.set_defaults(func=cmd_run_all)
 
     return parser
 

@@ -22,7 +22,6 @@ def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path):
         [
             "--config",
             str(config_path),
-            "run-all",
             "--epochs",
             "7",
             "--batch-size",
@@ -43,7 +42,7 @@ def test_merge_args_with_config_rejects_unknown_keys(tmp_path):
     config_path.write_text("unknown_flag: true\n")
 
     parser = cli.build_parser()
-    args = parser.parse_args(["--config", str(config_path), "run-all"])
+    args = parser.parse_args(["--config", str(config_path)])
 
     with pytest.raises(ValueError):
         cli._merge_args_with_config(args)
