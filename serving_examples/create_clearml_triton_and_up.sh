@@ -12,7 +12,8 @@ serving_id_arg=""
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 env_file="${script_dir}/docker.env"
-compose_file="${script_dir}/docker-compose-triton.yml"
+compose_file="${script_dir}/docker-compose-triton-gpu.yml"
+compose_file_arg_provided="0"
 
 log() {
   echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
@@ -29,6 +30,7 @@ Options:
   --service-name <name>   ClearML Serving service name (default: "$service_name")
   --endpoint <endpoint>   Endpoint name (default: <model-type>)
   --preprocess <path>     Preprocess script path (default: based on --model-type)
+  --compose-file <path>   Docker compose yml path (if relative, resolved from \$PWD; default: "$compose_file")
   -h, --help              Show this help
 EOF
 }
@@ -61,6 +63,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --preprocess)
       preprocess_path="${2:-}"
+      shift 2
+      ;;
+    --compose-file)
+      compose_file="${2:-}"
+      compose_file_arg_provided="1"
       shift 2
       ;;
     -h|--help)
@@ -99,6 +106,15 @@ esac
 
 if [[ -z "$endpoint" ]]; then
   endpoint="$model_type"
+fi
+
+if [[ "$compose_file_arg_provided" == "1" ]]; then
+  if [[ "$compose_file" == "~/"* ]]; then
+    compose_file="${HOME}/${compose_file#"~/"}"
+  fi
+  if [[ "$compose_file" != /* ]]; then
+    compose_file="$(pwd -P)/${compose_file}"
+  fi
 fi
 
 if ! command -v clearml-serving >/dev/null 2>&1; then

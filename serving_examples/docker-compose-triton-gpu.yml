@@ -134,7 +134,7 @@ services:
       CLEARML_SERVING_TASK_ID: ${CLEARML_SERVING_TASK_ID:-}
       CLEARML_TRITON_POLL_FREQ: ${CLEARML_TRITON_POLL_FREQ:-0.25}
       CLEARML_TRITON_METRIC_FREQ: ${CLEARML_TRITON_METRIC_FREQ:-1.0}
-      CLEARML_EXTRA_PYTHON_PACKAGES: ${CLEARML_EXTRA_PYTHON_PACKAGES:-}
+      CLEARML_EXTRA_PYTHON_PACKAGES: ${CLEARML_EXTRA_PYTHON_PACKAGES:-}      
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
@@ -145,6 +145,11 @@ services:
       - kafka
     networks:
       - clearml-serving-backend
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
 
   clearml-serving-statistics:
     image: clearml/clearml-serving-statistics:latest
