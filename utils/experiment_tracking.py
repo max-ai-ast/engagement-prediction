@@ -206,7 +206,8 @@ class ClearMLExperimentTracker:
         om = OutputModel(
             task=self._task, 
             name=name, 
-            framework='pytorch'
+            framework='pytorch',
+            tags=['candidate'],
         )
         om.update_weights(str(p))
 
