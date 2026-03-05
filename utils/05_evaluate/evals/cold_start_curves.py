@@ -269,8 +269,8 @@ class ColdStartCurvesModule(EvalModule):
             if len(bin_data) == 0:
                 continue
 
-            y_true = bin_data['y_true'].values
-            y_pred_proba = bin_data['y_pred_proba'].values
+            y_true = bin_data['y_true'].to_numpy()
+            y_pred_proba = bin_data['y_pred_proba'].to_numpy()
             metrics = compute_classification_metrics(y_true, y_pred_proba)
 
             row: Dict[str, Any] = {
@@ -305,7 +305,7 @@ class ColdStartCurvesModule(EvalModule):
 
         bin_order = list(agg_df['bin'])
         agg_x = list(range(len(agg_df)))
-        agg_y = agg_df[metric].values
+        agg_y = agg_df[metric].to_numpy()
         color = self.METRIC_COLORS.get(metric, '#333333')
 
         fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
@@ -316,7 +316,7 @@ class ColdStartCurvesModule(EvalModule):
             label='Aggregate (all posts)',
         )
 
-        for xi, yi, n in zip(agg_x, agg_y, agg_df['n_predictions'].values):
+        for xi, yi, n in zip(agg_x, agg_y, agg_df['n_predictions'].to_numpy()):
             if not np.isnan(yi):
                 ax.annotate(
                     f'n={n}', (xi, yi),
@@ -355,7 +355,7 @@ class ColdStartCurvesModule(EvalModule):
             .reindex(bin_pred_counts.index)
         )
 
-        ax1.bar(range(len(bin_pred_counts)), bin_pred_counts.values,
+        ax1.bar(range(len(bin_pred_counts)), bin_pred_counts.to_numpy(),
                 color='steelblue', edgecolor='black')
         ax1.set_xticks(range(len(bin_pred_counts)))
         ax1.set_xticklabels(bin_pred_counts.index, rotation=45, ha='right')
@@ -363,10 +363,10 @@ class ColdStartCurvesModule(EvalModule):
         ax1.set_ylabel('Number of Predictions', fontsize=11)
         ax1.set_title('Predictions Distribution Across History Length Bins', fontsize=12)
         ax1.grid(True, alpha=0.3, axis='y')
-        for i, v in enumerate(bin_pred_counts.values):
+        for i, v in enumerate(bin_pred_counts.to_numpy()):
             ax1.text(i, v + 0.5, str(v), ha='center', fontsize=9)
 
-        ax2.bar(range(len(bin_user_counts)), bin_user_counts.values,
+        ax2.bar(range(len(bin_user_counts)), bin_user_counts.to_numpy(),
                 color='darkorange', edgecolor='black')
         ax2.set_xticks(range(len(bin_user_counts)))
         ax2.set_xticklabels(bin_user_counts.index, rotation=45, ha='right')
@@ -374,7 +374,7 @@ class ColdStartCurvesModule(EvalModule):
         ax2.set_ylabel('Number of Users', fontsize=11)
         ax2.set_title('Unique Users per History Length Bin', fontsize=12)
         ax2.grid(True, alpha=0.3, axis='y')
-        for i, v in enumerate(bin_user_counts.values):
+        for i, v in enumerate(bin_user_counts.to_numpy()):
             ax2.text(i, v + 0.5, str(v), ha='center', fontsize=9)
 
         plt.tight_layout()
@@ -408,7 +408,7 @@ class ColdStartCurvesModule(EvalModule):
             if metric not in binned_metrics.columns:
                 continue
 
-            values = binned_metrics[metric].dropna().values
+            values = binned_metrics[metric].dropna().to_numpy()
             if len(values) < 2:
                 continue
 

@@ -81,7 +81,7 @@ class PerformanceInequalityModule(EvalModule):
         gini_results = {}
         for metric in self.METRICS_TO_ANALYZE:
             if metric in per_user_df.columns:
-                values = per_user_df[metric].dropna().values
+                values = per_user_df[metric].dropna().to_numpy()
                 if len(values) > 0:
                     gini = compute_gini_coefficient(values)
                     gini_results[f"gini_{metric}"] = gini
@@ -101,7 +101,7 @@ class PerformanceInequalityModule(EvalModule):
         plot_paths = {}
         for metric in self.METRICS_TO_ANALYZE:
             if metric in per_user_df.columns:
-                values = per_user_df[metric].dropna().values
+                values = per_user_df[metric].dropna().to_numpy()
                 if len(values) > 1:
                     plot_path = out_dir / f"lorenz_{metric}.png"
                     self._plot_lorenz_curve(
@@ -195,7 +195,7 @@ class PerformanceInequalityModule(EvalModule):
         for metric in self.METRICS_TO_ANALYZE:
             if metric not in per_user_df.columns:
                 continue
-            values = per_user_df[metric].dropna().values
+            values = per_user_df[metric].dropna().to_numpy()
             if len(values) < 2:
                 continue
             
@@ -243,7 +243,7 @@ class PerformanceInequalityModule(EvalModule):
         
         for idx, metric in enumerate(metrics):
             ax = axes[idx]
-            values = per_user_df[metric].dropna().values
+            values = per_user_df[metric].dropna().to_numpy()
             
             if len(values) == 0:
                 ax.text(0.5, 0.5, 'No data', ha='center', va='center', fontsize=12)
