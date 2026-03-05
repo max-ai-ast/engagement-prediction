@@ -912,6 +912,12 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
+    # Normalize to pandas: tests and some callers may pass Polars DataFrames
+    if hasattr(target_posts_df, "to_pandas"):
+        target_posts_df = target_posts_df.to_pandas()
+    if hasattr(history_df, "to_pandas"):
+        history_df = history_df.to_pandas()
+
     # Filter to requested split and drop rows missing negative samples
     # (negative samples may be missing if the negative sampling stage failed
     # to find a suitable negative for that user-post pair)
