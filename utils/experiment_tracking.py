@@ -195,7 +195,21 @@ class ClearMLExperimentTracker:
         p = Path(path)
         if not p.exists():
             return
-        OutputModel(task=self._task, name=name).update_weights(str(p))
+        
+        # create the OutputModel and upload the file as its weights/artifact
+        
+        om = OutputModel(
+            task=self._task, 
+            name=name, 
+            framework='pytorch'
+        )
+        om.update_weights(str(p))
+
+        # also attach useful metadata
+        script = self._task.data.script
+        om.set_metadata("git_repo", getattr(script, "repository", ""))
+        om.set_metadata("git_branch", getattr(script, "branch", ""))
+        om.set_metadata("git_sha", getattr(script, "version_num", ""))
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         self._task.connect(params, name=name)
