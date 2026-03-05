@@ -4,10 +4,12 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Union
+import logging
 
 import torch
 from clearml import Model
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 
@@ -26,6 +28,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
+
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # -------------------------
 # Config
@@ -74,18 +82,7 @@ def _choose_device() -> torch.device:
 def _find_model_file(path: str) -> str:
     if os.path.isfile(path):
         return path
-    if not os.path.isdir(path):
-        raise RuntimeError(f"ClearML local copy path not found: {path}")
-
-    candidates: List[str] = []
-    for root, _, files in os.walk(path):
-        for f in files:
-            if f.endswith((".pt", ".pth", ".ts")):
-                candidates.append(os.path.join(root, f))
-
-    if not candidates:
-        raise RuntimeError(f"No model file (*.pt/*.pth/*.ts) found under: {path}")
-    return sorted(candidates)[0]
+    raise RuntimeError(f"ClearML local copy path is not a file: {path}")
 
 
 def _coerce_inputs_to_batched_tensor(
@@ -157,7 +154,9 @@ def _load_model_inner() -> None:
 
     device = _choose_device()
 
+    model_id = None
     model_path_env = os.getenv("MODEL_PATH")
+
     if model_path_env:
         model_file = _find_model_file(model_path_env)
     else:
@@ -165,7 +164,6 @@ def _load_model_inner() -> None:
         if not model_id:
             raise RuntimeError("Either MODEL_PATH or CLEARML_MODEL_ID env var is required")
 
-        # Download artifact referenced by ClearML model registry entry
         cm = Model(model_id=model_id)
         local_copy = cm.get_local_copy()
         model_file = _find_model_file(local_copy)
@@ -178,6 +176,13 @@ def _load_model_inner() -> None:
     _model = m
     _device = device
     _model_path = model_file
+
+    logger.info(
+        "Model loaded successfully | model_id=%s | model_path=%s | device=%s",
+        model_id,
+        model_file,
+        device,
+    )
 
 
 def ensure_model_loaded() -> None:
@@ -231,16 +236,20 @@ def healthz() -> dict:
 
 
 @app.get("/readyz")
-def readyz() -> dict:
-    # Ready only when the model is loaded.
-    return {
-        "ready": _loaded_event.is_set(),
+def readyz():
+    ready = _loaded_event.is_set()
+
+    payload = {
+        "ready": ready,
         "device": str(_device) if _device else None,
         "model_path": _model_path,
         "load_error": _load_error,
         "load_started_at": _load_started_at,
         "load_finished_at": _load_finished_at,
     }
+
+    status = 200 if ready else 503
+    return JSONResponse(content=payload, status_code=status)
 
 
 @app.post("/predict")
@@ -262,3 +271,9 @@ def predict(req: PredictRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"Inference failed: {e}")
 
     return {"outputs": _to_python(y)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

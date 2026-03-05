@@ -21,6 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Run as non-root (Cloud Run-friendly).
 RUN useradd --create-home --shell /bin/bash --uid 10001 appuser
 
+# Create writable cache directories for the non-root user
+RUN mkdir -p /tmp/.cache /tmp/torch /tmp/clearml \
+    && chown -R appuser:appuser /tmp/.cache /tmp/torch /tmp/clearml
+
 # Upgrade pip
 RUN python3 -m pip install --no-cache-dir --upgrade pip
 
