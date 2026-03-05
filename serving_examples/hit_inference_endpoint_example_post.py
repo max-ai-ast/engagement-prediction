@@ -10,8 +10,10 @@ def main():
     batch_size = 3
     embed_dim = 384
     
+    rng = np.random.default_rng(42)
+
     # generate inputs
-    post_embeddings = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
+    post_embeddings = (rng.random((batch_size, embed_dim)) - 0.5).tolist()
 
     payload = {
         "post_embeddings": post_embeddings
