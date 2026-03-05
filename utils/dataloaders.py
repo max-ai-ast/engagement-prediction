@@ -117,7 +117,7 @@ from torch.utils.data import Dataset
 from utils.pipeline.core import Context, select_prior_output
 from utils.helpers import (
     get_stage_logger,
-    get_latest_parquet_path,
+    load_parquet_from_prior,
     log_operation_start,
 )
 from shared.input_data_helpers import get_padded_embedding_history_and_mask
@@ -887,7 +887,7 @@ def load_training_data(
     # --- 2. Target posts from 02_target_posts ---
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
-    target_posts_df = pl.read_parquet(get_latest_parquet_path(target_posts_dir, "target_posts_"))
+    target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
     logger.info(f"Loaded target_posts: {target_posts_df.height:,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
@@ -898,7 +898,7 @@ def load_training_data(
         folder="03_user_history",
         fallback_folder="02_featurize",  # Legacy compatibility
     )
-    history_df = pl.read_parquet(get_latest_parquet_path(history_dir, "history_posts_"))
+    history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {history_df.height:,} rows")
 
     return embeddings_mmap, target_posts_df, history_df, embed_dim
@@ -948,8 +948,8 @@ def _resolve_prior(
 # ---------------------------------------------------------------------------
 
 def _prepare_split_data(
-    target_posts_df,
-    history_df,
+    target_posts_df: pl.DataFrame,
+    history_df: pl.DataFrame,
     split: str,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
@@ -1087,8 +1087,8 @@ class SummarizedEngagementDataset(Dataset):
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df,
-        history_df,
+        target_posts_df: pl.DataFrame,
+        history_df: pl.DataFrame,
         split: str,
         summarizer: UserSummarizer,
         embed_dim: int,
@@ -1260,8 +1260,8 @@ class SequenceEngagementDataset(Dataset):
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df,
-        history_df,
+        target_posts_df: pl.DataFrame,
+        history_df: pl.DataFrame,
         split: str,
         max_history_len: int,
         embed_dim: int,
