@@ -843,37 +843,51 @@ def load_training_data(
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
     """Locate and load the three upstream pipeline artifacts needed for training.
-
+    
+    This function abstracts away the complexity of finding prior stage outputs,
+    supporting both same-session pipeline runs (via context.artifacts) and
+    multi-session workflows (via filesystem scanning).
+    
     Resolution order for each artifact:
         1. context.artifacts - Set by pipeline when stages run in same session
         2. select_prior_output() - Filesystem scan for standalone training runs
         3. Fallback folders - Legacy compatibility (e.g., 02_featurize for history)
-
+    
     The three required artifacts:
         1. embeddings_*.npy   : Memmap array of post embeddings from Stage 1
         2. target_posts_*.parquet : Train/val/holdout split assignments from Stage 2
         3. history_posts_*.parquet: User engagement history from Stage 3
-
+    
     Args:
         run_dir: Root directory of the pipeline run
         context: Pipeline context with artifact tracking and configuration
         logger: Optional logger for progress reporting
-
+    
     Returns:
         Tuple of (embeddings_mmap, target_posts_df, history_df, embed_dim):
             - embeddings_mmap: Read-only numpy memmap [n_posts, D]
             - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
             - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
             - embed_dim: Integer embedding dimensionality D
-
+    
     Raises:
         FileNotFoundError: If any required artifact cannot be located
+        
+    Example:
+        >>> embeddings, targets, history, dim = load_training_data(
+        ...     run_dir=Path("/runs/experiment_001"),
+        ...     context=context,
+        ...     logger=logger
+        ... )
+        >>> print(f"Loaded {len(targets):,} target posts with {dim}-d embeddings")
     """
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
     run_dir = Path(run_dir).resolve()
 
     # --- 1. Embeddings memmap from 01_get_data ---
+    # This is a read-only memory-mapped array that allows accessing post
+    # embeddings without loading the entire matrix into RAM
     log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
     get_data_dir = _resolve_prior(run_dir, context, stage_key="get_data", folder="01_get_data")
     emb_candidates = sorted(get_data_dir.glob("embeddings_*.npy"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -885,12 +899,14 @@ def load_training_data(
     logger.info(f"Loaded embeddings memmap: shape={embeddings_mmap.shape}, path={embeddings_path}")
 
     # --- 2. Target posts from 02_target_posts ---
+    # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
     target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
-    logger.info(f"Loaded target_posts: {target_posts_df.height:,} rows")
+    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
+    # Contains the (most-recent-first-ordered) list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
     history_dir = _resolve_prior(
         run_dir, context,
@@ -899,7 +915,7 @@ def load_training_data(
         fallback_folder="02_featurize",  # Legacy compatibility
     )
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
-    logger.info(f"Loaded user_history: {history_df.height:,} rows")
+    logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
     return embeddings_mmap, target_posts_df, history_df, embed_dim
 
@@ -954,28 +970,28 @@ def _prepare_split_data(
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
     """Filter data to a single split and return aligned numpy arrays.
-
+    
     This internal helper performs the core data preparation logic shared by both
     SummarizedEngagementDataset and SequenceEngagementDataset. It:
     1. Filters target_posts to the requested split (train/val/holdout)
     2. Drops rows with missing negative samples
     3. Joins with user history to get engagement sequences
     4. Converts to numpy arrays for fast indexing
-
+    
     The returned arrays are **row-aligned**: position i in each array corresponds
     to the same user-post interaction. This alignment is critical for dataset
     __getitem__ to efficiently construct training samples.
-
+    
     Args:
-        target_posts_df: Full target posts Polars DataFrame with all splits.
-        history_df: User engagement history Polars DataFrame.
+        target_posts_df: Full target posts DataFrame with all splits
+        history_df: User engagement history DataFrame
         split: Split name to filter to ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         logger: Optional logger for progress reporting
-
+    
     Returns:
-        Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list,
+        Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list, 
                   target_dids, like_uris, neg_uris):
-
+        
         - like_emb_idx: Indices into embeddings memmap for positive posts [N]
         - neg_emb_idx: Indices into embeddings memmap for negative posts [N]
         - prior_emb_indices_list: List of N variable-length arrays, each containing
@@ -984,9 +1000,9 @@ def _prepare_split_data(
         - target_dids: User IDs as string array [N]
         - like_uris: Liked post URIs as string array [N]
         - neg_uris: Non-liked post URIs as string array [N]
-
+        
         Where N = number of target posts in the requested split (after filtering).
-
+    
     Note:
         Each target post row produces TWO training samples (positive + negative),
         so dataset length will be 2*N. This function returns N-length arrays that
@@ -995,23 +1011,39 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
+    # Filter to requested split and drop rows missing negative samples
+    # (negative samples may be missing if the negative sampling stage failed
+    # to find a suitable negative for that user-post pair)
     tp = target_posts_df.filter(
         (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
     )
-    logger.info(f"  Split '{split}': {tp.height:,} target rows (after dropping null neg_emb_idx)")
+    logger.info(f"  Split '{split}': {len(tp):,} target rows (after dropping null neg_emb_idx)")
 
-    history_sub = history_df.select("target_did", "like_uri", "prior_emb_indices")
-    joined = tp.join(history_sub, on=["target_did", "like_uri"], how="left", maintain_order="left")
+    # Join target posts with user history on (user_id, post_uri) to get the
+    # engagement sequence for each target. History is pre-filtered to exclude
+    # the target post itself (temporal validity).
+    joined = tp.join(
+        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        on=["target_did", "like_uri"],
+        how="left",
+    )
 
+    # Extract embedding indices for positive and negative posts
     like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
     neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
     target_dids = joined["target_did"].to_list()
     like_uris = joined["like_uri"].to_list()
     neg_uris = joined["neg_uri"].to_list()
 
+    # Convert Polars List[UInt32] column to Python list of numpy arrays
+    # This allows each user to have a different history length (variable-length)
+    # while still supporting fast numpy indexing into the embeddings memmap
+    prior_col = joined["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
-    for row_val in joined["prior_emb_indices"].to_list():
+    for row_val in prior_col.to_list():
         if row_val is None or len(row_val) == 0:
+            # Users with no history get an empty array (will become zero vector
+            # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
             prior_emb_indices_list.append(np.array([], dtype=np.uint32))
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))

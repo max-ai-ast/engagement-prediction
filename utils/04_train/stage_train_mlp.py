@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -619,15 +619,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     predictions_dir = out_dir / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame({
+    pl.DataFrame({
         "did": train_uids, "post_id": train_pids,
         "y_true": y_train, "y_pred_proba": p_train,
-    }).to_parquet(predictions_dir / "train.parquet", index=False)
+    }).write_parquet(predictions_dir / "train.parquet")
 
-    pd.DataFrame({
+    pl.DataFrame({
         "did": val_uids, "post_id": val_pids,
         "y_true": y_val, "y_pred_proba": p_val,
-    }).to_parquet(predictions_dir / "val.parquet", index=False)
+    }).write_parquet(predictions_dir / "val.parquet")
 
     # --- holdout eval ---
     holdout_metrics: Dict[str, Any] = {}
@@ -654,10 +654,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             if holdout_type == eval_holdout_type:
                 holdout_metrics = split_metrics
 
-            pd.DataFrame({
+            pl.DataFrame({
                 "did": holdout_uids, "post_id": holdout_pids,
                 "y_true": y_holdout, "y_pred_proba": p_holdout,
-            }).to_parquet(predictions_dir / f"{split_name}.parquet", index=False)
+            }).write_parquet(predictions_dir / f"{split_name}.parquet")
 
             if generate_plots and holdout_type == eval_holdout_type:
                 try:
