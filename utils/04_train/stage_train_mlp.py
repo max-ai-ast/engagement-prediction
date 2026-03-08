@@ -8,7 +8,7 @@ This stage trains Multi-Layer Perceptron (MLP) models for binary engagement pred
 user engagement history:
 
 ═══════════════════════════════════════════════════════════════════════════════
-APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (SummarizedMLP)
+APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (MLPModel, user_encoder="summarized")
 ═══════════════════════════════════════════════════════════════════════════════
 
 Uses SummarizedEngagementDataset with pluggable summarization strategies (mean,
@@ -20,7 +20,7 @@ Architecture:
     Output: Single sigmoid-activated probability
 
 ═══════════════════════════════════════════════════════════════════════════════
-APPROACH 2: MLP + LEARNED ATTENTION ENCODER (AttentionMLP)
+APPROACH 2: MLP + LEARNED ATTENTION ENCODER (MLPModel, user_encoder="full_transformer")
 ═══════════════════════════════════════════════════════════════════════════════
 
 Uses SequenceEngagementDataset with TransformerDualPoolingEncoder (transformer self-attention)
@@ -61,7 +61,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -72,7 +71,7 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, accuracy_score
 from torch.utils.data import DataLoader, Dataset
 
-from utils.pipeline.core import new_stage_timestamp_dir, Context
+from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
@@ -86,6 +85,7 @@ from utils.dataloaders import (
     get_summarizer,
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
+    SummarizedUserTower,
     TransformerDualPoolingEncoder,
     create_data_loaders,
 )
@@ -97,139 +97,26 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
 # Model Architectures
 # =============================================================================
 
-class SummarizedMLP(nn.Module):
-    """MLP engagement predictor using hand-crafted user history summarization.
-    
-    This is the simpler of two MLP architectures, accepting fixed-size concatenated
-    [user_summary || post_embedding] vectors from SummarizedEngagementDataset.
-    The user summary is computed by hand-crafted aggregation strategies (mean, EMA,
-    linear recency) applied during dataset initialization.
-    
-    The name "SummarizedMLP" reflects that this model works with pre-computed
-    user history SUMMARIES (via Summarizers like MeanSummarizer, EMASummarizer)
-    rather than learned ENCODERS (like TransformerDualPoolingEncoder).
-    
-    Architecture:
-        Input layer: Concatenated [user_summary || post_embedding] vector [2*D]
-        Hidden layers: Configurable stack of (Linear -> BatchNorm -> GELU -> Dropout)
-        Output layer: Linear -> Sigmoid producing engagement probability [0, 1]
-    
-    Design choices:
-        - BatchNorm for stable training with varying input distributions
-        - GELU activation for smooth gradients and better optimization
-        - Dropout for regularization (prevents overfitting to training users)
-        - Xavier initialization for faster convergence
-    
-    Args:
-        input_dim: Dimension of concatenated input (2 * embedding_dim)
-        hidden_dims: List of hidden layer sizes (e.g., [512, 256, 128])
-        dropout_rate: Dropout probability applied after each hidden layer
-    
-    Example:
-        >>> model = SummarizedMLP(input_dim=768, hidden_dims=[512, 256], dropout_rate=0.3)
-        >>> # Input: [batch, 768] -> Hidden: [batch, 512] -> [batch, 256] -> Output: [batch, 1]
-    """
 
-    def __init__(self, input_dim: int, hidden_dims: List[int], dropout_rate: float):
-        super().__init__()
-        # Build sequential network: repeated (Linear -> BatchNorm -> GELU -> Dropout) blocks
-        layers: List[nn.Module] = []
-        prev = input_dim
-        for h in hidden_dims:
-            layers.extend([
-                nn.Linear(prev, h),
-                nn.BatchNorm1d(h),
-                nn.GELU(),
-                nn.Dropout(dropout_rate),
-            ])
-            prev = h
-        # Final layer: Linear -> Sigmoid for binary classification
-        layers.append(nn.Linear(prev, 1))
-        layers.append(nn.Sigmoid())
-        self.network = nn.Sequential(*layers)
-        
-        # Initialize weights for stable training
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        print(f"model architecture: {input_dim} -> {' -> '.join(map(str, hidden_dims))} -> 1")
+class MLPModel(nn.Module):
+    """MLP engagement predictor with a pluggable user-history encoder.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the MLP.
-        
-        Args:
-            x: Input tensor [batch, input_dim]
-        
-        Returns:
-            Engagement probabilities [batch] in range [0, 1]
-        """
-        return self.network(x)
+    This mirrors `TwoTowerModel`: a single model class can be instantiated to
+    work with either dataset output format.
 
-    def compute_loss_and_preds(self, batch: Dict[str, torch.Tensor], device: str):
-        """Compute loss and predictions for a batch.
-        
-        This method provides a unified interface for training, validation, and
-        inference loops. It handles device transfer and loss computation.
-        
-        Args:
-            batch: Dictionary with "features" and "label" keys from SummarizedEngagementDataset
-            device: Device to run computation on ("cpu" or "cuda")
-        
-        Returns:
-            Tuple of (loss, predictions):
-                - loss: Scalar BCE loss tensor
-                - predictions: Predicted probabilities [batch]
-        """
-        feats = batch["features"].to(device)
-        labels = batch["label"].to(device)
-        preds = self(feats).squeeze(-1)
-        loss = F.binary_cross_entropy(preds, labels)
-        return loss, preds
+    - user_encoder_type="summarized": consumes `SummarizedEngagementDataset`
+      batches with {"features", "label"} where features is [B, 2*D]
+      concatenated [user_summary || post_embedding].
+    - user_encoder_type="full_transformer": consumes `SequenceEngagementDataset`
+      batches with {"history_embeddings", "history_mask", "target_post_embedding", "label"}.
 
-
-class AttentionMLP(nn.Module):
-    """MLP engagement predictor with learned attention-based user history encoder.
-    
-    This is the more sophisticated of two MLP architectures, using a trainable
-    TransformerDualPoolingEncoder (transformer self-attention) to learn optimal history
-    aggregation from raw embedding sequences. The encoder and MLP head are
-    trained jointly end-to-end. NOTE: THIS MODEL DOES NOT ACTUALLY PERFORM BETTER YET -- SOMETHING TO WORK ON.
-    
-    Architecture:
-        User encoder: TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [user_output_dim]
-        Concatenation: [user_vector || post_embedding] -> [user_output_dim + embed_dim]
-        MLP head: Stack of (Linear -> BatchNorm -> GELU -> Dropout) -> Linear -> Sigmoid
-    
-    Key differences from SummarizedMLP:
-        ✓ LEARNS history aggregation via attention (not hand-crafted)
-        ✓ Consumes SequenceEngagementDataset (not SummarizedEngagementDataset)
-        ✓ Can capture complex temporal patterns and inter-post relationships
-        ✗ More parameters to train (~2M for encoder + MLP)
-        ✗ Slower training and inference
-    
-    When to use:
-        - You have sufficient training data (>50K samples)
-        - Hand-crafted summarizers underperform
-        - You want the model to discover optimal aggregation
-        - Computational resources allow transformer training
-    
-    Args:
-        embed_dim: Dimensionality of post embeddings
-        hidden_dims: MLP head hidden layer sizes
-        dropout_rate: Dropout for MLP layers (not encoder, which has its own)
-        user_hidden_dim: TransformerDualPoolingEncoder internal hidden dimension
-        user_output_dim: TransformerDualPoolingEncoder output dimension (user vector size)
-        num_attention_heads: Number of attention heads in transformer
-        num_attention_layers: Number of transformer encoder layers
-        max_history_len: Maximum sequence length for positional embeddings
-        attention_dropout: Dropout rate for the TransformerDualPoolingEncoder
+    Forward signature is always:
+        forward(history_embeddings, history_mask, post_embedding) -> probabilities
     """
 
     def __init__(
         self,
-        embed_dim: int,
+        post_embedding_dim: int,
         hidden_dims: List[int],
         dropout_rate: float,
         user_hidden_dim: int,
@@ -238,24 +125,36 @@ class AttentionMLP(nn.Module):
         num_attention_layers: int,
         max_history_len: int,
         attention_dropout: float,
+        user_encoder_type: str,
     ):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.post_embedding_dim = post_embedding_dim
         self.user_output_dim = user_output_dim
+        self.user_encoder_type = user_encoder_type
 
-        # User "tower": Learned attention-based encoder over engagement history (can't actually be used separately like a true 2-tower)
-        self.user_encoder = TransformerDualPoolingEncoder(
-            input_dim=embed_dim,
-            hidden_dim=user_hidden_dim,
-            output_dim=user_output_dim,
-            num_attention_heads=num_attention_heads,
-            num_attention_layers=num_attention_layers,
-            max_seq_len=max_history_len,
-            dropout_rate=attention_dropout,
-        )
+        if user_encoder_type == "full_transformer":
+            self.user_encoder = TransformerDualPoolingEncoder(
+                input_dim=post_embedding_dim,
+                hidden_dim=user_hidden_dim,
+                output_dim=user_output_dim,
+                num_attention_heads=num_attention_heads,
+                num_attention_layers=num_attention_layers,
+                max_seq_len=max_history_len,
+                dropout_rate=attention_dropout,
+            )
+        elif user_encoder_type == "summarized":
+            if user_output_dim != post_embedding_dim:
+                raise ValueError(
+                    f"user_encoder_type='summarized' requires user_output_dim ({user_output_dim}) == post_embedding_dim ({post_embedding_dim})"
+                )
+            self.user_encoder = SummarizedUserTower()
+        else:
+            raise ValueError(
+                f"Unknown user_encoder_type '{user_encoder_type}' for MLPModel. "
+                "Choose 'summarized' or 'full_transformer'."
+            )
 
-        # MLP head: Processes concatenated [user_vec || post_emb] -> engagement probability
-        mlp_input_dim = user_output_dim + embed_dim
+        mlp_input_dim = user_output_dim + post_embedding_dim
         layers: List[nn.Module] = []
         prev = mlp_input_dim
         for h in hidden_dims:
@@ -270,66 +169,43 @@ class AttentionMLP(nn.Module):
         layers.append(nn.Sigmoid())
         self.mlp_head = nn.Sequential(*layers)
 
-        # Initialize MLP head weights (user_encoder handles its own initialization)
         for m in self.mlp_head.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        print(
-            f"AttentionMLP architecture: user_encoder({embed_dim}->{user_output_dim}) "
-            f"+ post({embed_dim}) -> MLP({mlp_input_dim} -> "
-            f"{' -> '.join(map(str, hidden_dims))} -> 1)"
-        )
+    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+        return self.user_encoder(history_embeddings, history_mask)
 
     def forward(
         self,
-        history_embeddings: torch.Tensor,  # [B, seq_len, embed_dim]
-        history_mask: torch.Tensor,         # [B, seq_len]
-        post_embedding: torch.Tensor,       # [B, embed_dim]
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        post_embedding: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass through user encoder and MLP head.
-        
-        Args:
-            history_embeddings: Padded user history sequences [batch, seq_len, embed_dim]
-            history_mask: Boolean mask [batch, seq_len], True = valid position
-            post_embedding: Target post embeddings [batch, embed_dim]
-        
-        Returns:
-            Engagement probabilities [batch] in range [0, 1]
-        """
-        # Encode user history into fixed-size representation
-        user_vec = self.user_encoder(history_embeddings, history_mask)
-        # Concatenate user and post representations
+        user_vec = self.encode_user(history_embeddings, history_mask)
         x = torch.cat([user_vec, post_embedding], dim=-1)
-        # Pass through MLP head
         return self.mlp_head(x)
 
-    def compute_loss_and_preds(self, batch: Dict[str, torch.Tensor], device: str):
-        """Compute loss and predictions for a batch.
-        
-        This method provides a unified interface for training, validation, and
-        inference loops. It handles device transfer and loss computation.
-        
-        Args:
-            batch: Dictionary from SequenceEngagementDataset with keys:
-                   - "history_embeddings": [batch, seq_len, embed_dim]
-                   - "history_mask": [batch, seq_len]
-                   - "target_post_embedding": [batch, embed_dim]
-                   - "label": [batch]
-            device: Device to run computation on ("cpu" or "cuda")
-        
-        Returns:
-            Tuple of (loss, predictions):
-                - loss: Scalar BCE loss tensor
-                - predictions: Predicted probabilities [batch]
-        """
-        history_emb = batch["history_embeddings"].to(device)
-        history_mask = batch["history_mask"].to(device)
-        target_emb = batch["target_post_embedding"].to(device)
+    def compute_loss_and_preds(self, batch: Dict[str, Any], device: str):
+        if self.user_encoder_type == "summarized":
+            features = batch["features"].to(device)  # [B, 2*D]
+            user_summary = features[:, : self.post_embedding_dim]
+            post_embedding = features[:, self.post_embedding_dim :]
+            history_embeddings = user_summary.unsqueeze(1)  # [B, 1, D]
+            history_mask = torch.ones(
+                (history_embeddings.shape[0], history_embeddings.shape[1]),
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            history_embeddings = batch["history_embeddings"].to(device)
+            history_mask = batch["history_mask"].to(device)
+            post_embedding = batch["target_post_embedding"].to(device)
+
         labels = batch["label"].to(device)
-        preds = self(history_emb, history_mask, target_emb).squeeze(-1)
+        preds = self(history_embeddings, history_mask, post_embedding).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
@@ -453,11 +329,11 @@ def train_mlp_model(
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     device = get_device(args.device)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = context.run_timestamp
 
     # --- output dirs ---
     run_tag = args.run_tag or ""
-    out_dir = new_stage_timestamp_dir(run_dir, "04_train", tag=run_tag)
+    out_dir = context.new_stage_dir("04_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"
@@ -495,6 +371,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
 
+    # User-encoder settings (passed through; some are unused in summarized mode)
+    max_history_len = int(args.max_history_len)
+    user_hidden_dim = int(args.user_hidden_dim)
+    user_output_dim = int(args.user_output_dim)
+    num_attention_heads = int(args.num_attention_heads)
+    num_attention_layers = int(args.num_attention_layers)
+    attention_dropout = float(args.attention_dropout)
+    effective_user_output_dim = user_output_dim
+
     # Worker settings (shared by all encoder types)
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
@@ -518,7 +403,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
         input_dim = 2 * embed_dim  # [user_summary || post_embedding]
-        model = SummarizedMLP(input_dim, hidden_dims, dropout_rate)
+        effective_user_output_dim = embed_dim
+        model = MLPModel(
+            post_embedding_dim=embed_dim,
+            hidden_dims=hidden_dims,
+            dropout_rate=dropout_rate,
+            user_hidden_dim=user_hidden_dim,
+            user_output_dim=effective_user_output_dim,
+            num_attention_heads=num_attention_heads,
+            num_attention_layers=num_attention_layers,
+            max_history_len=max_history_len,
+            attention_dropout=attention_dropout,
+            user_encoder_type="summarized",
+        )
         
         train_loader, val_loader, _ = create_data_loaders(
             train_dataset, val_dataset, batch_size,
@@ -529,14 +426,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     elif user_encoder == "full_transformer":
-        # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
+        # Sequence dataset + learned encoder + MLP head
         logger.info("User encoder: full_transformer (TransformerDualPoolingEncoder + MLP)")
-        max_history_len = int(args.max_history_len)
-        user_hidden_dim = int(args.user_hidden_dim)
-        user_output_dim = int(args.user_output_dim)
-        num_attention_heads = int(args.num_attention_heads)
-        num_attention_layers = int(args.num_attention_layers)
-        attention_dropout = float(args.attention_dropout)
         summarizer_name = "full_transformer"  # for config logging
         ema_alpha = 0.0
 
@@ -550,10 +441,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
 
-        # AttentionMLP uses user_output_dim (not shared_dim) since user vector is 
-        # concatenated with post embedding, not compared via dot product like TwoTower
-        model = AttentionMLP(
-            embed_dim=embed_dim,
+        model = MLPModel(
+            post_embedding_dim=embed_dim,
             hidden_dims=hidden_dims,
             dropout_rate=dropout_rate,
             user_hidden_dim=user_hidden_dim,
@@ -562,6 +451,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             num_attention_layers=num_attention_layers,
             max_history_len=max_history_len,
             attention_dropout=attention_dropout,
+            user_encoder_type="full_transformer",
         )
 
         train_loader, val_loader, _ = create_data_loaders(
@@ -684,6 +574,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "hidden_dims": hidden_dims,
                 "dropout_rate": dropout_rate,
                 "embed_dim": embed_dim,
+                "user_hidden_dim": user_hidden_dim,
+                "user_output_dim": effective_user_output_dim,
+                "num_attention_heads": num_attention_heads,
+                "num_attention_layers": num_attention_layers,
+                "max_history_len": max_history_len,
+                "attention_dropout": attention_dropout,
                 "user_summarization": summarizer_name,
                 "ema_alpha": ema_alpha,
                 "training_results": tr_sanitized,
@@ -703,7 +599,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
-        context.tracker.log_artifact(name="trained_model_mlp", path=model_path)
+
+        # save TorchScript file, which is the format needed for ClearML serving
+        torchscript_name = f"torchscript_mlp_model_{timestamp}"
+        torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
+        torch.jit.script(trained_model).save(torchscript_path)
+        context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
 
     # --- holdout eval ---
     holdout_metrics: Dict[str, Any] = {}
@@ -749,6 +650,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "input_dim": input_dim,
         "hidden_dims": hidden_dims,
         "dropout_rate": dropout_rate,
+        "user_hidden_dim": user_hidden_dim,
+        "user_output_dim": effective_user_output_dim,
+        "num_attention_heads": num_attention_heads,
+        "num_attention_layers": num_attention_layers,
+        "max_history_len": max_history_len,
+        "attention_dropout": attention_dropout,
         "user_summarization": summarizer_name,
         "ema_alpha": ema_alpha,
         "batch_size": batch_size,

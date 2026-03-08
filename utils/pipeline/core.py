@@ -27,13 +27,30 @@ UTILS_DIR = CURR.parent.parent
 ROOT = UTILS_DIR.parent
 
 
+RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+
+
+def generate_run_timestamp() -> str:
+    # Keep consistent with historical CLI naming (local time, second resolution).
+    return datetime.now().strftime(RUN_TIMESTAMP_FORMAT)
+
+
 @dataclass
 class Context:
     run_dir: Path
+    run_timestamp: str = field(default_factory=generate_run_timestamp)
     use_latest: bool = True
     prior_outputs: Dict[str, Optional[Path]] = field(default_factory=dict)
     artifacts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     tracker: ExperimentTracker = field(default_factory=NoOpExperimentTracker)
+
+    def new_stage_dir(self, stage_name: str, tag: str = "") -> Path:
+        return new_stage_timestamp_dir(
+            Path(self.run_dir).resolve(),
+            stage_name,
+            tag=tag,
+            timestamp=self.run_timestamp,
+        )
 
     def record_artifact(self, stage: str, output_dir: Path, extras: Optional[Dict[str, Any]] = None) -> None:
         self.artifacts[stage] = {
@@ -52,9 +69,15 @@ def stage_base_dir(run_dir: Path, stage_name: str) -> Path:
     return base
 
 
-def new_stage_timestamp_dir(run_dir: Path, stage_name: str, tag: str = "") -> Path:
+def new_stage_timestamp_dir(
+    run_dir: Path,
+    stage_name: str,
+    tag: str = "",
+    *,
+    timestamp: Optional[str] = None,
+) -> Path:
     base = stage_base_dir(run_dir, stage_name)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = str(timestamp).strip() if timestamp else generate_run_timestamp()
     dirname = f"{ts}_{tag}" if tag else ts
     out = base / dirname
     # Collision-safe: if the dir already exists (parallel jobs at same second),
@@ -130,5 +153,3 @@ def load_run_callable(module_path: Path) -> Callable[[Context, Any], Dict[str, A
     if not hasattr(mod, 'run'):
         raise AttributeError(f"Stage module {module_path} has no run(context, args) function")
     return getattr(mod, 'run')
-
-

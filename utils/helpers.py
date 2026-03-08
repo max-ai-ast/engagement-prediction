@@ -14,9 +14,6 @@ import os
 import sys
 import json
 import random
-import base64
-import struct
-import zlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any, TYPE_CHECKING
 from datetime import datetime, timedelta, timezone
@@ -102,119 +99,6 @@ def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
     if not candidates:
         raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
     return pl.scan_parquet(candidates[0])
-
-
-# ----------------------------------------
-# Embeddings helpers
-# ----------------------------------------
-
-# Known embedding model dimensions
-EMBEDDING_MODEL_DIMS: Dict[str, int] = {
-    "all_MiniLM_L6_v2": 384,
-    "all_MiniLM_L12_v2": 384,
-    "all-MiniLM-L6-v2": 384,
-    "all-MiniLM-L12-v2": 384,
-    "paraphrase-MiniLM-L6-v2": 384,
-    "multi-qa-MiniLM-L6-cos-v1": 384,
-}
-
-
-def get_embedding_dim_for_model(embedding_model: str) -> int:
-    """
-    Get the embedding dimension for a known model name.
-    
-    Args:
-        embedding_model: Name of the embedding model
-        
-    Returns:
-        Embedding dimension (e.g., 384 for MiniLM models)
-        
-    Raises:
-        ValueError: If model name is not in EMBEDDING_MODEL_DIMS
-    """
-    if embedding_model not in EMBEDDING_MODEL_DIMS:
-        known_models = ", ".join(sorted(EMBEDDING_MODEL_DIMS.keys()))
-        raise ValueError(
-            f"Unknown embedding model '{embedding_model}'. "
-            f"Known models: {known_models}. "
-            f"Add new models to EMBEDDING_MODEL_DIMS in helpers.py."
-        )
-    return EMBEDDING_MODEL_DIMS[embedding_model]
-
-
-def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
-    import polars as pl
-    emb_str = (
-        pl.col("embeddings")
-        .list.eval(
-            pl.when(pl.element().struct.field("key") == embedding_model)
-              .then(pl.element().struct.field("value"))
-        )
-        .list.drop_nulls()
-        .list.get(0)
-    )
-    emb_vec = emb_str.map_elements(
-        lambda s: _embedding_loads(s, decompress=True) if s is not None else None,
-        return_dtype=pl.List(pl.Float32),
-    )
-    return lf.with_columns(emb_vec.alias("_emb_vec"))
-
-
-def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
-    import polars as pl
-    lf_with_emb = get_embeddings_list_col(lf, embedding_model)
-    return (
-        lf_with_emb
-        .select(pl.col("_emb_vec").list.len().alias("dim"))
-        .filter(pl.col("dim").is_not_null())
-        .head(1)
-        .collect(engine="streaming")
-        .item()
-    )
-
-
-def expand_embeddings_polars(
-    lf: pl.LazyFrame,
-    embedding_model: str,
-    embed_dim: int
-) -> pl.LazyFrame:
-    import polars as pl
-    lf = get_embeddings_list_col(lf, embedding_model)
-    return (
-        lf
-        .with_columns(
-            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(embed_dim)]
-        ).drop(["embeddings", "_emb_vec"])
-    )
-
-
-def get_embed_col_names(dim: int) -> List[str]:
-    """Generate embedding column names for given dimension."""
-    return [f"post_emb_{i}" for i in range(dim)]
-
-
-def _embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
-    """
-    Convert an embedding from a base85-encoded string to a list of floats.
-
-    If `decompress` is `True`, decompress with zlib and throw an error if decompression fails.
-
-    If `decompress` is `False`, do not decompress before unpacking.
-
-    If `decompress` is `None`, attempt decompression and silently fallback to an uncompressed string
-    if decompression fails.
-    """
-
-    bs = base64.b85decode(s.encode())
-
-    if decompress or decompress is None:
-        try:
-            bs = zlib.decompress(bs)
-        except zlib.error:
-            if decompress:
-                raise
-
-    return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
 
 
 # ----------------------------------------

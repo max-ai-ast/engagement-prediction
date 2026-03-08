@@ -26,7 +26,7 @@ notebooks/
 nohup.out
 
 # Environment
-.env
+*.env
 .venv/
 venv/
 ENV/

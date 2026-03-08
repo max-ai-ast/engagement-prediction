@@ -360,3 +360,28 @@ def test_write_embeddings_memmap_handles_missing_embeddings(tmp_path, stage_get_
     assert np.allclose(mmap[uri_to_idx["post:3"]], [0.7, 0.8, 0.9], atol=1e-5)
     
     del mmap
+
+
+def test_get_embeddings_list_col_extracts_and_decodes(stage_get_data_module):
+    target_model = "model_b"
+    expected_vec = [0.1, 0.2, 0.3]
+
+    df = pl.DataFrame(
+        {
+            "embeddings": [
+                [
+                    {"key": "model_a", "value": _encode_embedding([9.9])},
+                    {"key": target_model, "value": _encode_embedding(expected_vec)},
+                ],
+                [{"key": "model_a", "value": _encode_embedding([1.0, 2.0])}],
+                None,
+            ]
+        }
+    )
+
+    out = stage_get_data_module.get_embeddings_list_col_polars(df.lazy(), target_model).collect()
+    got = out["_emb_vec"].to_list()
+
+    assert got[0] == pytest.approx(expected_vec, rel=1e-6, abs=1e-6)
+    assert got[1] is None
+    assert got[2] is None

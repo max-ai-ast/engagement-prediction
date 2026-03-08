@@ -30,7 +30,7 @@ This report documents only the code under `wills_tinkering_folder`. It covers th
   - Entrypoint: `utils/06_evaluate/stage_evaluate.py`
   - Output: `outputs/<run>/evaluate/<ts>_{mode}/...`
 
-A one-shot wrapper `cli.py run-all` orchestrates the above in sequence (with nohup/backgrounding by default). Individual stages are also exposed as subcommands.
+A one-shot wrapper `cli.py` orchestrates the above in sequence (foreground by default; use `--background` for nohup). The historical `run-all` token is optional and kept for backwards compatibility.
 
 ---
 
@@ -150,7 +150,7 @@ Subcommands:
 - `train`: train on preprocessed data
 - `evaluate`: evaluate a saved model on preprocessed data
 - `train-eval`: train using `embedding_bundle.pkl` + `user_splits.json` then run Stage 4
-- `run-all`: full 6-stage modular pipeline (get_data → featurize → relevel → split → train → evaluate), creating a run directory and backgrounding via nohup by default
+- `run-all` (optional): full modular pipeline (get_data → … → evaluate), creating a run directory (use `--background` to run via nohup)
 
 Examples:
 ```603:705:/srv/vox/engagement_prediction/wills_tinkering_folder/cli.py
@@ -158,7 +158,7 @@ Examples:
 ```
 Run all stages (backgrounded):
 ```bash
-python wills_tinkering_folder/cli.py run-all --use-latest \
+python wills_tinkering_folder/cli.py --use-latest \
   --max-files-per-table 5 \
   --image-mode auto \
   --max-posts-per-author 3 \
@@ -199,13 +199,13 @@ Feature schema parity is enforced at evaluation via `feature_columns` saved in t
 
 1) Stage 1 — Get data:
 ```bash
-python wills_tinkering_folder/cli.py run-all --foreground --use-latest --max-files-per-table 5 --image-mode auto
+python wills_tinkering_folder/cli.py --use-latest --max-files-per-table 5 --image-mode auto
 ```
-Subsequent stages are orchestrated automatically by run-all.
+Subsequent stages are orchestrated automatically by the pipeline runner.
 
 Or, end-to-end:
 ```bash
-python wills_tinkering_folder/cli.py run-all --global-topic-k 20 --relevel-strategy uniform_mixture_balanced
+python wills_tinkering_folder/cli.py --global-topic-k 20 --relevel-strategy uniform_mixture_balanced
 ```
 
 ---

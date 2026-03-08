@@ -1049,7 +1049,7 @@ def _generate_experiment_name(params: Dict[str, Any], index: int) -> str:
 
 def _build_cli_args(params: Dict[str, Any], experiment_name: str, tags: List[str]) -> List[str]:
     """Build CLI arguments for a single experiment."""
-    args = ['python', 'cli.py', 'run-all']
+    args = ['python', 'cli.py']
     
     # Add experiment tracking
     args.extend(['--experiment-task', experiment_name])
@@ -1072,7 +1072,6 @@ def _build_cli_args(params: Dict[str, Any], experiment_name: str, tags: List[str
         else:
             args.extend([flag, str(value)])
     
-    args.append('--foreground')
     return args
 
 

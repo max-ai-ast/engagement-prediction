@@ -161,7 +161,7 @@ This would give 2 × 2 × 1 × 1 = 4 experiments.
 
 ### Add New Parameters
 
-Add any parameter from `cli.py run-all`:
+Add any parameter from `cli.py` (the historical `run-all` token is optional):
 
 ```yaml
 sweep_params:
@@ -275,7 +275,7 @@ The memory estimator will automatically use the new model weights.
 After finding optimal parameters, run the full pipeline:
 
 ```bash
-python cli.py run-all \
+python cli.py \
   --posts-start 2026-01-01 --posts-end 2026-01-15 \
   --max-liking-users 100000 \
   --max-likes-per-user 500 \
