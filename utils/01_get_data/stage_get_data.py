@@ -1090,13 +1090,21 @@ def _load_inferences_core_polars(
 
     posts_uris_lf = posts_core_df.select("at_uri").lazy()
 
-    inferences_lf = (
+    inferences_df = (
         pl.scan_parquet(inferences_paths)
         .join(posts_uris_lf, on="at_uri", how="semi")
         .unique(subset=["at_uri"])
-        .with_columns(pl.col("inferences").str.json_decode())
+        .collect(engine="streaming")
     )
-    inferences_df = inferences_lf.collect(engine="streaming")
+
+    # Infer the JSON struct dtype from a sample, then parse the full column.
+    # (Polars Expr.str.json_decode requires an explicit dtype; Series auto-infers.)
+    if len(inferences_df) > 0:
+        sample = inferences_df["inferences"].drop_nulls().head(100)
+        inferred_dtype = sample.str.json_decode().dtype
+        inferences_df = inferences_df.with_columns(
+            pl.col("inferences").str.json_decode(inferred_dtype)
+        )
 
     n_posts_core = len(posts_core_df)
     n_matched = len(inferences_df)
