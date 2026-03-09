@@ -960,6 +960,37 @@ def _resolve_prior(
 
 
 # ---------------------------------------------------------------------------
+# Internal: shared filter + join used by both datasets and evaluation
+# ---------------------------------------------------------------------------
+
+def filter_split_and_join_history(
+    target_posts_df: pl.DataFrame,
+    history_df: pl.DataFrame,
+    split: str,
+) -> pl.DataFrame:
+    """Filter target posts to a split and left-join with user history.
+
+    This is the canonical implementation of the two-step operation that both
+    the training dataloaders and the evaluation stage need:
+      1. Keep only rows for the requested *split* that have a valid negative sample.
+      2. Left-join with history to attach ``prior_emb_indices`` per row.
+
+    Returns:
+        Polars DataFrame with all columns from the filtered target posts plus
+        ``prior_emb_indices`` from the history.
+    """
+    filtered = target_posts_df.filter(
+        (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
+    )
+    return filtered.join(
+        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        on=["target_did", "like_uri"],
+        how="left",
+        maintain_order="left",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Internal: prepare the row-aligned index arrays shared by both datasets
 # ---------------------------------------------------------------------------
 
@@ -985,7 +1016,7 @@ def _prepare_split_data(
     Args:
         target_posts_df: Full target posts DataFrame with all splits
         history_df: User engagement history DataFrame
-        split: Split name to filter to ("train", "val", or "holdout")
+        split: Split name to filter to ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         logger: Optional logger for progress reporting
     
     Returns:
@@ -1011,22 +1042,8 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    # Filter to requested split and drop rows missing negative samples
-    # (negative samples may be missing if the negative sampling stage failed
-    # to find a suitable negative for that user-post pair)
-    tp = target_posts_df.filter(
-        (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
-    )
-    logger.info(f"  Split '{split}': {len(tp):,} target rows (after dropping null neg_emb_idx)")
-
-    # Join target posts with user history on (user_id, post_uri) to get the
-    # engagement sequence for each target. History is pre-filtered to exclude
-    # the target post itself (temporal validity).
-    joined = tp.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
-        on=["target_did", "like_uri"],
-        how="left",
-    )
+    joined = filter_split_and_join_history(target_posts_df, history_df, split)
+    logger.info(f"  Split '{split}': {len(joined):,} target rows (after dropping null neg_emb_idx)")
 
     # Extract embedding indices for positive and negative posts
     like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
@@ -1098,7 +1115,7 @@ class SummarizedEngagementDataset(Dataset):
         embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
         target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
         history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", or "holdout")
+        split: Split to load ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         summarizer: UserSummarizer instance for aggregating engagement history
         embed_dim: Embedding dimensionality D
         logger: Optional logger for progress reporting
@@ -1266,7 +1283,7 @@ class SequenceEngagementDataset(Dataset):
         embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
         target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
         history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", or "holdout")
+        split: Split to load ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         max_history_len: Maximum sequence length for padding (truncate if longer)
         embed_dim: Embedding dimensionality D
         logger: Optional logger for progress reporting

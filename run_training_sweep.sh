@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260213_005409_all_mlp"
+DATA_DIR="outputs/20260305_224327"
 
 EPOCHS=300
 BATCH_SIZE=2048
@@ -78,7 +78,7 @@ run_one() {
   local CMD=(
     python3 cli.py
     --output-dir "$DATA_DIR_ABS"
-    --start-from train --stop-after train
+    --start-from train --stop-after evaluate
     --model-type "$MODEL_TYPE"
     --user-encoder "$USER_ENCODER"
     --run-tag "$RUN_TAG"

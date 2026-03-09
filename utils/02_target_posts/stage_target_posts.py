@@ -2,7 +2,19 @@
 
 """
 Stage 2: Build the target-posts dataset by pairing likes with sampled negatives and
-assigning temporal splits for train/val/holdout.
+assigning train/val/holdout splits.
+
+Two distinct holdout sets are produced:
+
+* **holdout_unseen_users** – a deterministic fraction of users (controlled by
+  ``holdout_user_fraction`` and ``holdout_user_seed``) whose rows are *never*
+  seen during training or validation.  Bounded above by ``holdout_end``.
+* **holdout_seen_users** – rows for the *remaining* (train/val) users that fall
+  after ``holdout_start`` (i.e. after the validation window).  Bounded above by
+  ``holdout_end``.
+
+The remaining rows for non-holdout users are split temporally into train/val
+using ``train_start`` / ``val_start`` / ``holdout_start``.
 
 Inputs:
 - posts_core_* (from 01_get_data)
@@ -16,8 +28,9 @@ Outputs under <run_dir>/target_posts/<timestamp>/:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 import argparse
+import hashlib
 import polars as pl
 import time
 from datetime import datetime
@@ -303,16 +316,50 @@ def _get_train_start(
     raise ValueError("Could not infer train window start from input arguments!")
 
 
-def _apply_temporal_splits(
+def _user_is_holdout(did: str, seed: int, fraction: float) -> bool:
+    """Deterministic hash-based holdout assignment.
+
+    Stable across dataset rebuilds: adding or removing a user does not
+    change the assignment of other users.
+    """
+    digest = hashlib.sha256(f"{seed}:{did}".encode()).hexdigest()
+    return (int(digest, 16) % 10_000) / 10_000 < fraction
+
+
+def _select_holdout_users(
+    all_dids: list[str],
+    seed: int,
+    fraction: float,
+) -> Set[str]:
+    """Return the set of user IDs assigned to holdout."""
+    return {did for did in all_dids if _user_is_holdout(did, seed, fraction)}
+
+
+def _apply_splits(
     args: argparse.Namespace,
     lf: pl.LazyFrame,
+    logger: logging.Logger,
 ) -> pl.LazyFrame:
+    """Assign ``split`` column with two distinct holdout sets.
+
+    **holdout_unseen_users** – rows for users selected by a deterministic
+    hash of ``(holdout_user_seed, target_did)``.  Bounded above by
+    ``holdout_end`` when set.
+
+    **holdout_seen_users** – rows for non-holdout (train/val) users whose
+    ``seen_at >= holdout_start``.  Bounded above by ``holdout_end`` when
+    set.  Only produced when ``holdout_start`` is supplied.
+
+    Non-holdout users are otherwise split temporally:
+    ``train`` (``train_start <= seen_at < val_start``) and ``val``
+    (``val_start <= seen_at < holdout_start``, or unbounded when
+    ``holdout_start`` is ``None``).
+
+    Only the unique ``target_did`` values are collected to determine the
+    holdout set; the full dataset remains lazy so it can be streamed to
+    disk via ``sink_parquet`` without materializing all rows in memory.
     """
-    Appends a column, "split", that specifies "train", "val", or "holdout".
-    If holdout_start is not specified in args, only outputs "train" or "val".
-    """
-    # note we use 
-    final_ts_col_name = 'seen_at'
+    ts_col = "seen_at"
 
     train_start_str: str = _get_train_start(args)
     train_start: datetime = parse_one_ts_strict(train_start_str)
@@ -321,30 +368,76 @@ def _apply_temporal_splits(
     val_start: datetime = parse_one_ts_strict(args.val_start)
     if val_start <= train_start:
         raise ValueError("Train start date is greater than or equal to val start date!")
-    holdout_start: Optional[datetime] = parse_one_ts(args.holdout_start)
 
+    holdout_fraction: float = float(args.holdout_user_fraction)
+    holdout_seed: int = int(args.holdout_user_seed)
+    holdout_start: Optional[datetime] = parse_one_ts(args.holdout_start)
+    holdout_end: Optional[datetime] = parse_one_ts(args.holdout_end)
+
+    if holdout_start is not None and holdout_start <= val_start:
+        raise ValueError(
+            "holdout_start must be after val_start "
+            f"(got holdout_start={holdout_start}, val_start={val_start})"
+        )
+
+    if not 0.0 < holdout_fraction < 1.0:
+        raise ValueError(
+            f"holdout_user_fraction must be in (0, 1), got {holdout_fraction}"
+        )
+
+    all_dids = lf.select("target_did").unique().collect()["target_did"].to_list()
+    holdout_dids = _select_holdout_users(all_dids, holdout_seed, holdout_fraction)
+
+    n_holdout = len(holdout_dids)
+    n_trainval = len(all_dids) - n_holdout
+    logger.info(
+        f"User split: {n_holdout} holdout (unseen) users, "
+        f"{n_trainval} train/val users "
+        f"(fraction={holdout_fraction}, seed={holdout_seed})"
+    )
+
+    is_holdout_user = pl.col("target_did").is_in(holdout_dids)
+    before_end = (pl.col(ts_col) < pl.lit(holdout_end)) if holdout_end is not None else pl.lit(True)
+
+    # --- unseen-users holdout ---
+    unseen_expr = pl.when(is_holdout_user & before_end).then(pl.lit("holdout_unseen_users"))
+
+    # --- seen-users holdout (only when holdout_start is set) ---
     if holdout_start is not None:
-        if holdout_start <= val_start:
-            raise ValueError("Validation start date is greater than or equal to holdout start date!")
-        return lf.with_columns(
-            pl.when((pl.col(final_ts_col_name) >= pl.lit(train_start)) & (pl.col(final_ts_col_name) < pl.lit(val_start)))
-              .then(pl.lit("train"))
-              .when((pl.col(final_ts_col_name) >= pl.lit(val_start)) & (pl.col(final_ts_col_name) < pl.lit(holdout_start)))
-              .then(pl.lit("val"))
-              .when(pl.col(final_ts_col_name) >= pl.lit(holdout_start))
-              .then(pl.lit("holdout"))
-              .otherwise(None)
-              .alias("split")
+        after_holdout_start = pl.col(ts_col) >= pl.lit(holdout_start)
+        seen_holdout_expr = (
+            unseen_expr
+            .when(~is_holdout_user & after_holdout_start & before_end)
+            .then(pl.lit("holdout_seen_users"))
         )
     else:
-        return lf.with_columns(
-            pl.when((pl.col(final_ts_col_name) >= pl.lit(train_start)) & (pl.col(final_ts_col_name) < pl.lit(val_start)))
-              .then(pl.lit("train"))
-              .when(pl.col(final_ts_col_name) >= pl.lit(val_start))
-              .then(pl.lit("val"))
-              .otherwise(None)
-              .alias("split")
+        seen_holdout_expr = unseen_expr
+
+    # --- val window upper bound ---
+    if holdout_start is not None:
+        val_upper = pl.col(ts_col) < pl.lit(holdout_start)
+    else:
+        val_upper = pl.lit(True)
+
+    split_expr = (
+        seen_holdout_expr
+        .when(
+            ~is_holdout_user
+            & (pl.col(ts_col) >= pl.lit(train_start))
+            & (pl.col(ts_col) < pl.lit(val_start))
         )
+        .then(pl.lit("train"))
+        .when(
+            ~is_holdout_user
+            & (pl.col(ts_col) >= pl.lit(val_start))
+            & val_upper
+        )
+        .then(pl.lit("val"))
+        .otherwise(None)
+        .alias("split")
+    )
+
+    return lf.with_columns(split_expr)
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -380,9 +473,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     })
 
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
-    # The core logic. (1) Generate target posts and (2) split into train/val/holdout
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
-    target_posts_lf = _apply_temporal_splits(args, target_posts_lf)
     validate_dataframe_schema(target_posts_lf, {
         'target_did': str,
         'seen_at': datetime,
@@ -394,9 +485,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'neg_author_did': str,
     })
 
-    # Write out result
+    target_posts_lf = _apply_splits(args, target_posts_lf, logger)
+
+    # Write out result (streaming to avoid full materialization in memory)
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
     target_posts_lf.sink_parquet(target_posts_output_path)
+
+    # Log split counts from the written file
+    split_counts = (
+        pl.scan_parquet(target_posts_output_path)
+        .group_by("split")
+        .len()
+        .sort("split")
+        .collect()
+    )
+    for row in split_counts.iter_rows(named=True):
+        logger.info(f"  split={row['split']!s:>10s}: {row['len']:>8,} rows")
 
     # Stage info
     info_lines = [

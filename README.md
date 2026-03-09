@@ -259,9 +259,11 @@ Two-tower training outputs:
 │   ├── training_history_<ts>.png
 │   ├── val_performance_<ts>.png
 │   └── holdout_performance_<ts>.png
-├── holdout_eval/
-│   ├── predictions.parquet
-│   └── metrics_overall.json
+├── predictions/
+│   ├── train.parquet
+│   ├── val.parquet
+│   ├── holdout_unseen_users.parquet
+│   └── holdout_seen_users.parquet    (only if holdout_start was configured)
 ├── training_config.json
 └── stage_info.txt
 ```

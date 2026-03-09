@@ -85,8 +85,10 @@ Outputs under <run_dir>/04_train/<timestamp>/:
     - logs/ (training logs)
     - training_config.json (hyperparameters and configuration)
     - stage_info.txt (pipeline metadata)
-    - holdout_eval/metrics_overall.json (final test set metrics)
-    - holdout_eval/predictions.parquet (detailed predictions for analysis)
+    - predictions/train.parquet (per-row predictions on the training set)
+    - predictions/val.parquet (per-row predictions on the validation set)
+    - predictions/holdout_unseen_users.parquet (predictions for user-split holdout)
+    - predictions/holdout_seen_users.parquet (predictions for temporal holdout, if configured)
 """
 
 from __future__ import annotations
@@ -97,6 +99,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -653,6 +656,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
+    eval_holdout_type = str(args.eval_holdout_type)
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -830,25 +834,45 @@ def run(context: Context, args) -> Dict[str, Any]:
         torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
         context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
 
+    # --- save predictions ---
+    predictions_dir = out_dir / "predictions"
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+
+    pl.DataFrame({
+        "did": train_eval["predictions"]["user_id"],
+        "post_id": train_eval["predictions"]["post_id"],
+        "y_true": train_eval["predictions"]["y_true"],
+        "y_pred_proba": train_eval["predictions"]["y_pred"],
+    }).write_parquet(predictions_dir / "train.parquet")
+
+    pl.DataFrame({
+        "did": val_eval["predictions"]["user_id"],
+        "post_id": val_eval["predictions"]["post_id"],
+        "y_true": val_eval["predictions"]["y_true"],
+        "y_pred_proba": val_eval["predictions"]["y_pred"],
+    }).write_parquet(predictions_dir / "val.parquet")
+
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
-    holdout_dir = out_dir / "holdout_eval"
-    try:
-        if user_encoder_type == "summarized":
-            holdout_dataset = SummarizedEngagementDataset(
-                embeddings_mmap, target_posts_df, history_df, split="holdout", 
-                summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-            )
-        else:
-            holdout_dataset = SequenceEngagementDataset(
-                embeddings_mmap, target_posts_df, history_df, split="holdout",
-                max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-            )
-        if len(holdout_dataset) > 0:
-            log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            # Use centralized function for consistency (train_loader unused, just a placeholder)
+    for holdout_type in ["unseen_users", "seen_users"]:
+        split_name = f"holdout_{holdout_type}"
+        try:
+            if user_encoder_type == "summarized":
+                holdout_dataset = SummarizedEngagementDataset(
+                    embeddings_mmap, target_posts_df, history_df, split=split_name,
+                    summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+                )
+            else:
+                holdout_dataset = SequenceEngagementDataset(
+                    embeddings_mmap, target_posts_df, history_df, split=split_name,
+                    max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+                )
+            if len(holdout_dataset) == 0:
+                logger.info(f"No rows for split '{split_name}', skipping.")
+                continue
+            log_operation_start(f"Holdout evaluation ({holdout_type})", STAGE_LOG_NAME, logger)
             _, _, holdout_loader = create_data_loaders(
-                train_dataset, train_dataset, batch_size,  # train/val unused here
+                train_dataset, train_dataset, batch_size,  # train/val loaders unused here
                 holdout_dataset=holdout_dataset,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
@@ -856,25 +880,19 @@ def run(context: Context, args) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
             )
             holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
-            holdout_metrics = holdout_eval["metrics"]
-            logger.info(f"Holdout metrics: {holdout_metrics}")
+            split_metrics = holdout_eval["metrics"]
+            logger.info(f"Holdout metrics ({holdout_type}): {split_metrics}")
+            if holdout_type == eval_holdout_type:
+                holdout_metrics = split_metrics
 
-            holdout_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save predictions
-            import pandas as pd
-            pred_df = pd.DataFrame({
+            pl.DataFrame({
                 "did": holdout_eval["predictions"]["user_id"],
                 "post_id": holdout_eval["predictions"]["post_id"],
                 "y_true": holdout_eval["predictions"]["y_true"],
                 "y_pred_proba": holdout_eval["predictions"]["y_pred"],
-            })
-            pred_df.to_parquet(holdout_dir / "predictions.parquet", index=False)
+            }).write_parquet(predictions_dir / f"{split_name}.parquet")
 
-            with open(holdout_dir / "metrics_overall.json", "w") as f:
-                json.dump(holdout_metrics, f, indent=2)
-
-            if generate_plots:
+            if generate_plots and holdout_type == eval_holdout_type:
                 try:
                     plot_model_performance(
                         holdout_eval["predictions"]["y_true"],
@@ -884,8 +902,8 @@ def run(context: Context, args) -> Dict[str, Any]:
                     )
                 except Exception as plot_exc:
                     logger.warning(f"Holdout performance plotting failed: {plot_exc}")
-    except Exception as exc:
-        logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
+        except Exception as exc:
+            logger.warning(f"Holdout evaluation ({holdout_type}) failed (non-fatal): {exc}")
 
     # --- training config ---
     training_config = {
