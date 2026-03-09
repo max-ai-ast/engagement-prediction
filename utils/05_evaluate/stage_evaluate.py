@@ -36,7 +36,7 @@ import polars as pl
 
 from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import get_stage_logger, log_operation_start
-from utils.dataloaders import load_training_data
+from utils.dataloaders import filter_split_and_join_history, load_training_data
 
 # ---------------------------------------------------------------------------
 # Import evaluation framework
@@ -164,14 +164,8 @@ def _join_holdout_with_history(
     holdout_split: str,
 ) -> pl.DataFrame:
     """Join holdout target rows with history and compute per-row history length."""
-    holdout_targets = target_posts_df.filter(
-        (pl.col("split") == holdout_split) & pl.col("neg_emb_idx").is_not_null()
-    )
-    return holdout_targets.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
-        on=["target_did", "like_uri"],
-        how="left",
-        maintain_order="left",
+    return filter_split_and_join_history(
+        target_posts_df, history_df, holdout_split
     ).with_columns(
         pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
     )
