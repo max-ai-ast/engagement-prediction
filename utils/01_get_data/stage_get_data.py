@@ -98,6 +98,9 @@ Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core_*.parquet: did, subject_uri, record_created_at, emb_idx
   - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, emb_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
+  - inferences_core_*.parquet: at_uri, indexed_at, inferences (Struct with NLP outputs).
+        Only present when bsky_inferences files exist for the requested time range.
+        Subset to posts retained in posts_core.
   - summary.json: full filtering statistics and parameters
   - stage.log: detailed execution log with memory checkpoints
   - stage_info.txt: human-readable run summary
@@ -779,8 +782,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_memory_gb = float(max_memory_gb)
     max_memory_pct = float(args.max_memory_pct)
 
-    # Use Polars-based filtering pipeline for GreenEarth Ingex data
-    # Returns: (likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, stats)
     (
         likes_core_df, 
         posts_core_df, 
@@ -788,6 +789,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         posts_core_path, 
         embeddings_path, 
         embed_dim, 
+        inferences_core_path,
         all_stats
     ) = _run_greenearth_pipeline(
         logger=logger, 
@@ -844,6 +846,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
     context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
     context.tracker.log_single_value(name="Output - Embeddings Written", value=not skip_embeddings)
+    n_inferences = all_stats.get('inferences', {}).get('n_inferences_matched', 0)
+    context.tracker.log_single_value(name="Output - Inferences (final)", value=n_inferences)
 
     # Log to experiment tracker - comprehensive metrics for sweep analysis
     # Metric names use readable format: "Category - Metric Name" for better CSV exports
@@ -875,6 +879,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'embedding_dim': embed_dim,
             'embeddings_file': str(embeddings_path.name) if embeddings_path is not None else None,
             'embeddings_written': not skip_embeddings,
+            'inferences_core_rows': n_inferences,
+            'inferences_file': str(inferences_core_path.name) if inferences_core_path is not None else None,
         },
         'filtering_stats': all_stats,
     }
@@ -895,6 +901,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"N_posts_core: {n_posts}",
         f"embedding_dim: {embed_dim}",
         f"embeddings_file: {embeddings_path.name if embeddings_path is not None else 'SKIPPED'}",
+        f"N_inferences_core: {n_inferences}",
+        f"inferences_file: {inferences_core_path.name if inferences_core_path is not None else 'NONE'}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
     
@@ -907,6 +915,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'posts_core_path': str(posts_core_path),
             'embeddings_path': str(embeddings_path) if embeddings_path is not None else None,
             'embed_dim': embed_dim,
+            'inferences_core_path': str(inferences_core_path) if inferences_core_path is not None else None,
         },
     }
 
@@ -1065,6 +1074,48 @@ def _write_embeddings_memmap(
     return uri_to_idx, stats
 
 
+def _load_inferences_core_polars(
+    posts_core_df: pl.DataFrame,
+    inferences_paths: List[str],
+    logger: logging.Logger,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    """
+    Load bsky_inferences parquets, keep only rows matching retained posts,
+    parse the JSON inferences column into a Polars Struct, and deduplicate.
+
+    Returns:
+        Tuple of (inferences_df, stats dict)
+    """
+    logger.info(f"Scanning {len(inferences_paths):,} inference parquet files...")
+
+    posts_uris_lf = posts_core_df.select("at_uri").lazy()
+
+    inferences_lf = (
+        pl.scan_parquet(inferences_paths)
+        .join(posts_uris_lf, on="at_uri", how="semi")
+        .unique(subset=["at_uri"])
+        .with_columns(pl.col("inferences").str.json_decode())
+    )
+    inferences_df = inferences_lf.collect(engine="streaming")
+
+    n_posts_core = len(posts_core_df)
+    n_matched = len(inferences_df)
+    coverage_pct = 100.0 * n_matched / n_posts_core if n_posts_core > 0 else 0.0
+
+    logger.info(
+        f"Inferences matched: {n_matched:,} / {n_posts_core:,} posts "
+        f"({coverage_pct:.1f}% coverage)"
+    )
+
+    stats = {
+        'n_inference_files': len(inferences_paths),
+        'n_inferences_matched': n_matched,
+        'n_posts_core': n_posts_core,
+        'coverage_pct': round(coverage_pct, 2),
+    }
+    return inferences_df, stats
+
+
 def _run_greenearth_pipeline(
     logger: logging.Logger,
     out_dir: Path,
@@ -1083,13 +1134,14 @@ def _run_greenearth_pipeline(
     cap_random_seed: int,
     embedding_model: str,
     skip_embeddings: bool,
-) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Optional[Path], Dict[str, Any]]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
     
     Returns:
         Tuple of (likes_core_df, posts_core_df, likes_core_path, posts_core_path, 
-                  embeddings_path (or None if skipped), embed_dim, stats_dict)
+                  embeddings_path (or None if skipped), embed_dim,
+                  inferences_core_path (or None if unavailable), stats_dict)
     """
     all_stats = {}
     
@@ -1353,6 +1405,39 @@ def _run_greenearth_pipeline(
     
     mem_tracker.checkpoint("after_parquet_save", quiet=True)
     
+    # ========================================================================
+    # PHASE 8: Load and save inferences (optional — gracefully skipped if none)
+    # ========================================================================
+    log_operation_start('Load inferences data', '01_GET_DATA', logger)
+    inferences_core_path: Optional[Path] = None
+
+    inferences_paths, _ = _list_files_with_timestamps_ingex_gcs(
+        gcs_bucket=gcs_bucket,
+        blob_prefix='bsky_inferences',
+        start=posts_start_dt,
+        end=posts_end_dt,
+    )
+
+    if not inferences_paths:
+        logger.warning("No bsky_inferences files found in time range — skipping inferences")
+        all_stats['inferences'] = {'skipped': True, 'reason': 'no_files'}
+    else:
+        inferences_df, inference_stats = _load_inferences_core_polars(
+            posts_core_df=posts_core_df,
+            inferences_paths=inferences_paths,
+            logger=logger,
+        )
+        all_stats['inferences'] = inference_stats
+
+        if len(inferences_df) > 0:
+            inferences_core_path = out_dir / f"inferences_core_{ts_name}.parquet"
+            inferences_df.write_parquet(inferences_core_path, compression="zstd")
+            logger.info(f"Saved inferences_core: {inferences_core_path} ({len(inferences_df):,} rows)")
+        else:
+            logger.warning("No inferences matched retained posts — skipping save")
+
+    mem_tracker.checkpoint("after_inferences_load", quiet=True)
+
     # Memory summary: compare actual vs estimated
     memory_summary = mem_tracker.summary()
     all_stats['memory_actual'] = memory_summary
@@ -1369,7 +1454,7 @@ def _run_greenearth_pipeline(
     max_liking_users_for_report = max_liking_users if max_liking_users is not None else 0
     _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_liking_users_for_report, logger)
     
-    return likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, all_stats
+    return likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, inferences_core_path, all_stats
 
 
 def _filter_likes_after_post_join(
