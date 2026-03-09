@@ -327,6 +327,7 @@ class TwoTowerModel(nn.Module):
         dropout_rate: float,
         user_encoder_type: str,
         use_post_encoder: bool,
+        
         # FIT parameters (optional, defaults to disabled)
         use_fit: bool = False,
         fit_num_queries: int = 64,
@@ -448,7 +449,11 @@ class TwoTowerModel(nn.Module):
         """
         # FIT mode: use MQM to get meta query vector
         if self.use_fit and meta_query is not None:
+
+            # use hard only during inference! 
+            # this will set correct bool depending on training vs inference
             hard = not self.training
+
             q_vec, q_idx = self.mqm(meta_query, tau=self.fit_tau.item(), hard=hard)
             # Pass meta_query_vec to encoder (only works for transformer/cross_attention encoders)
             if self.user_encoder_type in ("full_transformer", "cross_attention"):
@@ -505,10 +510,12 @@ class TwoTowerModel(nn.Module):
             )
             
             # Compute score: LSS or dot product
+            # if use light weight similarity score is specified then use LSS instead of dot product
             if self.fit_use_lss and self.lss is not None:
                 sim = user_emb * post_emb  # [B, shared_dim]
                 scores = self.lss(sim).squeeze(-1)  # [B]
             else:
+                # no numpy import, so following works instead for dot product (element-wise mult and sum)
                 scores = (user_emb * post_emb).sum(dim=-1)  # [B]
             return scores
         else:
@@ -580,9 +587,14 @@ class TwoTowerModel(nn.Module):
         # FIT: Update tau for soft query (linear decay by global step)
         if self.use_fit and self.training:
             self.fit_global_step += 1
+
+            # set tau to 1.0 with each global step or greater if threshold set >1
             threshold = max(int(getattr(self, "fit_tau_threshold", 1)), 1)
+
             progress = min(float(self.fit_global_step.item()) / float(threshold), 1.0)
+
             new_tau = self.fit_tau_init * (1.0 - progress)
+
             self.fit_tau.data = torch.tensor(
                 max(self.fit_tau_min, min(self.fit_tau_init, new_tau)),
                 device=self.fit_tau.device
@@ -614,8 +626,10 @@ def train_two_tower_model(
     from tqdm import tqdm
 
     model = model.to(device)
+
     if getattr(model, "use_fit", False):
         model.fit_tau_threshold = max(len(train_loader), 1)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience
@@ -867,10 +881,17 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- FIT parameters (extract with defaults) ---
     use_fit = bool(getattr(args, 'use_fit', False))
+
+    # number of query rows
     fit_num_queries = int(getattr(args, 'fit_num_queries', 64))
+
+    # tau params for using the Gumbel Softmax with our MQM matrix
+    # use tau because our hard argmax query selection is not differentiable
     fit_tau_init = float(getattr(args, 'fit_tau_init', 1.0))
     fit_tau_min = float(getattr(args, 'fit_tau_min', 0.1))
     fit_tau_decay = float(getattr(args, 'fit_tau_decay', 0.9995))
+
+    # use better late interaction light weight similarity score
     fit_use_lss = bool(getattr(args, 'fit_use_lss', False))
     
     # --- create model ---
