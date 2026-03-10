@@ -113,8 +113,8 @@ class ClearMLExperimentTracker:
             task_name=task_name,
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
-            auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
-            output_uri=True,
+            auto_connect_frameworks={'pytorch': ['*.pt']}, # True for anything not specified (e.g. matplotlib). Only log .pt (TorchScript) files for PyTorch.
+            output_uri="gs://greenearth-471522-eng-pred-model-test",
         )
         self._logger = self._task.get_logger()
 
