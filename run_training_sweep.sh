@@ -17,29 +17,36 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="/mnt/data/maxrod/engagement-prediction/outputs/20260224_051127_start_to_train_two_tower_two-tower" # "outputs/20260213_005409_all_mlp" # change to my own data dir
+DATA_DIR="/mnt/data/maxrod/engagement-prediction/outputs/2026_march_10_11am_full_sweep_eval"
 
 EPOCHS=300
 BATCH_SIZE=2048
 PATIENCE=50
 EMA_ALPHA=0.1    # only used when user-summarization=ema
 MAX_PARALLEL=4   # max concurrent MLP jobs
+EXPERIMENT_TRACKER="none"  # use "none" when clearml is not installed
+CONDA_ENV="content-analysis"
+STOP_AFTER_STAGE="train"   # use "evaluate" only when holdout splits exist
 
 # ── Permutations ───────────────────────────────────────────────────────
 # Each entry is "user_encoder:user_summarization" (summarization ignored when encoder != summarized)
 #
 # MLP experiments (parallelisable -- tiny GPU footprint)
-MLP_EXPERIMENTS=( # could comment these out and test
-  # "summarized:mean"
-  # "summarized:ema"
-  # "summarized:linear_recency"
-  # "full_transformer:"
+MLP_EXPERIMENTS=(
+  "summarized:mean"
+  "summarized:ema"
+  "summarized:linear_recency"
+  "full_transformer:"
 )
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
+# Each entry is "user_encoder:user_summarization:fit_mode"
+# fit_mode must be "nofit" or "fit".
 TT_EXPERIMENTS=(
-  "full_transformer:"
-  "cross_attention:"
+  "full_transformer::nofit"
+  "cross_attention::nofit"
+  "full_transformer::fit"
+  "cross_attention::fit"
 )
 
 # ── Resolve paths ──────────────────────────────────────────────────────
@@ -65,26 +72,28 @@ log "═════════════════════════
 
 # ── Helper: launch one experiment ──────────────────────────────────────
 # Writes exit code to a status file so we can collect results later.
-# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
+# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  USE_FIT  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
 run_one() {
   local MODEL_TYPE="$1"
   local USER_ENCODER="$2"
   local USER_SUMM="$3"
-  local RUN_TAG="$4"
-  local RUN_LABEL="$5"
-  local RUN_LOG="$6"
-  local STATUS_FILE="$7"
+  local USE_FIT="$4"
+  local RUN_TAG="$5"
+  local RUN_LABEL="$6"
+  local RUN_LOG="$7"
+  local STATUS_FILE="$8"
 
   local CMD=(
-    python3 cli.py
+    conda run -n "$CONDA_ENV" python3 cli.py
     --output-dir "$DATA_DIR_ABS"
-    --start-from train --stop-after evaluate
+    --start-from train --stop-after "$STOP_AFTER_STAGE"
     --model-type "$MODEL_TYPE"
     --user-encoder "$USER_ENCODER"
     --run-tag "$RUN_TAG"
     --epochs "$EPOCHS"
     --batch-size "$BATCH_SIZE"
     --patience "$PATIENCE"
+    --experiment-tracker "$EXPERIMENT_TRACKER"
   )
 
   # Only pass --user-summarization when the encoder is "summarized"
@@ -93,6 +102,10 @@ run_one() {
     if [[ "$USER_SUMM" == "ema" ]]; then
       CMD+=(--ema-alpha "$EMA_ALPHA")
     fi
+  fi
+
+  if [[ "$USE_FIT" == "true" ]]; then
+    CMD+=(--use-fit)
   fi
 
   log "[$RUN_LABEL] Launching: ${CMD[*]}"
@@ -148,7 +161,7 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
     done
   done
 
-  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
+  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "false" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
   MLP_PIDS+=($!)
   MLP_STATUS_FILES+=("$STATUS_FILE")
   MLP_LABELS+=("$RUN_LABEL")
@@ -186,9 +199,17 @@ log "╚════════════════════════
 for i in "${!TT_EXPERIMENTS[@]}"; do
   SPEC="${TT_EXPERIMENTS[$i]}"
   USER_ENCODER="${SPEC%%:*}"
-  USER_SUMM="${SPEC#*:}"
+  REST="${SPEC#*:}"
+  USER_SUMM="${REST%%:*}"
+  FIT_MODE="${REST#*:}"
   RUN_NUM=$((i + 1))
-  RUN_TAG="two-tower_${USER_ENCODER}"
+  USE_FIT="false"
+  if [[ "$FIT_MODE" == "fit" ]]; then
+    USE_FIT="true"
+    RUN_TAG="two-tower_${USER_ENCODER}_fit"
+  else
+    RUN_TAG="two-tower_${USER_ENCODER}_nofit"
+  fi
   RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  ${RUN_TAG}"
   RUN_LOG="$LOG_DIR/run_${RUN_TAG}.log"
   STATUS_FILE="$LOG_DIR/.status_${RUN_TAG}"
@@ -198,7 +219,7 @@ for i in "${!TT_EXPERIMENTS[@]}"; do
   log "[$RUN_LABEL] Starting…"
   log "────────────────────────────────────────────────────────────────"
 
-  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
+  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$USE_FIT" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
 
   if [[ -f "$STATUS_FILE" ]] && [[ "$(cat "$STATUS_FILE")" == "0" ]]; then
     (( PASSED++ )) || true
