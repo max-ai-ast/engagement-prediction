@@ -46,8 +46,13 @@ PREFER_CUDA = os.getenv("PREFER_CUDA", "1") == "1"
 WARMUP = os.getenv("WARMUP", "1") == "1"
 WARMUP_SECONDS_BUDGET = float(os.getenv("WARMUP_SECONDS_BUDGET", "5.0"))
 
-# If you know D, set INPUT_DIM to validate and to create dummy warmup.
-INPUT_DIM = int(os.getenv("INPUT_DIM", "0"))  # 0 means unknown/skip dim validation
+# Which model signature to serve.
+# Supported: post_tower (1 input), user_tower (2 inputs), mlp (3 inputs)
+MODEL_TYPE = os.getenv("MODEL_TYPE", "auto").strip().lower()
+
+# If you know these shapes, set them to validate and to create dummy warmup.
+EMBED_DIM = int(os.getenv("EMBED_DIM", "0")) # 0 means unknown/skip dim validation
+MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", os.getenv("MAX_HISTORY_LEN", "0")))  # 0 means unknown/skip T validation
 
 DTYPE = torch.float32
 
@@ -69,8 +74,14 @@ _load_finished_at: Optional[float] = None
 # API schema
 # -------------------------
 class PredictRequest(BaseModel):
-    # Accept [D] or [B, D]
-    inputs: Union[List[float], List[List[float]]]
+    # User tower / MLP inputs.
+    # history_embeddings: [T, D] or [B, T, D]
+    history_embeddings: Optional[Union[List[List[float]], List[List[List[float]]]]] = None
+    # history_mask: [T] or [B, T]
+    history_mask: Optional[Union[List[Union[int, bool, float]], List[List[Union[int, bool, float]]]]] = None
+
+    # Post embedding: [D] or [B, D]
+    post_embedding: Optional[Union[List[float], List[List[float]]]] = None
 
 
 # -------------------------
@@ -123,16 +134,87 @@ def _download_gcs_uri_to_local(gs_uri: str) -> str:
     return local_path
 
 
-def _coerce_inputs_to_batched_tensor(
-    inputs: Union[List[float], List[List[float]]],
-    device: torch.device,
-) -> torch.Tensor:
-    if len(inputs) == 0:
-        raise HTTPException(status_code=400, detail="inputs must be non-empty")
+def _normalize_model_type(model_type: str) -> str:
+    mt = (model_type or "").strip().lower()
+    if mt in {"post", "post_tower", "post-tower"}:
+        return "post_tower"
+    if mt in {"user", "user_tower", "user-tower"}:
+        return "user_tower"
+    if mt in {"mlp"}:
+        return "mlp"
+    if mt in {"auto", ""}:
+        return "auto"
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown MODEL_TYPE '{model_type}'. Expected: post_tower, user_tower, mlp, auto",
+    )
 
-    is_batched = isinstance(inputs[0], list)  # type: ignore[index]
+
+def _tensor_from_nested_list(name: str, value: Any, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if value is None:
+        raise HTTPException(status_code=400, detail=f"Missing required field '{name}'")
+    try:
+        t = torch.tensor(value, dtype=dtype, device=device)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid '{name}': {e}")
+    if t.numel() == 0:
+        raise HTTPException(status_code=400, detail=f"'{name}' must be non-empty")
+    return t
+
+
+def _coerce_history_embeddings(value: Any, device: torch.device) -> torch.Tensor:
+    t = _tensor_from_nested_list("history_embeddings", value, dtype=DTYPE, device=device)
+    if t.dim() == 2:
+        t = t.unsqueeze(0)  # [1, T, D]
+    if t.dim() != 3:
+        raise HTTPException(status_code=400, detail="history_embeddings must have shape [T, D] or [B, T, D]")
+
+    b, seq_len, d = t.shape
+    if b > MAX_BATCH:
+        raise HTTPException(status_code=400, detail=f"batch too large (max={MAX_BATCH})")
+    if MAX_SEQ_LEN and seq_len > MAX_SEQ_LEN:
+        raise HTTPException(status_code=400, detail=f"expected T<= {MAX_SEQ_LEN}, got T={seq_len}")
+    if EMBED_DIM and d != EMBED_DIM:
+        raise HTTPException(status_code=400, detail=f"expected D={EMBED_DIM}, got D={d}")
+    return t
+
+
+def _coerce_history_mask(value: Any, device: torch.device, *, batch: int, seq_len: int) -> torch.Tensor:
+    if value is None:
+        if seq_len != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required field 'history_mask' (only optional when seq_len == 1).",
+            )
+        return torch.ones((batch, seq_len), dtype=torch.bool, device=device)
+
+    t = _tensor_from_nested_list("history_mask", value, dtype=torch.int64, device=device)
+    if t.dim() == 1:
+        t = t.unsqueeze(0)  # [1, T]
+    if t.dim() != 2:
+        raise HTTPException(status_code=400, detail="history_mask must have shape [T] or [B, T]")
+
+    b, t_len = t.shape
+    if b != batch or t_len != seq_len:
+        raise HTTPException(
+            status_code=400,
+            detail=f"history_mask shape must match history_embeddings [B, T] = [{batch}, {seq_len}]",
+        )
+    return t.to(torch.bool)
+
+
+def _coerce_post_embedding_from_request(req: PredictRequest, device: torch.device) -> torch.Tensor:
+    if req.post_embedding is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required post_embedding input",
+        )
+    if len(req.post_embedding) == 0:
+        raise HTTPException(status_code=400, detail="post_embedding must be non-empty")
+
+    is_batched = isinstance(req.post_embedding[0], list)  # type: ignore[index]
     if is_batched:
-        batch: List[List[float]] = inputs  # type: ignore[assignment]
+        batch: List[List[float]] = req.post_embedding  # type: ignore[assignment]
         if len(batch) > MAX_BATCH:
             raise HTTPException(status_code=400, detail=f"batch too large (max={MAX_BATCH})")
         d0 = len(batch[0])
@@ -140,15 +222,15 @@ def _coerce_inputs_to_batched_tensor(
             raise HTTPException(status_code=400, detail="each input vector must be non-empty")
         if not all(len(v) == d0 for v in batch):
             raise HTTPException(status_code=400, detail="all input vectors must have the same length")
-        if INPUT_DIM and d0 != INPUT_DIM:
-            raise HTTPException(status_code=400, detail=f"expected D={INPUT_DIM}, got D={d0}")
+        if EMBED_DIM and d0 != EMBED_DIM:
+            raise HTTPException(status_code=400, detail=f"expected D={EMBED_DIM}, got D={d0}")
         return torch.tensor(batch, dtype=DTYPE, device=device)
-
-    vec: List[float] = inputs  # type: ignore[assignment]
-    if INPUT_DIM and len(vec) != INPUT_DIM:
-        raise HTTPException(status_code=400, detail=f"expected D={INPUT_DIM}, got D={len(vec)}")
-    x = torch.tensor(vec, dtype=DTYPE, device=device)
-    return x.unsqueeze(0)  # [1, D]
+    else:
+        vec: List[float] = req.post_embedding # type: ignore[assignment]
+        if EMBED_DIM and len(vec) != EMBED_DIM:
+            raise HTTPException(status_code=400, detail=f"expected D={EMBED_DIM}, got D={len(vec)}")
+        x = torch.tensor(vec, dtype=DTYPE, device=device)
+        return x.unsqueeze(0)  # [1, D]
 
 
 def _to_python(obj: Any) -> Any:
@@ -174,17 +256,41 @@ def _warmup_model(model: torch.jit.ScriptModule, device: torch.device) -> None:
         return
     if not WARMUP:
         return
-    if INPUT_DIM <= 0:
+    if EMBED_DIM <= 0:
         # Without knowing D, we can't safely warm up.
         return
 
     start = time.time()
     with torch.inference_mode():
+        mt = _normalize_model_type(MODEL_TYPE)
+
         # A couple of warmup passes; keep it short.
-        dummy = torch.zeros((1, INPUT_DIM), dtype=DTYPE, device=device)
-        _ = model(dummy)
-        if time.time() - start < WARMUP_SECONDS_BUDGET:
+        if mt == "post_tower":
+            dummy = torch.zeros((1, EMBED_DIM), dtype=DTYPE, device=device)
             _ = model(dummy)
+            if time.time() - start < WARMUP_SECONDS_BUDGET:
+                _ = model(dummy)
+            return
+
+        if MAX_SEQ_LEN <= 0:
+            # Without knowing T, we can't safely warm up these signatures.
+            return
+
+        history_embeddings = torch.zeros((1, MAX_SEQ_LEN, EMBED_DIM), dtype=DTYPE, device=device)
+        history_mask = torch.ones((1, MAX_SEQ_LEN), dtype=torch.bool, device=device)
+
+        if mt == "user_tower":
+            _ = model(history_embeddings, history_mask)
+            if time.time() - start < WARMUP_SECONDS_BUDGET:
+                _ = model(history_embeddings, history_mask)
+            return
+
+        if mt == "mlp":
+            post_embedding = torch.zeros((1, EMBED_DIM), dtype=DTYPE, device=device)
+            _ = model(history_embeddings, history_mask, post_embedding)
+            if time.time() - start < WARMUP_SECONDS_BUDGET:
+                _ = model(history_embeddings, history_mask, post_embedding)
+            return
 
 
 def _load_model_inner() -> None:
@@ -288,6 +394,9 @@ def readyz():
     payload = {
         "ready": ready,
         "device": str(_device) if _device else None,
+        "model_type": _normalize_model_type(MODEL_TYPE),
+        "embed_dim": EMBED_DIM if EMBED_DIM > 0 else None,
+        "max_seq_len": MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else None,
         "load_error": _load_error,
         "load_started_at": _load_started_at,
         "load_finished_at": _load_finished_at
@@ -308,14 +417,42 @@ def predict(req: PredictRequest) -> dict:
 
     assert _model is not None and _device is not None
 
-    x = _coerce_inputs_to_batched_tensor(req.inputs, device=_device)
+    mt = _normalize_model_type(MODEL_TYPE)
     try:
         with torch.inference_mode():
-            y = _model(x)
+            if mt == "post_tower":
+                post_embedding = _coerce_post_embedding_from_request(req, device=_device)
+                y = _model(post_embedding)
+            elif mt == "user_tower":
+                history_embeddings = _coerce_history_embeddings(req.history_embeddings, device=_device)
+                history_mask = _coerce_history_mask(
+                    req.history_mask,
+                    device=_device,
+                    batch=int(history_embeddings.shape[0]),
+                    seq_len=int(history_embeddings.shape[1]),
+                )
+                y = _model(history_embeddings, history_mask)
+            elif mt == "mlp":
+                history_embeddings = _coerce_history_embeddings(req.history_embeddings, device=_device)
+                history_mask = _coerce_history_mask(
+                    req.history_mask,
+                    device=_device,
+                    batch=int(history_embeddings.shape[0]),
+                    seq_len=int(history_embeddings.shape[1]),
+                )
+                post_embedding = _coerce_post_embedding_from_request(req, device=_device)
+                if int(post_embedding.shape[0]) != int(history_embeddings.shape[0]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Batch size mismatch: history_embeddings has B={int(history_embeddings.shape[0])}, post_embedding has B={int(post_embedding.shape[0])}",
+                    )
+                y = _model(history_embeddings, history_mask, post_embedding)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported model type: {mt}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Inference failed: {e}")
 
-    return {"outputs": _to_python(y)}
+    return {"outputs": _to_python(y), "model_type": mt}
 
 
 if __name__ == "__main__":
