@@ -105,8 +105,15 @@ class ClearMLExperimentTracker:
         project_name: str,
         task_name: str,
         tags: Optional[Iterable[str]] = None,
+        model_output_uri: Optional[str] = None,
     ) -> None:
         from clearml import Task
+
+        output_uri: Union[bool, str]
+        if model_output_uri:
+            output_uri = model_output_uri
+        else:
+            output_uri = True
 
         self._task: Task = Task.init(
             project_name=project_name,
@@ -114,7 +121,7 @@ class ClearMLExperimentTracker:
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
             auto_connect_frameworks={'pytorch': ['*.pt']}, # True for anything not specified (e.g. matplotlib). Only log .pt (TorchScript) files for PyTorch.
-            output_uri="gs://greenearth-471522-engagement-prediction-test",
+            output_uri=output_uri,
         )
         self._logger = self._task.get_logger()
 
@@ -346,11 +353,13 @@ def build_experiment_tracker(
     project_name: str,
     task_name: str,
     tags: Optional[Iterable[str]] = None,
+    model_output_uri: Optional[str] = None,
 ) -> ExperimentTracker:
     if kind == "clearml":
         return ClearMLExperimentTracker(
             project_name=project_name,
             task_name=task_name,
             tags=tags,
+            model_output_uri=model_output_uri,
         )
     return NoOpExperimentTracker()

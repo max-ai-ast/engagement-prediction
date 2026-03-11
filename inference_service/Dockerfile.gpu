@@ -1,4 +1,5 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+ARG PYTORCH_BASE_IMAGE=pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
+FROM ${PYTORCH_BASE_IMAGE}
 
 ARG GIT_SHA=""
 LABEL org.opencontainers.image.revision=$GIT_SHA
@@ -14,14 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# OS deps + Python 3.11
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git \
-      software-properties-common \
-      gnupg dirmngr \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-      python3.11 python3.11-venv \
+      ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root (Cloud Run-friendly).
@@ -31,19 +26,9 @@ RUN useradd --create-home --shell /bin/bash --uid 10001 appuser
 RUN mkdir -p /tmp/.cache /tmp/torch /tmp/clearml \
     && chown -R appuser:appuser /tmp/.cache /tmp/torch /tmp/clearml
 
-# Upgrade pip
-RUN python3.11 -m ensurepip --upgrade \
-    && python3.11 -m pip install --no-cache-dir --upgrade pip
-
-# Install Python deps (FastAPI/ClearML/etc.)
 COPY requirements.txt .
-RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
-
-ARG TORCH_VERSION=2.5.1
-ARG TORCH_CUDA_TAG=cu121
-RUN python3.11 -m pip install --no-cache-dir \
-    "torch==${TORCH_VERSION}+${TORCH_CUDA_TAG}" \
-    --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
@@ -53,4 +38,4 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=2s --start-period=15s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" > /dev/null || exit 1
 
-CMD ["sh", "-c", "python3.11 -m uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS} --proxy-headers --timeout-keep-alive 75 ${UVICORN_RELOAD:+--reload}"]
+CMD ["sh", "-c", "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS} --proxy-headers --timeout-keep-alive 75 ${UVICORN_RELOAD:+--reload}"]

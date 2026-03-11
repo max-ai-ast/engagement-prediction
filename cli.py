@@ -118,6 +118,9 @@ DEFAULTS: Dict[str, Any] = {
     "experiment_project": "Engagement Prediction",
     "experiment_task": None,
     "experiment_tags": None,
+    # ClearML / model registry
+    # If set, used as ClearML Task output URI (e.g. gs://...); if None, ClearML uses its default output.
+    "model_output_uri": 'gs://greenearth-471522-engagement-prediction-test',
 }
 
 
@@ -342,6 +345,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         project_name=args.experiment_project,
         task_name=args.experiment_task or _generate_run_name(args),
         tags=args.experiment_tags,
+        model_output_uri=args.model_output_uri,
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
@@ -653,6 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Experiment tracking task name")
     _add_arg_with_default(p_all, "--experiment-tags", type=str, nargs="*", default=argparse.SUPPRESS,
                           help_text="Optional tags for the experiment tracker")
+    _add_arg_with_default(p_all, "--model-output-uri", type=str, default=argparse.SUPPRESS,
+                          help_text="Model/task output URI for ClearML (e.g. gs://bucket/path)")
     p_all.set_defaults(func=cmd_run_all)
 
     return parser

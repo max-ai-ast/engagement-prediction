@@ -288,18 +288,9 @@ def readyz():
     payload = {
         "ready": ready,
         "device": str(_device) if _device else None,
-        "model_path": _model_path,
         "load_error": _load_error,
         "load_started_at": _load_started_at,
-        "load_finished_at": _load_finished_at,
-        "python_version": sys.version,
-        "python_executable": sys.executable,
-        "torch_version": torch.__version__,
-        "torch_cuda_version": torch.version.cuda,
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        "cuda_device_name_0": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
+        "load_finished_at": _load_finished_at
     }
 
     status = 200 if ready else 503

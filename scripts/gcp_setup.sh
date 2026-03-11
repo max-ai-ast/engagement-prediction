@@ -66,7 +66,7 @@ setup_gcp_project() {
     # Enable required APIs
     log_info "Enabling required GCP APIs..."
     gcloud services enable \
-        storage.googleapis.com \
+        storage.googleapis.com
 
     log_info "GCP project setup complete."
 }
