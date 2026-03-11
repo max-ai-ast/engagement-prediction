@@ -6,7 +6,7 @@ import pytest
 
 from shared.input_data_helpers import (
     _extract_compressed_embedding_vector_from_struct,
-    get_user_tower_input_from_raw_history_embeddings,
+    get_user_tower_input_from_single_raw_history_embeddings,
 )
 
 
@@ -51,7 +51,7 @@ def test_get_user_tower_input_filters_padding_and_mask():
         [{"key": embedding_model, "value": _encode_embedding([0.4, 0.5, 0.6])}],
     ]
 
-    padded, mask = get_user_tower_input_from_raw_history_embeddings(
+    padded, mask = get_user_tower_input_from_single_raw_history_embeddings(
         raw_history_embeddings=raw_history_embeddings,
         embedding_model=embedding_model,
         max_history_len=4,
@@ -78,7 +78,7 @@ def test_get_user_tower_input_truncates_to_max_history_len():
         for i in range(10, 15)
     ]
 
-    padded, mask = get_user_tower_input_from_raw_history_embeddings(
+    padded, mask = get_user_tower_input_from_single_raw_history_embeddings(
         raw_history_embeddings=raw_history_embeddings,
         embedding_model=embedding_model,
         max_history_len=3,
@@ -99,7 +99,7 @@ def test_get_user_tower_input_raises_on_embed_dim_mismatch():
     ]
 
     with pytest.raises(ValueError, match="embed_dim"):
-        get_user_tower_input_from_raw_history_embeddings(
+        get_user_tower_input_from_single_raw_history_embeddings(
             raw_history_embeddings=raw_history_embeddings,
             embedding_model=embedding_model,
             max_history_len=3,
@@ -114,7 +114,7 @@ def test_get_user_tower_input_all_missing_returns_zeros():
         [{"key": "other", "value": _encode_embedding([9.9, 9.8, 9.7])}],
     ]
 
-    padded, mask = get_user_tower_input_from_raw_history_embeddings(
+    padded, mask = get_user_tower_input_from_single_raw_history_embeddings(
         raw_history_embeddings=raw_history_embeddings,
         embedding_model=embedding_model,
         max_history_len=2,
@@ -132,7 +132,7 @@ def test_get_user_tower_input_raises_on_non_zlib_embedding():
     raw_history_embeddings = [[{"key": embedding_model, "value": not_compressed}]]
 
     with pytest.raises(zlib.error):
-        get_user_tower_input_from_raw_history_embeddings(
+        get_user_tower_input_from_single_raw_history_embeddings(
             raw_history_embeddings=raw_history_embeddings,
             embedding_model=embedding_model,
             max_history_len=3,

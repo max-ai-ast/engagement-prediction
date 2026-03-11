@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Tuple, Dict, List, Optional
+from typing import Any, Tuple, Dict, List, Optional, Union
 import numpy as np
 import base64
 import struct
@@ -177,7 +177,7 @@ def get_padded_embedding_history_and_mask(
 # Inference helpers
 # ----------------------------------------
 
-def get_user_tower_input_from_raw_history_embeddings(
+def get_user_tower_input_from_single_raw_history_embeddings(
     raw_history_embeddings: List[Any],
     embedding_model: str,
     max_history_len: int,
@@ -216,3 +216,66 @@ def get_user_tower_input_from_raw_history_embeddings(
         if vec is not None
     ]
     return get_padded_embedding_history_and_mask(history_embeddings, max_history_len=max_history_len, embed_dim=embed_dim)
+
+
+def query_user_tower_with_processed_history_embeddings(
+    padded_history_embeddings: Union[List[List[Any]], List[List[List[Any]]]],
+    history_mask: List[List[Any]],
+    inference_url: str,
+) -> List[List[float]]:
+    import requests
+    
+    payload = {
+        "history_embeddings": padded_history_embeddings, 
+        "history_mask": history_mask,
+    }
+
+    # hit api
+    resp = requests.post(inference_url, json=payload, timeout=30)
+    if resp.status_code != 200:
+        raise ValueError(f"Request failed with status code {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    return data["outputs"]
+
+
+def query_user_tower_with_raw_history_embeddings(
+    # [B, T, D] or [T, D] depending on whether it's a batch or single input
+    raw_history_embeddings: Union[List[List[Any]], List[List[List[Any]]]],
+    embedding_model: str,
+    max_history_len: int,
+    embed_dim: int,
+    inference_url: str,
+) -> List[List[float]]:
+    if not isinstance(raw_history_embeddings, list) or len(raw_history_embeddings) == 0 or not isinstance(raw_history_embeddings[0], list) or len(raw_history_embeddings[0]) == 0:
+        raise ValueError("Invalid input: raw_history_embeddings must be a non-empty list of lists")
+
+    batch_padded_history_embeddings = []
+    batch_history_mask = []
+    if isinstance(raw_history_embeddings[0][0], list):
+        # Batched input
+        
+        for single_raw_history_embeddings in raw_history_embeddings:
+            padded_history_embeddings, history_mask = get_user_tower_input_from_single_raw_history_embeddings(
+                raw_history_embeddings=single_raw_history_embeddings,
+                embedding_model=embedding_model,
+                max_history_len=max_history_len,
+                embed_dim=embed_dim,
+            )
+            batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
+            batch_history_mask.append(history_mask.tolist())
+    else:
+        padded_history_embeddings, history_mask = get_user_tower_input_from_single_raw_history_embeddings(
+            raw_history_embeddings=raw_history_embeddings,
+            embedding_model=embedding_model,
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+        )
+        batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
+        batch_history_mask.append(history_mask.tolist())
+    
+    return query_user_tower_with_processed_history_embeddings(
+        padded_history_embeddings=batch_padded_history_embeddings,
+        history_mask=batch_history_mask,
+        inference_url=inference_url,
+    )
