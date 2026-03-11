@@ -46,9 +46,11 @@ PREFER_CUDA = os.getenv("PREFER_CUDA", "1") == "1"
 WARMUP = os.getenv("WARMUP", "1") == "1"
 WARMUP_SECONDS_BUDGET = float(os.getenv("WARMUP_SECONDS_BUDGET", "5.0"))
 
-# Which model signature to serve.
+# Which model signature to serve (required).
 # Supported: post_tower (1 input), user_tower (2 inputs), mlp (3 inputs)
-MODEL_TYPE = os.getenv("MODEL_TYPE", "auto").strip().lower()
+MODEL_TYPE = os.getenv("MODEL_TYPE")
+if not MODEL_TYPE:
+    raise RuntimeError("MODEL_TYPE env var is required (post_tower | user_tower | mlp).")
 
 # If you know these shapes, set them to validate and to create dummy warmup.
 EMBED_DIM = int(os.getenv("EMBED_DIM", "0")) # 0 means unknown/skip dim validation
@@ -142,11 +144,9 @@ def _normalize_model_type(model_type: str) -> str:
         return "user_tower"
     if mt in {"mlp"}:
         return "mlp"
-    if mt in {"auto", ""}:
-        return "auto"
     raise HTTPException(
         status_code=400,
-        detail=f"Unknown MODEL_TYPE '{model_type}'. Expected: post_tower, user_tower, mlp, auto",
+        detail=f"Unknown MODEL_TYPE '{model_type}'. Expected: post_tower, user_tower, mlp",
     )
 
 
