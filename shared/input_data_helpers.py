@@ -252,6 +252,24 @@ def query_user_tower_with_processed_history_embeddings(
     history_mask: List[List[Any]],
     inference_url: str,
 ) -> List[List[float]]:
+    """
+    Query a deployed user-tower inference endpoint with already-processed inputs.
+
+    This helper expects inputs that match the user-tower model signature:
+      - history_embeddings: shape [B, T, D]
+      - history_mask: shape [B, T]
+
+    Args:
+        padded_history_embeddings: Batched, padded history embeddings.
+        history_mask: Batched history mask (truthy = real token, falsy = padding).
+        inference_url: Full URL to the inference endpoint (e.g. "http://.../predict").
+
+    Returns:
+        A list of output vectors with shape [B, output_dim].
+
+    Raises:
+        ValueError: If the request fails (non-200) or the response is not valid JSON.
+    """
     import requests
     
     payload = {
@@ -280,6 +298,31 @@ def query_user_tower_with_raw_history_embeddings(
     embed_dim: int,
     inference_url: str,
 ) -> List[List[float]]:
+    """
+    Convert raw history embeddings into user-tower inputs and query the inference endpoint.
+
+    This is a convenience wrapper around:
+      1) `get_user_tower_input_from_single_raw_history_embeddings(...)` to build padded
+         `history_embeddings` and `history_mask`, and
+      2) `query_user_tower_with_processed_history_embeddings(...)` to call the service.
+
+    Input format:
+      - Single user: `raw_history_embeddings` is a list of "embeddings structs" (one per history item).
+      - Batched users: `raw_history_embeddings` is a list of per-user lists.
+
+    Args:
+        raw_history_embeddings: Raw embeddings structs (single) or list of per-user histories (batched).
+        embedding_model: The embedding model name to extract from each raw struct.
+        max_history_len: Fixed sequence length (T) for padding/truncation.
+        embed_dim: Embedding width (D) expected for each history vector.
+        inference_url: Full URL to the inference endpoint (e.g. "http://.../predict").
+
+    Returns:
+        A list of output vectors with shape [B, output_dim] (B==1 for single input).
+
+    Raises:
+        ValueError: If inputs are malformed or the server request fails.
+    """
     if not isinstance(raw_history_embeddings, list) or len(raw_history_embeddings) == 0:
         raise ValueError("Invalid input: raw_history_embeddings must be a non-empty list")
 
