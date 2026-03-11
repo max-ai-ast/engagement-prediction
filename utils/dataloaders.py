@@ -139,11 +139,29 @@ class SummarizedUserTower(nn.Module):
     consistent across encoder types.
     """
 
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        # Learnable cold-start embedding used when there is no user history.
+        # Kept in the same space as the summary vector so Two-Tower dot products
+        # can still rank posts for cold-start users.
+        self.empty_user_embedding = nn.Parameter(torch.randn(self.embed_dim) * 0.02)
+
     def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         if history_embeddings.dim() != 3:
             # Keep error message TorchScript-friendly (no dynamic shape formatting).
             raise RuntimeError("Expected history_embeddings with shape [B, T, D].")
-        return history_embeddings[:, 0, :]
+        summary = history_embeddings[:, 0, :]
+        if history_mask is None:
+            return summary
+        if history_mask.dim() != 2:
+            raise RuntimeError("Expected history_mask with shape [B, T].")
+
+        history_mask = history_mask.to(device=history_embeddings.device, dtype=torch.bool)
+        has_history = history_mask.any(dim=1)  # [B]
+        has_history_f = has_history.to(dtype=summary.dtype).unsqueeze(1)  # [B, 1]
+        empty = self.empty_user_embedding.unsqueeze(0)  # [1, D]
+        return summary * has_history_f + empty * (1.0 - has_history_f)
 
 
 class UserSummarizer(ABC):
@@ -390,6 +408,11 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # Learnable query vector for attention pooling
         self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
 
+        # Learnable cold-start token used when a user has no history (all-masked).
+        # This prevents degenerate all-zero user embeddings for cold-start users,
+        # which would otherwise yield identical Two-Tower scores across posts.
+        self.empty_history_embedding = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+
         # Project concatenated dual-pooled features to final output dimension
         self.output_projection = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),  # 2x because we concatenate two pooling outputs
@@ -440,6 +463,8 @@ class BaseAttentionEncoder(nn.Module, ABC):
                 `[B, seq_len, hidden_dim]`.
         """
         B, seq_len, _ = history_embeddings.shape
+        if seq_len == 0:
+            raise RuntimeError("history_embeddings must have a non-zero sequence length.")
         device = history_embeddings.device
 
         # Default to all-valid mask if not provided
@@ -459,6 +484,23 @@ class BaseAttentionEncoder(nn.Module, ABC):
         positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
         pos_emb = self.positional_embedding(positions)
         x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
+
+        # Cold-start handling: if an example has no valid history items, inject a
+        # learnable token at position 0 and mark it as valid so downstream
+        # pooling/self-attention has something to attend to.
+        has_any = history_mask.any(dim=1)  # [B]
+        inject = ~has_any  # [B], True where history is empty
+        inject_f = inject.to(dtype=x.dtype).unsqueeze(1)  # [B, 1]
+
+        # Mark position 0 as valid for empty-history rows.
+        history_mask = history_mask.clone()
+        history_mask[:, 0] = history_mask[:, 0] | inject
+
+        # Overwrite x at position 0 for empty-history rows with the learnable token.
+        token0 = (self.empty_history_embedding + pos_emb[0]).unsqueeze(0)  # [1, hidden]
+        x = x.clone()
+        x0 = x[:, 0, :]  # [B, hidden]
+        x[:, 0, :] = x0 * (1.0 - inject_f) + token0.expand(B, -1) * inject_f
         return B, seq_len, history_mask, x
 
     def _forward_attention_pooled(

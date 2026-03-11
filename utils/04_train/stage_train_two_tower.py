@@ -289,7 +289,7 @@ class TwoTowerModel(nn.Module):
             # (e.g., mean/EMA/linear-recency summary). The model treats the
             # history input as an already-encoded user embedding (placed at
             # position 0 in a padded sequence for a consistent forward() signature).
-            self.user_tower = SummarizedUserTower()
+            self.user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
@@ -409,18 +409,20 @@ class TwoTowerModel(nn.Module):
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device) # [B, embed_dim*2]
-            history_embeddings = features[:, :embed_dim].unsqueeze(1)  # [B, 1, D] (summary token at position 0)
-            post_embeddings = features[:, embed_dim:]
-            history_mask = torch.ones(
-                (history_embeddings.shape[0], history_embeddings.shape[1]),
-                dtype=torch.bool,
-                device=device,
-            )
+            user_summary = features[:, :embed_dim] # [B, embed_dim]
+            history_embeddings = user_summary.unsqueeze(1)  # [B, 1, embed_dim] (summary token at position 0)
+            post_embeddings = features[:, embed_dim:] # [B, embed_dim]
+            # Cold-start handling: empty histories have an all-zero summary sentinel.
+            # Use the mask to indicate whether the summary came from at least one
+            # history item so the summarized user tower can inject a learnable
+            # cold-start embedding.
+            has_history = user_summary.abs().sum(dim=1) > 0 # [B]
+            history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
             assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
-            history_embeddings = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            post_embeddings = batch["target_post_embedding"].to(device)
+            history_embeddings = batch["history_embeddings"].to(device) # [B, seq_len, embed_dim]
+            history_mask = batch["history_mask"].to(device) # [B, seq_len]
+            post_embeddings = batch["target_post_embedding"].to(device) # [B, embed_dim]
         labels = batch["label"].to(device)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
