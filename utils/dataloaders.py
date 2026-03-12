@@ -147,7 +147,7 @@ class SummarizedUserTower(nn.Module):
         # can still rank posts for cold-start users.
         self.empty_user_embedding = nn.Parameter(torch.randn(self.embed_dim) * 0.02)
 
-    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor]) -> torch.Tensor:
         if history_embeddings.dim() != 3:
             # Keep error message TorchScript-friendly (no dynamic shape formatting).
             raise RuntimeError("Expected history_embeddings with shape [B, T, D].")

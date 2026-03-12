@@ -567,6 +567,41 @@ def test_two_tower_compute_loss_and_preds():
     assert (probs >= 0).all() and (probs <= 1).all()
 
 
+def test_two_tower_compute_loss_and_preds_summarized_empty_history_uses_empty_embedding():
+    """Summarized compute_loss_and_preds should use cold-start embedding for empty histories."""
+    torch.manual_seed(0)
+    embed_dim = 16
+    model = TwoTowerModel(
+        post_embedding_dim=embed_dim,
+        shared_dim=embed_dim,
+        user_hidden_dim=32,
+        post_hidden_dim=32,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=10,
+        dropout_rate=0.0,
+        user_encoder_type="summarized",
+        use_post_encoder=False,
+    )
+    model.eval()
+
+    batch_size = 8
+    user_summary = torch.zeros(batch_size, embed_dim)
+    post_embeddings = torch.arange(embed_dim, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
+    features = torch.cat([user_summary, post_embeddings], dim=1)
+    batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
+
+    with torch.no_grad():
+        model.user_tower.empty_user_embedding.fill_(0.1)
+    _, scores1 = model.compute_loss_and_preds(batch, device="cpu", embed_dim=embed_dim)
+
+    with torch.no_grad():
+        model.user_tower.empty_user_embedding.fill_(0.2)
+    _, scores2 = model.compute_loss_and_preds(batch, device="cpu", embed_dim=embed_dim)
+
+    assert not torch.allclose(scores1, scores2), "Scores should depend on the cold-start embedding for empty histories"
+
+
 def test_two_tower_compute_loss_all_positive():
     """Test TwoTowerModel compute_loss with all positive labels."""
     model = TwoTowerModel(
