@@ -10,6 +10,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, TYPE_CHECKING, Union
+import os
 
 if TYPE_CHECKING:
     from clearml import Task
@@ -103,18 +104,26 @@ class ClearMLExperimentTracker:
         project_name: str,
         task_name: str,
         tags: Optional[Iterable[str]] = None,
+        model_output_uri: Optional[str] = None,
     ) -> None:
         from clearml import Task
+
+        output_uri: Union[bool, str]
+        if model_output_uri:
+            output_uri = model_output_uri
+        else:
+            output_uri = True
 
         self._task: Task = Task.init(
             project_name=project_name,
             task_name=task_name,
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
-            auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
-            output_uri=True,
+            auto_connect_frameworks={'pytorch': ['*.pt']}, # True for anything not specified (e.g. matplotlib). Only log .pt (TorchScript) files for PyTorch.
+            output_uri=output_uri,
         )
         self._logger = self._task.get_logger()
+
 
     @staticmethod
     def _coerce_like(value: Any, template: Any) -> Any:
@@ -195,7 +204,24 @@ class ClearMLExperimentTracker:
         p = Path(path)
         if not p.exists():
             return
-        OutputModel(task=self._task, name=name).update_weights(str(p))
+        
+        # create the OutputModel and upload the file as its weights/artifact
+        
+        om = OutputModel(
+            task=self._task, 
+            name=name, 
+            framework='pytorch',
+            tags=['candidate'],
+        )
+        om.update_weights(str(p))
+
+        # also attach useful metadata
+        script = self._task.data.script
+
+        # git info
+        om.set_metadata("git_repo", getattr(script, "repository", ""))
+        om.set_metadata("git_branch", getattr(script, "branch", ""))
+        om.set_metadata("git_sha", getattr(script, "version_num", ""))
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         self._task.connect(params, name=name)
@@ -320,11 +346,13 @@ def build_experiment_tracker(
     project_name: str,
     task_name: str,
     tags: Optional[Iterable[str]] = None,
+    model_output_uri: Optional[str] = None,
 ) -> ExperimentTracker:
     if kind == "clearml":
         return ClearMLExperimentTracker(
             project_name=project_name,
             task_name=task_name,
             tags=tags,
+            model_output_uri=model_output_uri,
         )
     return NoOpExperimentTracker()

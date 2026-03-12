@@ -1,0 +1,41 @@
+ARG PYTORCH_BASE_IMAGE=pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
+FROM ${PYTORCH_BASE_IMAGE}
+
+ARG GIT_SHA=""
+LABEL org.opencontainers.image.revision=$GIT_SHA
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8080 \
+    UVICORN_WORKERS=1 \
+    XDG_CACHE_HOME=/tmp/.cache \
+    TORCH_HOME=/tmp/torch \
+    CLEARML_CACHE_DIR=/tmp/clearml
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Run as non-root (Cloud Run-friendly).
+RUN useradd --create-home --shell /bin/bash --uid 10001 appuser
+
+# Create writable cache directories for the non-root user
+RUN mkdir -p /tmp/.cache /tmp/torch /tmp/clearml \
+    && chown -R appuser:appuser /tmp/.cache /tmp/torch /tmp/clearml
+
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+
+EXPOSE 8080
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=2s --start-period=15s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT}/health" > /dev/null || exit 1
+
+CMD ["sh", "-c", "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS} --proxy-headers --timeout-keep-alive 75 ${UVICORN_RELOAD:+--reload}"]

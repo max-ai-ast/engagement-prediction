@@ -824,12 +824,12 @@ def run(context: Context, args) -> Dict[str, Any]:
 
         # Save TorchScript file, which is the format needed for ClearML serving
         # Save the post and user towers separately
-        torchscript_user_name = f"torchscript_user_tower_{timestamp}"
+        torchscript_user_name = "engagement_user_tower"
         torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
         torch.jit.script(trained_model.user_tower.cpu()).save(torchscript_user_path)
         context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
 
-        torchscript_post_name = f"torchscript_post_tower_{timestamp}"
+        torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
         torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
         context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)

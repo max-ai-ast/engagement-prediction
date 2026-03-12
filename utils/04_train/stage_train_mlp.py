@@ -610,7 +610,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger.info(f"Model saved to: {model_path}")
 
         # save TorchScript file, which is the format needed for ClearML serving
-        torchscript_name = f"torchscript_mlp_model_{timestamp}"
+        torchscript_name = f"engagement_mlp"
         torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
         torch.jit.script(trained_model).save(torchscript_path)
         context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
