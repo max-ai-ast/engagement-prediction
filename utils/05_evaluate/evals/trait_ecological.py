@@ -22,9 +22,10 @@ Additionally computes per-user rho_pred - rho_true differences to surface
 systematic model bias at the individual level.
 
 Outputs (under trait_ecological/):
-- <group>_ecological.png:      composite KDE plot per inference group
-- <group>_ecological_diff.png: difference distribution per inference group
-- ecological_gap_summary.png:  headline bar chart of ecological gaps
+- <group>_ecological.png:           composite KDE plot per inference group
+- <group>_ecological_diff.png:      difference distribution per inference group
+- <group>_ecological_quintiles.png: true-pref rho by like-volume quintile
+- ecological_gap_summary.png:       headline bar chart of ecological gaps
 - trait_ecological_summary.json
 """
 
@@ -63,6 +64,7 @@ class TraitEcoResult(NamedTuple):
     rho_tweet: float
     user_rho_true: np.ndarray
     user_rho_pred: np.ndarray
+    user_ids: np.ndarray
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +95,16 @@ def _compute_per_user_rhos(
     trait_arrays: Dict[str, np.ndarray],
     finite_masks: Dict[str, np.ndarray],
     valid_keys: set[str],
-) -> Dict[str, Tuple[List[float], List[float]]]:
+) -> Dict[str, Tuple[List[float], List[float], List[Any]]]:
     """Within-user rho(trait, y_true) and rho(trait, y_pred_proba) per trait.
 
-    Returns {key: (list_of_rho_true, list_of_rho_pred)}.
+    Returns {key: (list_of_rho_true, list_of_rho_pred, list_of_user_ids)}.
     Only includes users with >= MIN_POSTS_PER_USER_TRAIT finite trait values
     and non-zero variance in both the outcome and trait columns.
     """
     rho_true_lists: Dict[str, List[float]] = defaultdict(list)
     rho_pred_lists: Dict[str, List[float]] = defaultdict(list)
+    uid_lists: Dict[str, List[Any]] = defaultdict(list)
 
     for uid in user_ids:
         rows = user_to_rows[uid]
@@ -120,9 +123,10 @@ def _compute_per_user_rhos(
             rp, _ = spearmanr(yp_m, tv_m)
             rho_true_lists[key].append(float(rt))
             rho_pred_lists[key].append(float(rp))
+            uid_lists[key].append(uid)
 
     return {
-        key: (rho_true_lists[key], rho_pred_lists[key])
+        key: (rho_true_lists[key], rho_pred_lists[key], uid_lists[key])
         for key in valid_keys
         if len(rho_true_lists[key]) >= MIN_USERS_PER_TRAIT
     }
@@ -273,6 +277,81 @@ def _plot_group_diff(
     return path
 
 
+_QUINTILE_COLORS = ["#c6dbef", "#6baed6", "#3182bd", "#08519c", "#08306b"]
+_QUINTILE_LABELS = ["Q1 (fewest)", "Q2", "Q3", "Q4", "Q5 (most)"]
+
+
+def _plot_group_quintiles(
+    group_name: str,
+    trait_results: Dict[str, TraitEcoResult],
+    did_to_likes: Dict[Any, int],
+    quintile_edges: np.ndarray,
+    out_dir: Path,
+) -> Path:
+    """Small-multiples: user-level rho_true KDEs stratified by like-volume quintile.
+
+    Each panel shows one trait with five overlaid KDE curves (one per quintile
+    of num_total_likes) plus the tweet-level rho as a dashed vertical line.
+    """
+    labels = sorted(trait_results.keys())
+    n = len(labels)
+    ncols = min(3, n)
+    nrows = math.ceil(n / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(5 * ncols, 3.5 * nrows),
+                             squeeze=False)
+    grid = np.linspace(-1, 1, 300)
+
+    for idx, label in enumerate(labels):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        tr = trait_results[label]
+
+        likes = np.array([did_to_likes.get(uid, 0) for uid in tr.user_ids])
+        q_assign = np.digitize(likes, quintile_edges[1:-1])
+
+        for qi in range(5):
+            mask = q_assign == qi
+            if mask.sum() < 5:
+                continue
+            subset = tr.user_rho_true[mask]
+            density = _safe_kde(subset, grid)
+            if density is not None:
+                ax.plot(grid, density, color=_QUINTILE_COLORS[qi],
+                        linewidth=1.2, label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+            else:
+                ax.hist(subset, bins=25, density=True, alpha=0.25,
+                        color=_QUINTILE_COLORS[qi],
+                        label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+
+        ax.axvline(tr.rho_tweet, color="#D65F5F", linestyle="--",
+                   linewidth=1.3,
+                   label=f"tweet-level ρ = {tr.rho_tweet:.3f}")
+
+        ax.set_title(label, fontsize=8, fontweight="bold")
+        ax.set_xlabel("Spearman ρ(trait, liked)", fontsize=7)
+        ax.set_ylabel("density", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.legend(fontsize=5, loc="upper right", framealpha=0.7)
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    fig.suptitle(
+        f"{group_name.replace('_', ' ').title()}"
+        " — True-Preference ρ by Like-Volume Quintile",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    path = out_dir / f"{group_name}_ecological_quintiles.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def _plot_gap_summary(
     all_gaps: Dict[str, Tuple[str, float]],
     group_color_map: Dict[str, str],
@@ -400,12 +479,25 @@ class TraitEcologicalModule(EvalModule):
 
         # --- Assemble per-trait result tuples ---
         trait_results: Dict[str, TraitEcoResult] = {}
-        for key, (rt_list, rp_list) in per_user.items():
+        for key, (rt_list, rp_list, uid_list) in per_user.items():
             trait_results[key] = TraitEcoResult(
                 rho_tweet=tweet_rhos[key],
                 user_rho_true=np.array(rt_list),
                 user_rho_pred=np.array(rp_list),
+                user_ids=np.array(uid_list),
             )
+
+        # --- Like-volume quintiles from user metadata ---
+        meta = ctx.user_metadata_df
+        did_to_likes: Dict[Any, int] = dict(
+            zip(meta["did"], meta["num_total_likes"])
+        )
+        eligible_likes = np.array([
+            did_to_likes.get(uid, 0) for uid in user_ids
+        ])
+        quintile_edges = np.quantile(
+            eligible_likes, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        )
 
         # --- Plots ---
         group_color_map = {
@@ -432,6 +524,10 @@ class TraitEcologicalModule(EvalModule):
                 str(_plot_group_ecological(gname, group_traits, out_dir)))
             plot_paths.append(
                 str(_plot_group_diff(gname, group_traits, out_dir)))
+            plot_paths.append(
+                str(_plot_group_quintiles(gname, group_traits,
+                                         did_to_likes, quintile_edges,
+                                         out_dir)))
 
         if all_gaps:
             plot_paths.insert(
