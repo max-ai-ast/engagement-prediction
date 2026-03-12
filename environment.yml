@@ -17,7 +17,6 @@ dependencies:
   - tqdm
   - pillow
   - pyyaml
-  - python-dotenv
   - pytest
   - requests
 

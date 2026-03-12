@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, TYPE_CHECKING, Union
 import os
-from dotenv import load_dotenv
 
 if TYPE_CHECKING:
     from clearml import Task
@@ -125,8 +124,6 @@ class ClearMLExperimentTracker:
         )
         self._logger = self._task.get_logger()
 
-        # get docker image digest from environment variable (set by build_image.sh) and log as metadata
-        load_dotenv(".docker_image.env")
 
     @staticmethod
     def _coerce_like(value: Any, template: Any) -> Any:
@@ -225,10 +222,6 @@ class ClearMLExperimentTracker:
         om.set_metadata("git_repo", getattr(script, "repository", ""))
         om.set_metadata("git_branch", getattr(script, "branch", ""))
         om.set_metadata("git_sha", getattr(script, "version_num", ""))
-        
-        # docker image info
-        om.set_metadata("docker_image_digest", os.getenv("DOCKER_IMAGE_DIGEST", ""))
-        om.set_metadata("docker_image_tag", os.getenv("DOCKER_IMAGE_TAG", ""))
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         self._task.connect(params, name=name)

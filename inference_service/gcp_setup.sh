@@ -86,17 +86,12 @@ create_service_account() {
     else
         log_info "Service account already exists: $SA_EMAIL"
     fi
-
-    # Grant necessary permissions
-    log_info "Granting permissions to engagement prediction service account..."
-
-    log_info "Engagement prediction service account permissions configured."
 }
 
-create_eng_pred_storage() {
+create_engagement_prediction_model_storage() {
     log_info "Setting up storage bucket for engagement prediction models..."
 
-    BUCKET_NAME="$GE_GCP_PROJECT_ID-engagement-prediction-$GE_ENVIRONMENT"
+    BUCKET_NAME="$GE_GCP_PROJECT_ID-engagement-prediction-model-$GE_ENVIRONMENT"
 
     if ! gsutil ls -b gs://"$BUCKET_NAME" > /dev/null 2>&1; then
         gsutil mb -l "$GE_GCP_REGION" gs://"$BUCKET_NAME"
@@ -124,7 +119,7 @@ main() {
     validate_config
     setup_gcp_project
     create_service_account
-    create_eng_pred_storage
+    create_engagement_prediction_model_storage
 
     log_info "Environment setup complete!"
     echo
@@ -134,7 +129,7 @@ main() {
     echo "3. Monitor logs for any issues"
     echo
     echo "Important notes:"
-    echo "- Model files are stored in: gs://$GE_GCP_PROJECT_ID-engagement-prediction-$GE_ENVIRONMENT"
+    echo "- Model files are stored in: gs://$GE_GCP_PROJECT_ID-engagement-prediction-model-$GE_ENVIRONMENT"
     echo "- Service account: engagement-prediction-sa-$GE_ENVIRONMENT@$GE_GCP_PROJECT_ID.iam.gserviceaccount.com"
     echo
 }

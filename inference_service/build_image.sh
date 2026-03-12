@@ -40,9 +40,6 @@ if [[ -z "$IMAGE_DIGEST" ]]; then
     "${IMAGE_NAME}:git-${SHORT_SHA}")
 fi
 
-echo "DOCKER_IMAGE_DIGEST=$IMAGE_DIGEST" > .docker_image.env
-echo "DOCKER_IMAGE_TAG=${IMAGE_NAME}:git-${SHORT_SHA}" >> .docker_image.env
-
 echo ""
 echo "Built image:"
 echo "  Tag:    ${IMAGE_NAME}:git-${SHORT_SHA}"
