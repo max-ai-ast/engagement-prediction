@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Engagement Prediction Pipeline</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: #0F1419;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 24px;
+  }
+
+  .slide {
+    width: 1400px;
+    height: 520px;
+    background: linear-gradient(135deg, #0F1419 0%, #1A2332 100%);
+    border-radius: 16px;
+    padding: 36px 48px 32px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+  }
+
+  .slide::before {
+    content: '';
+    position: absolute;
+    top: -200px; right: -200px;
+    width: 600px; height: 600px;
+    background: radial-gradient(circle, rgba(74,144,217,0.06) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  h1 {
+    color: #E8EDF2;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+    margin-bottom: 32px;
+  }
+  h1 span { color: #5BA0D9; }
+
+  .pipeline {
+    display: flex;
+    align-items: flex-start;
+    gap: 0;
+    position: relative;
+    height: 380px;
+  }
+
+  .source {
+    flex-shrink: 0;
+    width: 110px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    margin-top: 24px;
+  }
+  .source-icon {
+    width: 56px; height: 56px;
+    background: linear-gradient(135deg, #2A4A6B, #1E3550);
+    border: 2px solid #3A6B9F;
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+    margin-bottom: 10px;
+  }
+  .source-label {
+    color: #8CA3BE;
+    font-size: 11px;
+    font-weight: 500;
+    text-align: center;
+    line-height: 1.4;
+  }
+  .source-label strong { color: #B0C8E0; font-weight: 700; display: block; font-size: 12px; }
+
+  .arrow-connector {
+    flex-shrink: 0;
+    width: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    margin-top: 24px;
+  }
+  .arrow-connector svg { overflow: visible; }
+
+  .stage {
+    flex: 1;
+    min-width: 185px;
+    max-width: 210px;
+    margin: 0 4px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .stage-header {
+    padding: 14px 16px 12px;
+    border-radius: 12px 12px 0 0;
+    position: relative;
+  }
+  .stage-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin-bottom: 4px;
+    opacity: 0.7;
+  }
+  .stage-title {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+  }
+
+  .stage-body {
+    padding: 12px 16px 14px;
+    border-radius: 0 0 12px 12px;
+    flex: 1;
+  }
+  .stage-body p {
+    font-size: 11.5px;
+    line-height: 1.55;
+    margin-bottom: 10px;
+    opacity: 0.85;
+  }
+
+  .artifacts {
+    list-style: none;
+    padding: 0;
+  }
+  .artifacts li {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    margin-bottom: 3px;
+    display: inline-block;
+    margin-right: 3px;
+  }
+
+  .flow-arrows {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    margin-top: 24px;
+    flex-shrink: 0;
+    width: 24px;
+  }
+  .flow-arrows svg { overflow: visible; }
+
+  /* Stage color themes */
+  .s1 .stage-header { background: linear-gradient(135deg, #1B3A5C, #1E4A6E); color: #B8D8F0; }
+  .s1 .stage-body   { background: #142C45; color: #8CB8DA; border: 1px solid #1E3D5A; border-top: none; }
+  .s1 .artifacts li  { background: #1A3552; color: #7AADCF; }
+
+  .s2 .stage-header { background: linear-gradient(135deg, #1B4A4A, #1E5C5A); color: #B0E0DB; }
+  .s2 .stage-body   { background: #13363A; color: #88C5BF; border: 1px solid #1D4A4A; border-top: none; }
+  .s2 .artifacts li  { background: #183F42; color: #72B8B0; }
+
+  .s3 .stage-header { background: linear-gradient(135deg, #3A2E5C, #4A3870); color: #C8B8F0; }
+  .s3 .stage-body   { background: #2A2245; color: #A08CDA; border: 1px solid #3A305A; border-top: none; }
+  .s3 .artifacts li  { background: #322A52; color: #9A82CF; }
+
+  .s4 .stage-header { background: linear-gradient(135deg, #5C3A1B, #704A1E); color: #F0D0B0; }
+  .s4 .stage-body   { background: #452C14; color: #DAB088; border: 1px solid #5A3D1E; border-top: none; }
+  .s4 .artifacts li  { background: #523518; color: #CFa072; }
+
+  .s5 .stage-header { background: linear-gradient(135deg, #4A1B3A, #5C1E4A); color: #F0B8D8; }
+  .s5 .stage-body   { background: #381430; color: #DA88B8; border: 1px solid #4A1E3A; border-top: none; }
+  .s5 .artifacts li  { background: #421A38; color: #CF72A8; }
+
+  .cross-flow {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+  }
+  .cross-flow-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    color: #5C7A96;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .cross-flow-item .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #3A6B9F;
+    opacity: 0.5;
+  }
+</style>
+</head>
+<body>
+
+<div class="slide">
+  <h1><span>Engagement Prediction</span> Pipeline</h1>
+
+  <div class="pipeline">
+
+    <div class="source">
+      <div class="source-icon">&#9729;</div>
+      <div class="source-label">
+        <strong>GCS</strong>
+        Bluesky Firehose<br>likes &middot; posts &middot; embeds
+      </div>
+    </div>
+
+    <div class="arrow-connector">
+      <svg width="24" height="2"><line x1="0" y1="1" x2="24" y2="1" stroke="#3A6B9F" stroke-width="2" stroke-dasharray="4,3"/></svg>
+    </div>
+
+    <div class="stage s1">
+      <div class="stage-header">
+        <div class="stage-num">Stage 01</div>
+        <div class="stage-title">Get Data</div>
+      </div>
+      <div class="stage-body">
+        <p>Stream &amp; filter from GCS. Hash-sample users, write embeddings memmap.</p>
+        <ul class="artifacts">
+          <li>posts_core</li>
+          <li>likes_core</li>
+          <li>embeddings.npy</li>
+          <li>inferences</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="flow-arrows">
+      <svg width="16" height="12"><polyline points="0,6 12,6" stroke="#3A6B9F" stroke-width="1.5" fill="none"/><polyline points="9,2 14,6 9,10" stroke="#3A6B9F" stroke-width="1.5" fill="none"/></svg>
+    </div>
+
+    <div class="stage s2">
+      <div class="stage-header">
+        <div class="stage-num">Stage 02</div>
+        <div class="stage-title">Target Posts</div>
+      </div>
+      <div class="stage-body">
+        <p>Pair liked posts with time-bucketed negatives. Assign train/val/holdout splits.</p>
+        <ul class="artifacts">
+          <li>target_posts</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="flow-arrows">
+      <svg width="16" height="12"><polyline points="0,6 12,6" stroke="#3A6B9F" stroke-width="1.5" fill="none"/><polyline points="9,2 14,6 9,10" stroke="#3A6B9F" stroke-width="1.5" fill="none"/></svg>
+    </div>
+
+    <div class="stage s3">
+      <div class="stage-header">
+        <div class="stage-num">Stage 03</div>
+        <div class="stage-title">User History</div>
+      </div>
+      <div class="stage-body">
+        <p>Build prior-like embedding index per target row, capped by recency.</p>
+        <ul class="artifacts">
+          <li>history_posts</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="flow-arrows">
+      <svg width="16" height="12"><polyline points="0,6 12,6" stroke="#3A6B9F" stroke-width="1.5" fill="none"/><polyline points="9,2 14,6 9,10" stroke="#3A6B9F" stroke-width="1.5" fill="none"/></svg>
+    </div>
+
+    <div class="stage s4">
+      <div class="stage-header">
+        <div class="stage-num">Stage 04</div>
+        <div class="stage-title">Train</div>
+      </div>
+      <div class="stage-body">
+        <p>MLP or Two-Tower model. BCE loss, AdamW, early stopping on val AUC.</p>
+        <ul class="artifacts">
+          <li>checkpoints</li>
+          <li>TorchScript</li>
+          <li>predictions</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="flow-arrows">
+      <svg width="16" height="12"><polyline points="0,6 12,6" stroke="#3A6B9F" stroke-width="1.5" fill="none"/><polyline points="9,2 14,6 9,10" stroke="#3A6B9F" stroke-width="1.5" fill="none"/></svg>
+    </div>
+
+    <div class="stage s5">
+      <div class="stage-header">
+        <div class="stage-num">Stage 05</div>
+        <div class="stage-title">Evaluate</div>
+      </div>
+      <div class="stage-body">
+        <p>Modular eval suite: cold-start, diversity, trait amplification, inequality.</p>
+        <ul class="artifacts">
+          <li>eval_summary</li>
+          <li>plots</li>
+          <li>CSVs</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="cross-flow">
+      <div class="cross-flow-item"><div class="dot"></div>embeddings.npy shared 01 &rarr; 04</div>
+      <div class="cross-flow-item"><div class="dot"></div>target_posts shared 02 &rarr; 05</div>
+      <div class="cross-flow-item"><div class="dot"></div>history_posts shared 03 &rarr; 05</div>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>

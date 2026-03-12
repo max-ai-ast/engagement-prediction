@@ -1,0 +1,65 @@
+%%{ init: {
+  "theme": "base",
+  "themeVariables": {
+    "primaryColor": "#4A90D9",
+    "primaryTextColor": "#fff",
+    "primaryBorderColor": "#2C5F8A",
+    "lineColor": "#5C6370",
+    "secondaryColor": "#E8F4FD",
+    "tertiaryColor": "#F0F4F8",
+    "fontFamily": "Segoe UI, Helvetica, Arial, sans-serif",
+    "fontSize": "14px"
+  }
+} }%%
+
+graph LR
+
+    %% ── External source ──
+    GCS(["fa:fa-cloud GCS · Bluesky Firehose"])
+
+    %% ── Stage 1 ──
+    subgraph stage1 ["01 · Get Data"]
+        direction TB
+        S1_work["Stream & filter from GCS\nHash-sample users\nWrite embeddings memmap"]
+        S1_out[/"posts_core · likes_core\nembeddings.npy · inferences"/]
+    end
+
+    %% ── Stage 2 ──
+    subgraph stage2 ["02 · Target Posts"]
+        direction TB
+        S2_work["Pair liked posts w/ negatives\nTime-bucketed neg sampling\nAssign train / val / holdout"]
+        S2_out[/"target_posts\n(pos/neg pairs + splits)"/]
+    end
+
+    %% ── Stage 3 ──
+    subgraph stage3 ["03 · User History"]
+        direction TB
+        S3_work["Build prior-like index\nper target row\nCap by max_prior_likes"]
+        S3_out[/"history_posts\n(prior_emb_indices)"/]
+    end
+
+    %% ── Stage 4 ──
+    subgraph stage4 ["04 · Train"]
+        direction TB
+        S4_work["MLP or Two-Tower\nBCE loss · AdamW\nEarly stopping on val AUC"]
+        S4_out[/"checkpoints · TorchScript\npredictions · plots"/]
+    end
+
+    %% ── Stage 5 ──
+    subgraph stage5 ["05 · Evaluate"]
+        direction TB
+        S5_work["Modular eval suite\nCold-start · Diversity\nTrait amplification · Inequality"]
+        S5_out[/"eval_summary.json\nmodule artifacts"/]
+    end
+
+    %% ── Main flow ──
+    GCS -->|"likes, posts,\nembeddings"| stage1
+    stage1 -->|"posts_core\nlikes_core"| stage2
+    stage2 -->|"target_posts"| stage3
+    stage3 -->|"history_posts"| stage4
+    stage4 -->|"predictions"| stage5
+
+    %% ── Cross-stage data ──
+    stage1 -.->|"embeddings.npy\n(shared memmap)"| stage4
+    stage2 -.->|"target_posts"| stage5
+    stage3 -.->|"history_posts"| stage5

@@ -1,0 +1,26 @@
+
+  Engagement Prediction Pipeline
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+                                     posts_core                          target_posts                      history_posts
+                                     likes_core                         (pos/neg pairs,                  (prior_emb_indices
+   ┌───────────┐                    embeddings.npy                     train/val/holdout)                   per target)                    model checkpoints
+   │           │                   inferences_core                                                                                         predictions
+   │    GCS    │─────────┐                                                                                                                (train/val/holdout)
+   │  Bluesky  │         │    ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐
+   │ Firehose  │         │    │                     │    │                     │    │                     │    │                     │    │                     │
+   │           │         ├───▶│    01 · GET DATA     ├───▶│  02 · TARGET POSTS  ├───▶│  03 · USER HISTORY  ├───▶│     04 · TRAIN      ├───▶│    05 · EVALUATE    │
+   │  (likes,  │         │    │                     │    │                     │    │                     │    │                     │    │                     │
+   │  posts,   │         │    ├─────────────────────┤    ├─────────────────────┤    ├─────────────────────┤    ├─────────────────────┤    ├─────────────────────┤
+   │  embeds)  │         │    │ Stream & filter from │    │ Pair liked posts    │    │ Build prior-like    │    │ MLP or Two-Tower    │    │ Modular eval suite: │
+   │           │─────────┘    │ GCS; hash-sample     │    │ with negatives;     │    │ embedding index     │    │ on user + post      │    │ cold-start, diver-  │
+   └───────────┘              │ users; write embed-  │    │ assign train/val/   │    │ per target row;     │    │ embeddings; BCE     │    │ sity, trait amplif-  │
+                              │ dings memmap         │    │ holdout splits      │    │ cap history length  │    │ loss; early stop    │    │ ication, inequality  │
+                              └─────────────────────┘    └─────────────────────┘    └──────────┬──────────┘    └──────────┬──────────┘    └─────────────────────┘
+                                                                                               │                         │
+                                                                                               │    ┌───────────────┐    │                  eval_summary.json
+                                                                                               └───▶│  embeddings   │◀───┘                  module artifacts
+                                                                                                    │   (memmap)    │                      (plots, CSVs, JSON)
+                                                                                                    └───────────────┘
+                                                                                                     shared from 01
+

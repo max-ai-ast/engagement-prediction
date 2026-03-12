@@ -1,0 +1,210 @@
+// Engagement Prediction Pipeline
+// Render: dot -Tpng pipeline_diagram.dot -o pipeline_diagram.png
+//     or: dot -Tsvg pipeline_diagram.dot -o pipeline_diagram.svg
+
+digraph pipeline {
+    rankdir=LR;
+    bgcolor="#FAFBFC";
+    fontname="Helvetica Neue";
+    pad=0.4;
+    nodesep=0.6;
+    ranksep=1.0;
+    splines=ortho;
+
+    // Global node defaults
+    node [
+        fontname="Helvetica Neue"
+        fontsize=11
+        style="filled,rounded"
+        shape=box
+        penwidth=1.5
+    ];
+
+    edge [
+        fontname="Helvetica Neue"
+        fontsize=9
+        color="#7B8CA0"
+        penwidth=1.5
+        arrowsize=0.7
+    ];
+
+    // ── External source ──────────────────────────────────
+    gcs [
+        label="GCS\nBluesky Firehose\n(likes, posts, embeds)"
+        shape=cylinder
+        fillcolor="#E8EDF4"
+        color="#7B8CA0"
+        fontcolor="#2C3E50"
+        fontsize=10
+    ];
+
+    // ── Stage 1: Get Data ────────────────────────────────
+    subgraph cluster_01 {
+        label="01 · Get Data";
+        fontsize=13;
+        fontcolor="#1B3A5C";
+        style="filled,rounded";
+        fillcolor="#E8F0F8";
+        color="#4A7FAF";
+        penwidth=2;
+
+        s1_work [
+            label="Stream & filter from GCS\nHash-sample users\nWrite embeddings memmap"
+            fillcolor="#D0E4F4"
+            color="#4A7FAF"
+            fontcolor="#1B3A5C"
+        ];
+        s1_out [
+            label="posts_core · likes_core\nembeddings.npy · inferences"
+            shape=note
+            fillcolor="#F4F8FC"
+            color="#4A7FAF"
+            fontcolor="#2C5F8A"
+            fontsize=9
+        ];
+
+        s1_work -> s1_out [style=invis];
+    }
+
+    // ── Stage 2: Target Posts ────────────────────────────
+    subgraph cluster_02 {
+        label="02 · Target Posts";
+        fontsize=13;
+        fontcolor="#1B4A4A";
+        style="filled,rounded";
+        fillcolor="#E4F4F2";
+        color="#3A8F88";
+        penwidth=2;
+
+        s2_work [
+            label="Pair liked w/ negatives\nTime-bucketed neg sampling\nTrain / val / holdout splits"
+            fillcolor="#CCE8E4"
+            color="#3A8F88"
+            fontcolor="#1B4A4A"
+        ];
+        s2_out [
+            label="target_posts\n(pos/neg pairs + splits)"
+            shape=note
+            fillcolor="#F2FAF8"
+            color="#3A8F88"
+            fontcolor="#1D5C5A"
+            fontsize=9
+        ];
+
+        s2_work -> s2_out [style=invis];
+    }
+
+    // ── Stage 3: User History ────────────────────────────
+    subgraph cluster_03 {
+        label="03 · User History";
+        fontsize=13;
+        fontcolor="#3A2E5C";
+        style="filled,rounded";
+        fillcolor="#EDE8F8";
+        color="#7A68B8";
+        penwidth=2;
+
+        s3_work [
+            label="Build prior-like index\nper target row\nCap by max_prior_likes"
+            fillcolor="#DCD4F0"
+            color="#7A68B8"
+            fontcolor="#3A2E5C"
+        ];
+        s3_out [
+            label="history_posts\n(prior_emb_indices)"
+            shape=note
+            fillcolor="#F6F2FC"
+            color="#7A68B8"
+            fontcolor="#4A3870"
+            fontsize=9
+        ];
+
+        s3_work -> s3_out [style=invis];
+    }
+
+    // ── Stage 4: Train ───────────────────────────────────
+    subgraph cluster_04 {
+        label="04 · Train";
+        fontsize=13;
+        fontcolor="#5C3A1B";
+        style="filled,rounded";
+        fillcolor="#F8F0E4";
+        color="#C08840";
+        penwidth=2;
+
+        s4_work [
+            label="MLP or Two-Tower\nBCE loss · AdamW\nEarly stop on val AUC"
+            fillcolor="#F0DCC4"
+            color="#C08840"
+            fontcolor="#5C3A1B"
+        ];
+        s4_out [
+            label="checkpoints · TorchScript\npredictions · plots"
+            shape=note
+            fillcolor="#FCF6EE"
+            color="#C08840"
+            fontcolor="#704A1E"
+            fontsize=9
+        ];
+
+        s4_work -> s4_out [style=invis];
+    }
+
+    // ── Stage 5: Evaluate ────────────────────────────────
+    subgraph cluster_05 {
+        label="05 · Evaluate";
+        fontsize=13;
+        fontcolor="#5C1E4A";
+        style="filled,rounded";
+        fillcolor="#F8E4F0";
+        color="#B858A0";
+        penwidth=2;
+
+        s5_work [
+            label="Modular eval suite\nCold-start · Diversity\nTrait amplification"
+            fillcolor="#F0C8E4"
+            color="#B858A0"
+            fontcolor="#5C1E4A"
+        ];
+        s5_out [
+            label="eval_summary.json\nmodule artifacts"
+            shape=note
+            fillcolor="#FEF2FA"
+            color="#B858A0"
+            fontcolor="#4A1E3A"
+            fontsize=9
+        ];
+
+        s5_work -> s5_out [style=invis];
+    }
+
+    // ── Main flow ────────────────────────────────────────
+    gcs     -> s1_work [label="  likes, posts,\n  embeddings" fontcolor="#4A7FAF"];
+    s1_out  -> s2_work [label="  posts_core\n  likes_core" fontcolor="#3A8F88"];
+    s2_out  -> s3_work [label="  target_posts" fontcolor="#7A68B8"];
+    s3_out  -> s4_work [label="  history_posts" fontcolor="#C08840"];
+    s4_out  -> s5_work [label="  predictions" fontcolor="#B858A0"];
+
+    // ── Cross-stage data flows ───────────────────────────
+    s1_out -> s4_work [
+        label="  embeddings.npy\n  (shared memmap)"
+        style=dashed
+        color="#7B8CA0:transparent"
+        fontcolor="#7B8CA0"
+        constraint=false
+    ];
+    s2_out -> s5_work [
+        label="  target_posts"
+        style=dashed
+        color="#7B8CA0:transparent"
+        fontcolor="#7B8CA0"
+        constraint=false
+    ];
+    s3_out -> s5_work [
+        label="  history_posts"
+        style=dashed
+        color="#7B8CA0:transparent"
+        fontcolor="#7B8CA0"
+        constraint=false
+    ];
+}
