@@ -45,6 +45,7 @@ from utils.helpers import (
     parse_one_ts,
     parse_one_ts_strict
 )
+from utils.memory_helpers import log_memory_checkpoint
 
 STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
 RAW_TS_COL_NAME = 'record_created_at'
@@ -79,6 +80,29 @@ def _get_liked_target_posts(
             how='inner'
         )
     ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did'
+
+
+def _nth_unliked_index(s: dict) -> int | None:
+    """Map rank-in-unliked-space to actual bucket index, skipping liked indices.
+
+    Given a sorted list of liked indices within a time-bucket, convert
+    ``neg_rank`` (a position in the *unliked* index space) to the real
+    ``idx_in_bucket`` by stepping past liked positions.  Runs in O(k)
+    where *k* = len(liked_idx_list), which is typically very small.
+    """
+    neg_rank = s['neg_rank']
+    if neg_rank is None:
+        return None
+    liked = s['liked_idx_list']
+    if not liked:
+        return neg_rank
+    idx = neg_rank
+    for l in liked:
+        if l <= idx:
+            idx += 1
+        else:
+            break
+    return idx
 
 
 def _get_negative_target_posts(
@@ -156,68 +180,69 @@ def _get_negative_target_posts(
         .select(['target_did', 'bucket', 'bucket_size'])
         .unique()
         .join(liked_idx_by_user_bucket_lf, on=['target_did', 'bucket'], how='left')
-        .with_columns(
+        .with_columns([
             pl.col('liked_idx_list')
-            .fill_null(pl.lit([], dtype=pl.List(pl.Int64)))
-            .alias('liked_idx_list')
-        )
+            .fill_null(pl.lit([], dtype=pl.List(pl.Int64))),
+            pl.col('liked_count').fill_null(0),
+        ])
         .with_columns(
-            pl.int_ranges(0, pl.col('bucket_size')).alias('all_idx'),
+            (pl.col('bucket_size') - pl.col('liked_count')).alias('unliked_count')
         )
-        .with_columns(
-            pl.col('all_idx')
-            .list
-            .set_difference(pl.col('liked_idx_list'))
-            .list
-            .sort()
-            .alias('unliked_idx_list')
-        )
-        .with_columns(
-            pl.col('unliked_idx_list').list.len().alias('unliked_count')
-        )
-        .select(['target_did', 'bucket', 'unliked_idx_list', 'unliked_count'])
+        .select(['target_did', 'bucket', 'liked_idx_list', 'unliked_count'])
     )
 
-    likes_lf = (
+    # Count likes before and after bucket join (cheap — no UDF involved yet)
+    likes_pre_neg_lf = (
         likes_with_bucket_lf
-        # join to get bucket_size for the like's bucket
         .join(bucket_sizes_lf, on="bucket", how="inner")
+    )
+    n_likes_orig = liked_target_posts_lf.select(pl.len()).collect(engine='streaming').item()
+    n_likes_after_bucket_join = likes_pre_neg_lf.select(pl.len()).collect(engine='streaming').item()
+    n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
+    logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_lost_from_bucket_join:,} likes).")
+    context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
+    log_memory_checkpoint('after_bucket_join_counts', logger)
+
+    likes_lf = (
+        likes_pre_neg_lf
         .with_columns(
-            # deterministic "random" seed per (user, liked_post)
             pl.struct(
                 [pl.col('target_did'), pl.col('like_uri')]
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
         )
         .join(user_bucket_candidates_lf, on=['target_did', 'bucket'], how='left')
         .with_columns(
-            # seed and neg_rank together assign a random *unliked* post in the bucket to each like
-            # (multiple likes can be assigned to the same negative post, which is what we want)
             pl.when(pl.col('unliked_count') > 0)
             .then((pl.col('seed') % pl.col('unliked_count').cast(pl.UInt64)).cast(pl.Int64))
             .otherwise(None)
             .alias('neg_rank'),
         )
         .with_columns(
-            pl.when(pl.col('neg_rank').is_not_null())
-            .then(pl.col('unliked_idx_list').list.get(pl.col('neg_rank')))
-            .otherwise(None)
+            pl.struct(['neg_rank', 'liked_idx_list'])
+            .map_elements(_nth_unliked_index, return_dtype=pl.Int64)
             .alias('neg_idx'),
         )
-    ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did' 'bucket', 'bucket_size', 'seed', 'neg_idx'
+    )
 
-    # (Shouldn't happen but) keep track of any potential lost likes by joining to bucket sizes.
-    n_likes_orig = liked_target_posts_lf.select(pl.len()).collect(engine='streaming').item()
-    n_likes_after_bucket_join = likes_lf.select(pl.len()).collect(engine='streaming').item()
-    n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
-    logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_lost_from_bucket_join:,} likes).")
-    context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
+    # Materialize once to avoid repeated Python UDF evaluation on every
+    # downstream .collect() / .sink_parquet() call.
+    likes_lf = (
+        likes_lf
+        .select([
+            'target_did', 'seen_at', 'like_uri', 'like_emb_idx',
+            'like_author_did', 'bucket', 'neg_idx',
+        ])
+        .collect()
+        .lazy()
+    )
+    log_memory_checkpoint('after_neg_sampling_collect', logger)
 
     # If a user liked every post in a bucket, there is no valid negative for that like.
     n_likes_without_neg = (
         likes_lf
         .filter(pl.col('neg_idx').is_null())
         .select(pl.len())
-        .collect(engine='streaming')
+        .collect()
         .item()
     )
     if n_likes_without_neg > 0:
@@ -472,6 +497,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'emb_idx': int
     })
 
+    log_memory_checkpoint('stage_start', logger)
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
     validate_dataframe_schema(target_posts_lf, {
@@ -487,9 +513,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     target_posts_lf = _apply_splits(args, target_posts_lf, logger)
 
-    # Write out result (streaming to avoid full materialization in memory)
+    log_memory_checkpoint('before_sink_parquet', logger)
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
     target_posts_lf.sink_parquet(target_posts_output_path)
+    log_memory_checkpoint('after_sink_parquet', logger)
 
     # Log split counts from the written file
     split_counts = (
