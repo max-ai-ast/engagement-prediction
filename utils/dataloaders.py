@@ -151,11 +151,18 @@ class SummarizedUserTower(nn.Module):
         if history_embeddings.dim() != 3:
             # Keep error message TorchScript-friendly (no dynamic shape formatting).
             raise RuntimeError("Expected history_embeddings with shape [B, T, D].")
+        if history_embeddings.size(-1) != self.embed_dim:
+            raise RuntimeError("Expected history_embeddings last dimension to match embed_dim.")
         summary = history_embeddings[:, 0, :]
         if history_mask is None:
             return summary
         if history_mask.dim() != 2:
             raise RuntimeError("Expected history_mask with shape [B, T].")
+        if (
+            history_mask.size(0) != history_embeddings.size(0)
+            or history_mask.size(1) != history_embeddings.size(1)
+        ):
+            raise RuntimeError("Expected history_mask shape [B, T] to match history_embeddings.")
 
         history_mask = history_mask.to(device=history_embeddings.device, dtype=torch.bool)
         has_history = history_mask.any(dim=1)  # [B]
@@ -435,7 +442,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
     def _forward_up_to_pos_embed(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
-        history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        history_mask: Optional[torch.Tensor],  # [B, seq_len] True = valid
     ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
         """Project inputs, normalize mask, and add (recency-flipped) positional embeddings.
 
@@ -489,6 +496,8 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # learnable token at position 0 and mark it as valid so downstream
         # pooling/self-attention has something to attend to.
         has_any = history_mask.any(dim=1)  # [B]
+        if has_any.all().item():
+            return B, seq_len, history_mask, x
         inject = ~has_any  # [B], True where history is empty
         inject_f = inject.to(dtype=x.dtype).unsqueeze(1)  # [B, 1]
 

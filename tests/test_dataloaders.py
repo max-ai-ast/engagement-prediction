@@ -603,3 +603,24 @@ def test_attention_encoder_raises_on_zero_sequence_length():
             history_embeddings=torch.zeros(2, 0, 8),
             history_mask=torch.zeros(2, 0, dtype=torch.bool),
         )
+
+
+def test_attention_encoder_empty_history_embedding_receives_grad():
+    """When history is empty, the cold-start token should participate in backprop."""
+    encoder = CrossAttentionPoolingEncoder(
+        input_dim=8,
+        hidden_dim=16,
+        output_dim=12,
+        max_seq_len=5,
+        dropout_rate=0.0,
+    )
+
+    history_embeddings = torch.zeros(2, 5, 8)
+    history_mask = torch.zeros(2, 5, dtype=torch.bool)  # all-masked => inject token
+
+    out = encoder(history_embeddings, history_mask)
+    loss = out.sum()
+    loss.backward()
+
+    assert encoder.empty_history_embedding.grad is not None
+    assert torch.isfinite(encoder.empty_history_embedding.grad).all()

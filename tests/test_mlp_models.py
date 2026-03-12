@@ -577,6 +577,10 @@ def test_attention_mlp_backward_pass():
     
     # Check gradients exist in both encoder and MLP
     for name, param in model.named_parameters():
+        # `empty_history_embedding` is only used when an example has an empty history
+        # (all-masked). For fully non-empty batches, it's expected to have no grad.
+        if "empty_history_embedding" in name:
+            continue
         assert param.grad is not None, f"Parameter {name} should have gradient"
 
 

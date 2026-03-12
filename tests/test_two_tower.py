@@ -705,6 +705,11 @@ def test_two_tower_backward_pass():
     
     # Check gradients exist in both towers
     for name, param in model.named_parameters():
+        # `empty_history_embedding` is only used when an example has an empty history
+        # (all-masked). For fully non-empty batches, it's expected to have no grad.
+        if "empty_history_embedding" in name:
+            assert (param.grad is None) or torch.isfinite(param.grad).all()
+            continue
         assert param.grad is not None, f"Parameter {name} should have gradient"
         assert torch.isfinite(param.grad).all(), f"Gradient for {name} should be finite"
 
