@@ -36,7 +36,7 @@ import time
 from datetime import datetime
 import logging
 
-from utils.pipeline.core import select_prior_output, Context
+from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger, 
     log_operation_start, 
@@ -441,7 +441,6 @@ def _apply_splits(
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
-    run_dir = Path(context.run_dir).resolve()
     out_dir = context.new_stage_dir('02_target_posts')
 
     # Initialize logger
@@ -450,9 +449,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # get args
     t0 = time.time()
 
-    prior_stage_path = select_prior_output(run_dir, '01_get_data', use_latest=context.use_latest, prior_path=context.prior_outputs.get('01_get_data'))
-    if prior_stage_path is None:
-        raise FileNotFoundError(f"Could not find outputs in prior 01_get_data directory!")
+    prior_stage_path = context.resolve_prior_output('01_get_data', prior_path=context.prior_outputs.get('01_get_data'))
     
     posts_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_stage_path, "posts_core_")
     validate_dataframe_schema(posts_core_lf, {

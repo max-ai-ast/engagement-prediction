@@ -838,7 +838,6 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
 # ---------------------------------------------------------------------------
 
 def load_training_data(
-    run_dir: Path,
     context: Context,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
@@ -850,8 +849,7 @@ def load_training_data(
     
     Resolution order for each artifact:
         1. context.artifacts - Set by pipeline when stages run in same session
-        2. select_prior_output() - Filesystem scan for standalone training runs
-        3. Fallback folders - Legacy compatibility (e.g., 02_featurize for history)
+        2. Filesystem scan of the canonical artifact store (context.artifacts_dir)
     
     The three required artifacts:
         1. embeddings_*.npy   : Memmap array of post embeddings from Stage 1
@@ -859,7 +857,6 @@ def load_training_data(
         3. history_posts_*.parquet: User engagement history from Stage 3
     
     Args:
-        run_dir: Root directory of the pipeline run
         context: Pipeline context with artifact tracking and configuration
         logger: Optional logger for progress reporting
     
@@ -875,7 +872,6 @@ def load_training_data(
         
     Example:
         >>> embeddings, targets, history, dim = load_training_data(
-        ...     run_dir=Path("/runs/experiment_001"),
         ...     context=context,
         ...     logger=logger
         ... )
@@ -883,13 +879,12 @@ def load_training_data(
     """
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
-    run_dir = Path(run_dir).resolve()
 
     # --- 1. Embeddings memmap from 01_get_data ---
     # This is a read-only memory-mapped array that allows accessing post
     # embeddings without loading the entire matrix into RAM
     log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
-    get_data_dir = _resolve_prior(run_dir, context, stage_key="get_data", folder="01_get_data")
+    get_data_dir = _resolve_prior(context, stage_key="get_data", folder="01_get_data")
     emb_candidates = sorted(get_data_dir.glob("embeddings_*.npy"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not emb_candidates:
         raise FileNotFoundError(f"No embeddings_*.npy found under {get_data_dir}")
@@ -901,19 +896,14 @@ def load_training_data(
     # --- 2. Target posts from 02_target_posts ---
     # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
-    target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
+    target_posts_dir = _resolve_prior(context, stage_key="target_posts", folder="02_target_posts")
     target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
     logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
     # Contains the (most-recent-first-ordered) list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
-    history_dir = _resolve_prior(
-        run_dir, context,
-        stage_key="user_history",
-        folder="03_user_history",
-        fallback_folder="02_featurize",  # Legacy compatibility
-    )
+    history_dir = _resolve_prior(context, stage_key="user_history", folder="03_user_history")
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
@@ -921,42 +911,19 @@ def load_training_data(
 
 
 def _resolve_prior(
-    run_dir: Path,
     context: Context,
     *,
     stage_key: str,
     folder: str,
-    fallback_folder: Optional[str] = None,
 ) -> Path:
     """Resolve a prior stage output directory, trying context artifacts first,
-    then ``select_prior_output`` with an optional legacy fallback folder."""
+    then a filesystem scan of the canonical artifact store."""
     # Try context artifacts first (same-session run)
     art_dir = context.get_artifact_dir(stage_key)
     if art_dir is not None and Path(art_dir).exists():
         return Path(art_dir)
-    # Filesystem scan
-    result = select_prior_output(
-        run_dir, folder,
-        use_latest=context.use_latest,
-        prior_path=context.prior_outputs.get(folder),
-    )
-    if result is not None:
-        return result
-    # Fallback folder (e.g. legacy '02_featurize' for user_history)
-    if fallback_folder is not None:
-        result = select_prior_output(
-            run_dir, fallback_folder,
-            use_latest=context.use_latest,
-            prior_path=context.prior_outputs.get(fallback_folder),
-        )
-        if result is not None:
-            return result
-    raise FileNotFoundError(
-        f"Could not find output for stage '{stage_key}' "
-        f"(looked for '{folder}'"
-        + (f" and '{fallback_folder}'" if fallback_folder else "")
-        + f") under {run_dir}"
-    )
+    # Filesystem scan (also records lineage for the active stage)
+    return context.resolve_prior_output(folder, prior_path=context.prior_outputs.get(folder))
 
 
 # ---------------------------------------------------------------------------

@@ -60,15 +60,16 @@ def test_background_effective_config_preserves_no_post_encoder(tmp_path):
     raw = parser.parse_args(["--no-post-encoder"])
     merged = cli._merge_args_with_config(raw)
 
-    run_dir = Path(tmp_path) / "run"
+    output_root = Path(tmp_path) / "out"
+    run_dir = output_root / "runs" / "run"
     initial_log = run_dir / "run-all.log"
     cfg = cli._build_effective_config_for_background_run(
-        merged, run_dir=run_dir, initial_log=initial_log
+        merged, output_root=output_root, initial_log=initial_log
     )
 
     assert cfg["use_post_encoder"] is False
     assert cfg["background"] is False
-    assert cfg["output_dir"] == str(run_dir.resolve())
+    assert cfg["output_dir"] == str(output_root.resolve())
     assert cfg["_initial_log"] == str(initial_log)
 
 
@@ -81,10 +82,31 @@ def test_background_effective_config_allows_cli_to_override_config_to_default(tm
     raw = parser.parse_args(["--config", str(config_path), "--post-encoder"])
     merged = cli._merge_args_with_config(raw)
 
-    run_dir = Path(tmp_path) / "run"
+    output_root = Path(tmp_path) / "out"
+    run_dir = output_root / "runs" / "run"
     initial_log = run_dir / "run-all.log"
     cfg = cli._build_effective_config_for_background_run(
-        merged, run_dir=run_dir, initial_log=initial_log
+        merged, output_root=output_root, initial_log=initial_log
     )
 
     assert cfg["use_post_encoder"] is True
+
+
+def test_merge_args_with_config_accepts_prior_pins(tmp_path):
+    config_path = Path(tmp_path) / "config.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            prior_01_get_data: 20260101_000000_deadbeef
+            prior_02_target_posts: 20260102_000000_cafebabe
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.prior_01_get_data == "20260101_000000_deadbeef"
+    assert merged.prior_02_target_posts == "20260102_000000_cafebabe"

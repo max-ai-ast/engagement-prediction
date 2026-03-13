@@ -331,7 +331,6 @@ def train_mlp_model(
 # =============================================================================
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
-    run_dir = Path(context.run_dir).resolve()
     device = get_device(args.device)
     timestamp = context.run_timestamp
 
@@ -356,7 +355,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
     embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
-        run_dir, context, logger=logger,
+        context, logger=logger,
     )
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---

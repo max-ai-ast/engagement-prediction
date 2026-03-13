@@ -36,7 +36,11 @@ def dummy_logger():
 def dummy_context(tmp_path):
     from utils.pipeline.core import Context
 
-    return Context(run_dir=tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir = tmp_path / "artifacts"
+    runs_dir = tmp_path / "runs"
+    return Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=runs_dir, pipeline_run_id="test")
 
 
 def test_get_liked_target_posts_selects_expected_columns(stage_target_posts_module):
