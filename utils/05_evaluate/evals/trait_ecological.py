@@ -33,16 +33,15 @@ Outputs (under trait_ecological/):
 from __future__ import annotations
 
 import math
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Tuple
+from typing import Any, Dict, NamedTuple, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from scipy.stats import gaussian_kde, spearmanr
+from scipy.stats import gaussian_kde
 
 from . import EvalContext, EvalModule
 from .trait_corrs import _load_inferences, _unnest_text_inferences
@@ -72,65 +71,70 @@ class TraitEcoResult(NamedTuple):
 # Computation
 # ---------------------------------------------------------------------------
 
-def _compute_tweet_level_rhos(
-    y_true: np.ndarray,
-    trait_arrays: Dict[str, np.ndarray],
-    finite_masks: Dict[str, np.ndarray],
-) -> Dict[str, float]:
-    """Tweet-level Spearman rho(trait, y_true) ignoring user identity."""
-    results: Dict[str, float] = {}
-    for key, vals in trait_arrays.items():
-        mask = finite_masks[key]
-        if mask.sum() < 10:
-            continue
-        rho, _ = spearmanr(y_true[mask], vals[mask])
-        results[key] = float(rho)
-    return results
+def _compute_all_rhos(
+    flat: pl.DataFrame,
+    group_names: list[str],
+) -> tuple[Dict[str, float], Dict[str, TraitEcoResult], Dict[str, list[str]]]:
+    """Tweet-level and per-user Spearman rhos via native Polars groupby.
 
+    Replaces separate tweet-level and per-user Python loops with a single pass
+    per trait column using Polars' Rust-native ``pl.corr(..., method="spearman")``
+    inside ``group_by().agg()``.
 
-def _compute_per_user_rhos(
-    user_ids: np.ndarray,
-    user_to_rows: Dict[Any, np.ndarray],
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    trait_arrays: Dict[str, np.ndarray],
-    finite_masks: Dict[str, np.ndarray],
-    valid_keys: set[str],
-) -> Dict[str, Tuple[List[float], List[float], List[Any]]]:
-    """Within-user rho(trait, y_true) and rho(trait, y_pred_proba) per trait.
-
-    Returns {key: (list_of_rho_true, list_of_rho_pred, list_of_user_ids)}.
-    Only includes users with >= MIN_POSTS_PER_USER_TRAIT finite trait values
-    and non-zero variance in both the outcome and trait columns.
+    Returns ``(tweet_rhos, trait_results, group_labels)``.
     """
-    rho_true_lists: Dict[str, List[float]] = defaultdict(list)
-    rho_pred_lists: Dict[str, List[float]] = defaultdict(list)
-    uid_lists: Dict[str, List[Any]] = defaultdict(list)
+    tweet_rhos: Dict[str, float] = {}
+    trait_results: Dict[str, TraitEcoResult] = {}
+    group_labels: Dict[str, list[str]] = {}
 
-    for uid in user_ids:
-        rows = user_to_rows[uid]
-        yt = y_true[rows]
-        yp = y_pred[rows]
+    for gname in group_names:
+        base = flat.select("did", "y_true", "y_pred_proba", gname).unnest(gname)
+        cols = [c for c in base.columns if c not in ("did", "y_true", "y_pred_proba")]
+        group_labels[gname] = cols
 
-        for key in valid_keys:
-            tv = trait_arrays[key][rows]
-            m = finite_masks[key][rows]
-            if int(m.sum()) < MIN_POSTS_PER_USER_TRAIT:
+        for col in cols:
+            key = f"{gname}::{col}"
+            work = base.select("did", "y_true", "y_pred_proba", col)
+            if work[col].dtype not in (pl.Float32, pl.Float64):
+                work = work.with_columns(pl.col(col).cast(pl.Float64))
+            valid = work.filter(pl.col(col).is_finite())
+
+            if len(valid) < 10:
                 continue
-            yt_m, yp_m, tv_m = yt[m], yp[m], tv[m]
-            if yt_m.std() == 0 or tv_m.std() == 0 or yp_m.std() == 0:
-                continue
-            rt, _ = spearmanr(yt_m, tv_m)
-            rp, _ = spearmanr(yp_m, tv_m)
-            rho_true_lists[key].append(float(rt))
-            rho_pred_lists[key].append(float(rp))
-            uid_lists[key].append(uid)
 
-    return {
-        key: (rho_true_lists[key], rho_pred_lists[key], uid_lists[key])
-        for key in valid_keys
-        if len(rho_true_lists[key]) >= MIN_USERS_PER_TRAIT
-    }
+            rho_tweet = valid.select(
+                pl.corr("y_true", col, method="spearman")
+            ).item()
+            if rho_tweet is None or not np.isfinite(rho_tweet):
+                continue
+            tweet_rhos[key] = float(rho_tweet)
+
+            per_user = (
+                valid
+                .group_by("did")
+                .agg(
+                    pl.len().alias("n"),
+                    pl.corr("y_true", col, method="spearman").alias("rho_true"),
+                    pl.corr("y_pred_proba", col, method="spearman").alias("rho_pred"),
+                )
+                .filter(
+                    (pl.col("n") >= MIN_POSTS_PER_USER_TRAIT)
+                    & pl.col("rho_true").is_finite()
+                    & pl.col("rho_pred").is_finite()
+                )
+            )
+
+            if len(per_user) < MIN_USERS_PER_TRAIT:
+                continue
+
+            trait_results[key] = TraitEcoResult(
+                rho_tweet=tweet_rhos[key],
+                user_rho_true=per_user["rho_true"].to_numpy(),
+                user_rho_pred=per_user["rho_pred"].to_numpy(),
+                user_ids=per_user["did"].to_numpy(),
+            )
+
+    return tweet_rhos, trait_results, group_labels
 
 
 # ---------------------------------------------------------------------------
@@ -514,51 +518,12 @@ class TraitEcologicalModule(EvalModule):
 
         flat, group_names = _unnest_text_inferences(joined)
 
-        # --- Extract numpy arrays ---
-        y_true = flat["y_true"].to_numpy().astype(float)
-        y_pred = flat["y_pred_proba"].to_numpy()
-        user_col = flat["did"].to_numpy()
-
-        user_ids = np.unique(user_col)
-        user_to_rows: Dict[Any, np.ndarray] = {
-            u: np.where(user_col == u)[0] for u in user_ids
-        }
-
-        trait_arrays: Dict[str, np.ndarray] = {}
-        finite_masks: Dict[str, np.ndarray] = {}
-        group_labels: Dict[str, List[str]] = {}
-
-        for gname in group_names:
-            gdf = flat.select(gname).unnest(gname)
-            cols = gdf.columns
-            group_labels[gname] = cols
-            for col in cols:
-                key = f"{gname}::{col}"
-                arr = gdf[col].to_numpy().astype(float)
-                trait_arrays[key] = arr
-                finite_masks[key] = np.isfinite(arr)
-
-        # --- (1) Tweet-level rhos ---
-        tweet_rhos = _compute_tweet_level_rhos(
-            y_true, trait_arrays, finite_masks,
+        # --- Compute tweet-level & per-user rhos via Polars groupby ---
+        tweet_rhos, trait_results, group_labels = _compute_all_rhos(
+            flat, group_names,
         )
 
-        # --- (2) & (3) Per-user rhos ---
-        per_user = _compute_per_user_rhos(
-            user_ids, user_to_rows, y_true, y_pred,
-            trait_arrays, finite_masks,
-            valid_keys=set(tweet_rhos.keys()),
-        )
-
-        # --- Assemble per-trait result tuples ---
-        trait_results: Dict[str, TraitEcoResult] = {}
-        for key, (rt_list, rp_list, uid_list) in per_user.items():
-            trait_results[key] = TraitEcoResult(
-                rho_tweet=tweet_rhos[key],
-                user_rho_true=np.array(rt_list),
-                user_rho_pred=np.array(rp_list),
-                user_ids=np.array(uid_list),
-            )
+        user_ids = flat["did"].unique().to_numpy()
 
         # --- Like-volume quintiles from user metadata ---
         meta = ctx.user_metadata_df
