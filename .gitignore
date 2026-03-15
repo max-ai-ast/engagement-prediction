@@ -37,6 +37,9 @@ ENV/
 *.swp
 *.swo
 
+# Agents
+CLAUDE.md
+
 # OS
 .DS_Store
 Thumbs.db
