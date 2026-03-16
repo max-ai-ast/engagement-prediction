@@ -426,6 +426,170 @@ def _plot_group_p90_diff(
     return path
 
 
+class _SplitSpec(NamedTuple):
+    """Defines a high/low user split for the points plot."""
+    did_is_high: Dict[Any, bool]
+    tag: str            # file-name suffix, e.g. "p90", "p50", "likes50pct"
+    title: str          # human-readable subtitle
+    label_lo: str       # legend label for low group
+    label_hi: str       # legend label for high group
+
+
+def _compute_user_splits(
+    did_to_likes: Dict[Any, int],
+    eligible_likes: np.ndarray,
+    user_ids: np.ndarray,
+) -> list[_SplitSpec]:
+    """Build the set of high/low user splits to visualise."""
+    splits: list[_SplitSpec] = []
+
+    for quantile, tag in [(0.9, "p90"), (0.5, "p50")]:
+        thresh = float(np.quantile(eligible_likes, quantile))
+        is_high = {uid: did_to_likes.get(uid, 0) >= thresh for uid in user_ids}
+        pct_label = f"p{int(quantile * 100)}"
+        splits.append(_SplitSpec(
+            did_is_high=is_high,
+            tag=tag,
+            title=f"Like-count {pct_label} = {thresh:.0f}",
+            label_lo=f"< {pct_label}",
+            label_hi=f"≥ {pct_label}",
+        ))
+
+    sorted_uids = sorted(user_ids, key=lambda u: did_to_likes.get(u, 0),
+                          reverse=True)
+    total_likes = sum(did_to_likes.get(u, 0) for u in user_ids)
+    if total_likes > 0:
+        cumulative = 0
+        high_set: set = set()
+        for uid in sorted_uids:
+            cumulative += did_to_likes.get(uid, 0)
+            high_set.add(uid)
+            if cumulative >= total_likes * 0.5:
+                break
+        is_high_vol = {uid: uid in high_set for uid in user_ids}
+        n_hi = len(high_set)
+        splits.append(_SplitSpec(
+            did_is_high=is_high_vol,
+            tag="likes50pct",
+            title=f"Top-50%-of-likes ({n_hi} users = 50% of volume)",
+            label_lo=f"remaining users",
+            label_hi=f"top {n_hi} users (50% vol)",
+        ))
+
+    return splits
+
+
+def _plot_group_split_points(
+    group_name: str,
+    trait_results: Dict[str, TraitEcoResult],
+    split: _SplitSpec,
+    out_dir: Path,
+) -> Path:
+    """Single-panel mean +/- 95% CI point plot of user-level rho_true for a given split.
+
+    Traits are ordered left-to-right by ascending (high-group mean - low-group mean).
+    Significance is assessed via Welch t-tests with Benjamini-Hochberg FDR
+    correction within the group; traits surviving q < 0.05 are marked with *.
+    """
+    from scipy.stats import ttest_ind
+    from statsmodels.stats.multitest import multipletests
+
+    z95 = 1.96
+
+    raw: Dict[str, Dict[str, Any]] = {}
+    for label in trait_results:
+        tr = trait_results[label]
+        mask_hi = np.array([split.did_is_high.get(uid, False)
+                            for uid in tr.user_ids])
+        below_vals = tr.user_rho_true[~mask_hi]
+        above_vals = tr.user_rho_true[mask_hi]
+
+        n_lo, n_hi = len(below_vals), len(above_vals)
+        if n_lo < 5 or n_hi < 5:
+            continue
+
+        mean_lo = float(np.mean(below_vals))
+        mean_hi = float(np.mean(above_vals))
+        ci_lo = z95 * float(np.std(below_vals, ddof=1)) / np.sqrt(n_lo)
+        ci_hi = z95 * float(np.std(above_vals, ddof=1)) / np.sqrt(n_hi)
+
+        _, p_val = ttest_ind(above_vals, below_vals, equal_var=False)
+
+        raw[label] = {
+            "mean_lo": mean_lo, "ci_lo": ci_lo, "n_lo": n_lo,
+            "mean_hi": mean_hi, "ci_hi": ci_hi, "n_hi": n_hi,
+            "diff": mean_hi - mean_lo,
+            "p_val": float(p_val),
+        }
+
+    labels = sorted(raw, key=lambda k: raw[k]["diff"])
+    n = len(labels)
+    fname = f"{group_name}_ecological_{split.tag}_points.png"
+    if n == 0:
+        path = out_dir / fname
+        fig, ax = plt.subplots(figsize=(4, 3))
+        ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes,
+                ha="center", va="center", fontsize=9, color="#999999")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return path
+
+    x = np.arange(n)
+    dodge = 0.15
+
+    means_lo = [raw[l]["mean_lo"] for l in labels]
+    cis_lo   = [raw[l]["ci_lo"]   for l in labels]
+    means_hi = [raw[l]["mean_hi"] for l in labels]
+    cis_hi   = [raw[l]["ci_hi"]   for l in labels]
+
+    fig, ax = plt.subplots(figsize=(max(6, 0.55 * n), 5))
+
+    ax.errorbar(
+        x - dodge, means_lo, yerr=cis_lo,
+        fmt="o", color=_P90_COLORS["below"], markersize=5,
+        capsize=3, capthick=0.8, linewidth=0.8,
+        label=split.label_lo,
+    )
+    ax.errorbar(
+        x + dodge, means_hi, yerr=cis_hi,
+        fmt="o", color=_P90_COLORS["above"], markersize=5,
+        capsize=3, capthick=0.8, linewidth=0.8,
+        label=split.label_hi,
+    )
+
+    p_vals = np.array([raw[l]["p_val"] for l in labels])
+    _, q_vals, _, _ = multipletests(p_vals, alpha=0.05, method="fdr_bh")
+
+    y_top = max(
+        max(m + c for m, c in zip(means_lo, cis_lo)),
+        max(m + c for m, c in zip(means_hi, cis_hi)),
+    )
+    star_y = y_top + 0.02
+    for i, q in enumerate(q_vals):
+        if q < 0.05:
+            ax.text(i, star_y, "*", ha="center", va="bottom",
+                    fontsize=10, fontweight="bold", color="#333333")
+
+    ax.axhline(0, color="black", linestyle="--", linewidth=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("User-level Spearman ρ(trait, liked)  [mean ± 95% CI]",
+                   fontsize=8)
+    ax.set_title(
+        f"{group_name.replace('_', ' ').title()}"
+        f" — True-Preference ρ  ({split.title})",
+        fontsize=10, fontweight="bold",
+    )
+    ax.legend(fontsize=7, loc="best", framealpha=0.8)
+    ax.tick_params(axis="y", labelsize=7)
+    plt.tight_layout()
+
+    path = out_dir / fname
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def _plot_gap_summary(
     all_gaps: Dict[str, Tuple[str, float]],
     group_color_map: Dict[str, str],
@@ -522,7 +686,7 @@ class TraitEcologicalModule(EvalModule):
 
         user_ids = flat["did"].unique().to_numpy()
 
-        # --- 90th-percentile like-volume threshold from user metadata ---
+        # --- Like-volume thresholds from user metadata ---
         meta = ctx.user_metadata_df
         did_to_likes: Dict[Any, int] = dict(
             zip(meta["did"], meta["num_total_likes"])
@@ -531,6 +695,9 @@ class TraitEcologicalModule(EvalModule):
             did_to_likes.get(uid, 0) for uid in user_ids
         ])
         p90_threshold = float(np.quantile(eligible_likes, 0.9))
+
+        user_splits = _compute_user_splits(did_to_likes, eligible_likes,
+                                           user_ids)
 
         # --- Plots ---
         group_color_map = {
@@ -565,6 +732,10 @@ class TraitEcologicalModule(EvalModule):
                 str(_plot_group_p90_diff(gname, group_traits,
                                         did_to_likes, p90_threshold,
                                         out_dir)))
+            for sp in user_splits:
+                plot_paths.append(
+                    str(_plot_group_split_points(gname, group_traits,
+                                                sp, out_dir)))
 
         if all_gaps:
             plot_paths.insert(
