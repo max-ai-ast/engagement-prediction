@@ -48,7 +48,7 @@ from .trait_corrs import _load_inferences, _unnest_text_inferences
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
 MIN_USERS_PER_TRAIT = 30
-MIN_POSTS_PER_USER_TRAIT = 10
+MIN_POSTS_PER_USER_TRAIT = 4  # minimum for Fisher-z variance 1/(n-3) to be finite
 
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -65,6 +65,55 @@ class TraitEcoResult(NamedTuple):
     user_rho_true: np.ndarray
     user_rho_pred: np.ndarray
     user_ids: np.ndarray
+    user_n: np.ndarray
+    tau_sq_true: float
+    tau_sq_pred: float
+
+
+# ---------------------------------------------------------------------------
+# Empirical-Bayes shrinkage
+# ---------------------------------------------------------------------------
+
+def _eb_shrink(
+    rhos: np.ndarray,
+    ns: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Empirical-Bayes shrinkage of Spearman correlations via Fisher z-transform.
+
+    Each per-user rho_i (estimated from n_i observations) is shrunk toward the
+    grand mean, with shrinkage strength inversely proportional to n_i.
+
+    Steps:
+      1. Fisher z-transform: z_i = arctanh(rho_i), with rho clipped to
+         +/-0.999 to avoid divergence.
+      2. Sampling variance: var_i = 1 / (n_i - 3), the standard large-sample
+         approximation for Spearman (Bonett & Wright 2000).
+      3. Prior via method-of-moments:
+           mu   = mean(z_i)
+           tau² = max(0,  var(z_i) - mean(var_i))
+         where tau² estimates the true between-user variance after removing
+         expected sampling noise.
+      4. Posterior mean (James–Stein / normal–normal EB):
+           z_shrunk_i = mu + B_i * (z_i - mu)
+         with reliability B_i = tau² / (tau² + var_i).
+      5. Back-transform: rho_shrunk_i = tanh(z_shrunk_i).
+
+    Returns (shrunk_rhos, tau_sq).  When tau² = 0 (no detectable heterogeneity)
+    all rhos collapse to tanh(mu) ≈ mean(rho).
+    """
+    rhos_clipped = np.clip(rhos, -0.999, 0.999)
+    z = np.arctanh(rhos_clipped)
+    var_i = 1.0 / (ns.astype(np.float64) - 3.0)
+
+    mu = float(np.mean(z))
+    tau_sq = max(0.0, float(np.var(z, ddof=0)) - float(np.mean(var_i)))
+
+    if tau_sq == 0.0:
+        return np.full_like(rhos, np.tanh(mu)), tau_sq
+
+    B = tau_sq / (tau_sq + var_i)
+    z_shrunk = mu + B * (z - mu)
+    return np.tanh(z_shrunk), tau_sq
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +151,6 @@ def _compute_all_rhos(
             if len(valid) < 10:
                 continue
 
-            rho_tweet = valid.select(
-                pl.corr("y_true", col, method="spearman")
-            ).item()
-            if rho_tweet is None or not np.isfinite(rho_tweet):
-                continue
-            tweet_rhos[key] = float(rho_tweet)
-
             per_user = (
                 valid
                 .group_by("did")
@@ -127,11 +169,32 @@ def _compute_all_rhos(
             if len(per_user) < MIN_USERS_PER_TRAIT:
                 continue
 
+            # Tweet-level rho restricted to the same user population
+            valid_restricted = valid.join(
+                per_user.select("did"), on="did", how="semi",
+            )
+            rho_tweet = valid_restricted.select(
+                pl.corr("y_true", col, method="spearman")
+            ).item()
+            if rho_tweet is None or not np.isfinite(rho_tweet):
+                continue
+            tweet_rhos[key] = float(rho_tweet)
+
+            raw_true = per_user["rho_true"].to_numpy()
+            raw_pred = per_user["rho_pred"].to_numpy()
+            user_n = per_user["n"].to_numpy()
+
+            shrunk_true, tau_sq_true = _eb_shrink(raw_true, user_n)
+            shrunk_pred, tau_sq_pred = _eb_shrink(raw_pred, user_n)
+
             trait_results[key] = TraitEcoResult(
                 rho_tweet=tweet_rhos[key],
-                user_rho_true=per_user["rho_true"].to_numpy(),
-                user_rho_pred=per_user["rho_pred"].to_numpy(),
+                user_rho_true=shrunk_true,
+                user_rho_pred=shrunk_pred,
                 user_ids=per_user["did"].to_numpy(),
+                user_n=user_n,
+                tau_sq_true=tau_sq_true,
+                tau_sq_pred=tau_sq_pred,
             )
 
     return tweet_rhos, trait_results, group_labels
@@ -779,6 +842,8 @@ class TraitEcologicalModule(EvalModule):
                     "diff_mean": float(np.mean(diff)),
                     "diff_median": float(np.median(diff)),
                     "n_users_computed": len(tr.user_rho_true),
+                    "tau_sq_true": tr.tau_sq_true,
+                    "tau_sq_pred": tr.tau_sq_pred,
                 }
             if gdict:
                 groups_json[gname] = gdict
@@ -787,6 +852,8 @@ class TraitEcologicalModule(EvalModule):
             "n_users_total": n_users_total,
             "n_users_eligible": n_users_eligible,
             "min_user_posts": MIN_USER_POSTS,
+            "min_posts_per_user_trait": MIN_POSTS_PER_USER_TRAIT,
+            "shrinkage": "empirical_bayes_fisher_z",
             "n_posts_matched": n_posts_matched,
             "mean_abs_ecological_gap": (
                 float(np.mean(all_abs_gaps)) if all_abs_gaps else 0.0
