@@ -24,9 +24,12 @@ notebooks/
 *.log
 *.pid
 nohup.out
+logs/
 
 # Environment
 *.env
+.env.*
+!.env.example
 .venv/
 venv/
 ENV/
@@ -36,6 +39,10 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# Agents
+CLAUDE.md
+.claude/
 
 # OS
 .DS_Store
