@@ -66,7 +66,12 @@ setup_gcp_project() {
     # Enable required APIs
     log_info "Enabling required GCP APIs..."
     gcloud services enable \
-        storage.googleapis.com
+        storage.googleapis.com \
+        cloudbuild.googleapis.com \
+        run.googleapis.com \
+        artifactregistry.googleapis.com \
+        vpcaccess.googleapis.com \
+        compute.googleapis.com
 
     log_info "GCP project setup complete."
 }
@@ -106,6 +111,23 @@ create_engagement_prediction_model_storage() {
     log_info "Granted objectAdmin to engagement prediction service account for bucket: $BUCKET_NAME"
 }
 
+check_vpc_connector() {
+    log_info "Checking for VPC connector..."
+
+    local connector_name="ingex-vpc-connector-$GE_ENVIRONMENT"
+
+    if gcloud compute networks vpc-access connectors describe "$connector_name" --region="$GE_GCP_REGION" > /dev/null 2>&1; then
+        log_info "VPC connector '$connector_name' already exists"
+        log_info "Inference service will be able to use this for internal network access"
+    else
+        log_warn "VPC connector '$connector_name' does not exist"
+        log_warn "If you need internal network access, run:"
+        log_warn "  cd ../ingex/ingest && ./scripts/gcp_setup.sh"
+        log_warn ""
+        log_warn "The inference service can still be deployed without VPC connector"
+    fi
+}
+
 main() {
     echo "=========================================================="
     echo "Green Earth Engagement Prediction - GCP Environment Setup"
@@ -120,17 +142,20 @@ main() {
     setup_gcp_project
     create_service_account
     create_engagement_prediction_model_storage
+    check_vpc_connector
 
     log_info "Environment setup complete!"
     echo
     echo "Next steps:"
-    echo "1. Run './scripts/deploy.sh' to build and deploy your services"
-    echo "2. Check Cloud Run console to verify services are running"
-    echo "3. Monitor logs for any issues"
+    echo "1. Set GE_INFERENCE_MODEL_URI to the GCS path of your model"
+    echo "2. Run 'inference_service/deploy.sh' to deploy the inference service to Cloud Run"
+    echo "3. Check Cloud Run console to verify the service is running"
+    echo "4. Confirm the service is only accessible from within the VPC (--ingress=internal)"
     echo
     echo "Important notes:"
     echo "- Model files are stored in: gs://$GE_GCP_PROJECT_ID-engagement-prediction-model-$GE_ENVIRONMENT"
     echo "- Service account: engagement-prediction-sa-$GE_ENVIRONMENT@$GE_GCP_PROJECT_ID.iam.gserviceaccount.com"
+    echo "- Service name: engagement-prediction-inference-$GE_ENVIRONMENT"
     echo
 }
 
