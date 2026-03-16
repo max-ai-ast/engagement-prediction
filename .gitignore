@@ -24,6 +24,7 @@ notebooks/
 *.log
 *.pid
 nohup.out
+logs/
 
 # Environment
 *.env
