@@ -293,9 +293,12 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_batch_size = int(args.eval_batch_size)
     eval_holdout_type = str(args.eval_holdout_type)
     holdout_split = f"holdout_{eval_holdout_type}"
-    skip_modules = args.skip_modules
-    if skip_modules and isinstance(skip_modules, str):
-        skip_modules = [m.strip() for m in skip_modules.split(',')]
+    skip_eval_modules = args.skip_eval_modules
+    if skip_eval_modules and isinstance(skip_eval_modules, str):
+        skip_eval_modules = [m.strip() for m in skip_eval_modules.split(',')]
+    only_eval_modules = args.only_eval_modules
+    if only_eval_modules and isinstance(only_eval_modules, str):
+        only_eval_modules = [m.strip() for m in only_eval_modules.split(',')]
 
     # Resolve training output first so we can nest eval outputs inside it
     train_dir = resolve_train_output(run_dir, context)
@@ -380,7 +383,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Step 5: Discover and run evaluation modules
     log_operation_start('Discover and run evaluation modules', STAGE_LOG_NAME, logger)
     logger.info("Running evaluation modules...")
-    module_results = run_all_modules(ctx, skip_modules=skip_modules)
+    module_results = run_all_modules(ctx, skip_modules=skip_eval_modules, only_modules=only_eval_modules)
 
     # Step 6: Save combined summary
     log_operation_start('Save evaluation summary', STAGE_LOG_NAME, logger)

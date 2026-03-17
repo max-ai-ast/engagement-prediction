@@ -103,7 +103,8 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 5 (eval)
     "eval_batch_size": 8192,
     "eval_holdout_type": "unseen_users",
-    "skip_modules": None,  # Comma-separated eval module names to skip (None = run all)
+    "skip_eval_modules": None,  # Comma-separated eval module names to skip (None = run all)
+    "only_eval_modules": None,  # Comma-separated eval module names to run exclusively (None = run all)
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
@@ -626,8 +627,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--eval-holdout-type", type=str, default=argparse.SUPPRESS,
                           choices=["unseen_users", "seen_users"],
                           help_text="Which holdout set to use for evaluation: unseen_users (user-split) or seen_users (temporal after val period)")
-    _add_arg_with_default(p_all, "--skip-modules", type=str, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--skip-eval-modules", type=str, default=argparse.SUPPRESS,
                           help_text="Comma-separated list of evaluation module names to skip (e.g. cold_start_curves,performance_inequality)")
+    _add_arg_with_default(p_all, "--only-eval-modules", type=str, default=argparse.SUPPRESS,
+                          help_text="Comma-separated list of evaluation module names to run exclusively (e.g. cold_start_curves,performance_inequality)")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")

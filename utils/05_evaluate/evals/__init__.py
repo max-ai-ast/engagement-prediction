@@ -163,6 +163,7 @@ def run_all_modules(
     ctx: EvalContext,
     modules: Optional[List[Type[EvalModule]]] = None,
     skip_modules: Optional[List[str]] = None,
+    only_modules: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Run all evaluation modules and collect results.
@@ -171,6 +172,7 @@ def run_all_modules(
         ctx: EvalContext to pass to each module.
         modules: Optional list of module classes to run. If None, auto-discovers modules.
         skip_modules: Optional list of module names to skip.
+        only_modules: Optional list of module names to run exclusively.
     
     Returns:
         Dict mapping module name -> module results dict.
@@ -179,11 +181,15 @@ def run_all_modules(
         modules = discover_modules()
     
     skip_set = set(skip_modules or [])
+    only_set = set(only_modules) if only_modules else None
     results: Dict[str, Dict[str, Any]] = {}
     
     for module_cls in modules:
         module = module_cls()
         
+        if only_set is not None and module.name not in only_set:
+            print(f"  Skipping module: {module.name}")
+            continue
         if module.name in skip_set:
             print(f"  Skipping module: {module.name}")
             continue
