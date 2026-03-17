@@ -427,6 +427,12 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # Resolve pipeline run dir after ClearML connects args, since output_dir might have been overridden.
     run_dir = _resolve_pipeline_run_dir(args, output_root=output_root, run_timestamp=run_timestamp)
     update_latest_symlink(output_root / "runs", run_dir)
+    tracker.log_params(params={
+            "run_dir": str(run_dir.resolve()),
+            "run_name": run_dir.name
+        },
+        name="Directories"
+    )
 
     # Ensure args.output_dir is set (this is the output root).
     setattr(args, 'output_dir', str(output_root))

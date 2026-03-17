@@ -224,7 +224,8 @@ class ClearMLExperimentTracker:
         om.set_metadata("git_sha", getattr(script, "version_num", ""))
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
-        self._task.connect(params, name=name)
+        # ClearML expects values to be JSON-serializable; normalize common types (e.g. Path).
+        self._task.connect(normalize_params(params), name=name)
 
     def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
         """Connect an argparse.Namespace to ClearML and return the (possibly) updated args.
