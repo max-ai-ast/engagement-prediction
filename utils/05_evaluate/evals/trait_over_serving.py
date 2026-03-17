@@ -37,13 +37,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from scipy.stats import gaussian_kde
+from scipy.stats import gaussian_kde, ttest_1samp
 
 from . import EvalContext, EvalModule
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
-MIN_POSTS_PER_HALF = 4
+MIN_POSTS_PER_HALF = 8
 
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -60,6 +60,9 @@ class TraitOverServingResult(NamedTuple):
     over_serving_std: np.ndarray
     global_sd: float
     n_users: int
+    cohen_d: float
+    t_stat: float
+    p_value: float
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +119,9 @@ def _compute_over_serving(
                 yp = y_pred[valid_rows]
                 tv = trait_vals[valid_rows]
 
+                if np.std(tv) < 1e-6:
+                    continue
+
                 liked = yt == 1
                 not_liked = ~liked
                 if liked.sum() < MIN_POSTS_PER_HALF or not_liked.sum() < MIN_POSTS_PER_HALF:
@@ -138,11 +144,18 @@ def _compute_over_serving(
             os_raw = np.array(os_raw_list)
             os_std = os_raw / global_sd
 
+            sd_std = float(np.std(os_std, ddof=1))
+            cohen_d = float(np.mean(os_std)) / sd_std if sd_std > 1e-12 else 0.0
+            t_res = ttest_1samp(os_std, 0.0)
+
             trait_results[key] = TraitOverServingResult(
                 over_serving_raw=os_raw,
                 over_serving_std=os_std,
                 global_sd=global_sd,
                 n_users=len(os_raw),
+                cohen_d=cohen_d,
+                t_stat=float(t_res.statistic),
+                p_value=float(t_res.pvalue),
             )
 
     return trait_results, group_labels
@@ -151,6 +164,14 @@ def _compute_over_serving(
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
+
+def _fmt_pvalue(p: float) -> str:
+    if p < 0.001:
+        return "p < .001"
+    if p < 0.01:
+        return f"p = {p:.3f}"
+    return f"p = {p:.2f}"
+
 
 def _safe_kde(values: np.ndarray, grid: np.ndarray) -> np.ndarray | None:
     try:
@@ -202,12 +223,16 @@ def _plot_group_over_serving(
         ax.axvline(median_v, color="#c04000", linewidth=0.8, linestyle=":",
                    label=f"median = {median_v:+.3f} SD")
 
-        ax.set_title(f"{label}  ({pct_over:.0f}% over-served)",
+        p_str = _fmt_pvalue(tr.p_value)
+        ax.set_title(f"{label}  (d = {tr.cohen_d:+.3f}, {p_str})",
                      fontsize=8, fontweight="bold")
         ax.set_xlabel("Over-serving (SD of trait)", fontsize=7)
         ax.set_ylabel("density", fontsize=7)
         ax.tick_params(labelsize=6)
-        ax.legend(fontsize=5, loc="upper right", framealpha=0.7)
+        ax.legend(
+            title=f"{pct_over:.0f}% > 0  (N={tr.n_users})",
+            title_fontsize=5, fontsize=5, loc="upper right", framealpha=0.7,
+        )
 
     for idx in range(n, nrows * ncols):
         row, col = divmod(idx, ncols)
@@ -238,7 +263,8 @@ def _plot_summary_bar(
 
     rng = np.random.default_rng(seed)
 
-    bar_data: Dict[str, Tuple[str, float, float, float]] = {}
+    _BarEntry = Tuple[str, float, float, float, float, float]
+    bar_data: Dict[str, _BarEntry] = {}
     for key, tr in all_results.items():
         gname = key.split("::")[0]
         vals = tr.over_serving_std
@@ -251,19 +277,21 @@ def _plot_summary_bar(
         ci_lo = float(np.percentile(boot_means, 2.5))
         ci_hi = float(np.percentile(boot_means, 97.5))
 
-        bar_data[key] = (gname, mean_v, ci_lo, ci_hi)
+        bar_data[key] = (gname, mean_v, ci_lo, ci_hi, tr.cohen_d, tr.p_value)
 
     sorted_keys = sorted(bar_data, key=lambda k: abs(bar_data[k][1]), reverse=True)
     labels = [k.split("::")[-1] for k in sorted_keys]
     means = [bar_data[k][1] for k in sorted_keys]
     ci_los = [bar_data[k][2] for k in sorted_keys]
     ci_his = [bar_data[k][3] for k in sorted_keys]
+    cohen_ds = [bar_data[k][4] for k in sorted_keys]
+    p_vals = [bar_data[k][5] for k in sorted_keys]
     colors = [group_color_map.get(bar_data[k][0], "#999999") for k in sorted_keys]
 
     xerr_neg = [m - lo for m, lo in zip(means, ci_los)]
     xerr_pos = [hi - m for m, hi in zip(means, ci_his)]
 
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.35 * len(labels))))
+    fig, ax = plt.subplots(figsize=(9, max(3, 0.35 * len(labels))))
     y_pos = np.arange(len(labels))
 
     ax.barh(y_pos, means, color=colors, edgecolor="white", linewidth=0.5,
@@ -275,6 +303,15 @@ def _plot_summary_bar(
     ax.axvline(0, color="black", linewidth=0.5)
     ax.set_xlabel("Mean over-serving (SD of trait)  [95% bootstrap CI]")
     ax.set_title("Content Over-Serving Summary")
+
+    x_max = max(abs(m) + xe for m, xe in zip(means, xerr_pos))
+    for i, (d, p) in enumerate(zip(cohen_ds, p_vals)):
+        sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+        ann = f"d={d:+.2f}{sig}"
+        ax.text(
+            x_max * 1.02, y_pos[i], ann,
+            va="center", ha="left", fontsize=5.5, color="#333333",
+        )
 
     seen: set[str] = set()
     handles = []
@@ -299,24 +336,43 @@ def _plot_summary_bar(
 
 def _generate_headline(
     all_results: Dict[str, TraitOverServingResult],
-) -> str:
-    """Auto-generate a one-sentence verbal summary of the largest over-serving."""
+) -> List[str]:
+    """Auto-generate verbal summary sentences for the largest over-serving effects."""
     if not all_results:
-        return "No traits had sufficient data for over-serving analysis."
+        return ["No traits had sufficient data for over-serving analysis."]
 
-    biggest_key = max(all_results,
-                      key=lambda k: abs(float(np.mean(all_results[k].over_serving_std))))
+    biggest_key = max(
+        all_results,
+        key=lambda k: abs(all_results[k].cohen_d),
+    )
     tr = all_results[biggest_key]
     trait_name = biggest_key.split("::")[-1]
     mean_std = float(np.mean(tr.over_serving_std))
-    pct_over = float(np.mean(tr.over_serving_std > 0) * 100)
-
     direction = "over" if mean_std > 0 else "under"
-    return (
+    p_str = _fmt_pvalue(tr.p_value)
+
+    sentences = [
         f"The model {direction}-serves {trait_name} by "
-        f"{abs(mean_std):.3f} SD for the average user "
-        f"({pct_over:.0f}% of users {direction}-served)."
-    )
+        f"{abs(mean_std):.3f} SD on average "
+        f"(d = {tr.cohen_d:+.3f}, {p_str}, "
+        f"N = {tr.n_users} users with trait variation).",
+    ]
+
+    sig_keys = [
+        k for k in all_results if all_results[k].p_value < 0.05
+    ]
+    n_sig = len(sig_keys)
+    n_total = len(all_results)
+    if n_sig > 0:
+        n_over = sum(1 for k in sig_keys if all_results[k].cohen_d > 0)
+        n_under = n_sig - n_over
+        sentences.append(
+            f"{n_sig}/{n_total} traits show statistically significant "
+            f"over-serving effects (p < .05): "
+            f"{n_over} over-served, {n_under} under-served."
+        )
+
+    return sentences
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +446,7 @@ class TraitOverServingModule(EvalModule):
                                          out_dir)))
 
         # --- Headline ---
-        headline = _generate_headline(trait_results)
+        headline_sentences = _generate_headline(trait_results)
 
         # --- Summary JSON ---
         groups_json: Dict[str, Any] = {}
@@ -409,6 +465,9 @@ class TraitOverServingModule(EvalModule):
                     "mean_over_serving_std": mean_std,
                     "median_over_serving_std": float(np.median(tr.over_serving_std)),
                     "sd_over_serving_std": float(np.std(tr.over_serving_std, ddof=1)),
+                    "cohen_d": tr.cohen_d,
+                    "t_stat": tr.t_stat,
+                    "p_value": tr.p_value,
                     "pct_users_over_served": float(np.mean(tr.over_serving_raw > 0) * 100),
                     "global_trait_sd": tr.global_sd,
                     "n_users": tr.n_users,
@@ -417,7 +476,7 @@ class TraitOverServingModule(EvalModule):
                 groups_json[gname] = gdict
 
         summary = {
-            "headline": headline,
+            "headline": headline_sentences,
             "n_users_total": n_users_total,
             "n_users_eligible": n_users_eligible,
             "min_user_posts": MIN_USER_POSTS,
@@ -428,7 +487,7 @@ class TraitOverServingModule(EvalModule):
         self.save_json(summary, out_dir / "trait_over_serving_summary.json")
 
         return {
-            "headline": headline,
+            "headline": headline_sentences,
             "n_users_eligible": n_users_eligible,
             "n_posts_matched": n_posts_matched,
             "groups_plotted": len(groups_json),
