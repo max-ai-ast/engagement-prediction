@@ -48,12 +48,12 @@ import polars as pl
 from scipy.stats import rankdata, spearmanr
 
 from . import EvalContext, EvalModule
-from .trait_corrs import _load_inferences, _unnest_text_inferences
+from .trait_corrs import _load_inferences, _unnest_text_inferences, eb_shrink
 
 MIN_USER_POSTS = 20
 N_BOOTSTRAP = 500
 ALPHA = 0.05
-PER_USER_MIN_POSTS = 10
+PER_USER_MIN_POSTS = 4  # minimum for Fisher-z variance 1/(n-3) to be finite
 
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -251,10 +251,11 @@ def _compute_per_user_rhos(
     finite_masks: Dict[str, np.ndarray],
     valid_keys: set[str],
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-    """Per-user Spearman rho for each trait.
+    """Per-user Spearman rho for each trait, with EB shrinkage.
 
     Returns {key: (rho_true_array, rho_pred_array)} where each array has one
-    entry per user that had enough finite trait observations.
+    entry per user that had enough finite trait observations.  Raw per-user
+    rhos are shrunk via ``eb_shrink`` before returning.
     """
     results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     keys = sorted(valid_keys)
@@ -267,6 +268,7 @@ def _compute_per_user_rhos(
         fmask = finite_masks[key]
         rho_trues: List[float] = []
         rho_preds: List[float] = []
+        user_ns: List[int] = []
 
         for u in user_ids:
             rows = user_to_rows[u]
@@ -285,9 +287,13 @@ def _compute_per_user_rhos(
             if np.isfinite(rt) and np.isfinite(rp):
                 rho_trues.append(rt)
                 rho_preds.append(rp)
+                user_ns.append(len(vr))
 
         if len(rho_trues) >= 5:
-            results[key] = (np.array(rho_trues), np.array(rho_preds))
+            ns = np.array(user_ns)
+            shrunk_true, _ = eb_shrink(np.array(rho_trues), ns)
+            shrunk_pred, _ = eb_shrink(np.array(rho_preds), ns)
+            results[key] = (shrunk_true, shrunk_pred)
 
     return results
 

@@ -67,6 +67,48 @@ def _unnest_text_inferences(df: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
     return partially.unnest("_text_inf"), group_names
 
 
+def eb_shrink(
+    rhos: np.ndarray,
+    ns: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Empirical-Bayes shrinkage of Spearman correlations via Fisher z-transform.
+
+    Each per-user rho_i (estimated from n_i observations) is shrunk toward the
+    grand mean, with shrinkage strength inversely proportional to n_i.
+
+    Steps:
+      1. Fisher z-transform: z_i = arctanh(rho_i), with rho clipped to
+         +/-0.999 to avoid divergence.
+      2. Sampling variance: var_i = 1 / (n_i - 3), the standard large-sample
+         approximation for Spearman (Bonett & Wright 2000).
+      3. Prior via method-of-moments:
+           mu   = mean(z_i)
+           tau² = max(0,  var(z_i) - mean(var_i))
+         where tau² estimates the true between-user variance after removing
+         expected sampling noise.
+      4. Posterior mean (James–Stein / normal–normal EB):
+           z_shrunk_i = mu + B_i * (z_i - mu)
+         with reliability B_i = tau² / (tau² + var_i).
+      5. Back-transform: rho_shrunk_i = tanh(z_shrunk_i).
+
+    Returns (shrunk_rhos, tau_sq).  When tau² = 0 (no detectable heterogeneity)
+    all rhos collapse to tanh(mu) ≈ mean(rho).
+    """
+    rhos_clipped = np.clip(rhos, -0.999, 0.999)
+    z = np.arctanh(rhos_clipped)
+    var_i = 1.0 / (ns.astype(np.float64) - 3.0)
+
+    mu = float(np.mean(z))
+    tau_sq = max(0.0, float(np.var(z, ddof=0)) - float(np.mean(var_i)))
+
+    if tau_sq == 0.0:
+        return np.full_like(rhos, np.tanh(mu)), tau_sq
+
+    B = tau_sq / (tau_sq + var_i)
+    z_shrunk = mu + B * (z - mu)
+    return np.tanh(z_shrunk), tau_sq
+
+
 def _correlations_for_group(
     y_pred: np.ndarray,
     group_df: pl.DataFrame,
