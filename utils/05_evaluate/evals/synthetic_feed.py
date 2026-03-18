@@ -33,6 +33,9 @@ Outputs (under synthetic_feed/):
 - synthetic_feed_decomposition_abs.png:    headline bar chart (absolute)
 - <group>_synthetic_feed.png:              per-group bars (standardized)
 - <group>_synthetic_feed_abs.png:          per-group bars (absolute)
+- <group>_synthetic_feed_prevalence.png:   per-group vertical bars showing
+                                           pool / liked / feed prevalence
+                                           with 95% CIs and bias arrows
 """
 
 from __future__ import annotations
@@ -60,6 +63,11 @@ TOP_K = 100
 BATCH_SIZE = 2048
 MIN_USER_LIKES = 5
 
+_EXCLUDED_TRAITS: Dict[str, set] = {
+    "moderation": {"OK"},
+    "emotion_sentiment": {"neutral"},
+}
+
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -83,6 +91,7 @@ class TraitDecompResult(NamedTuple):
     p_pref: float
     p_amp: float
     p_excess: float
+    n_pool_finite: int
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +336,7 @@ def _compute_trait_decomposition(
         p_pref=p_pref,
         p_amp=p_amp,
         p_excess=p_excess,
+        n_pool_finite=len(finite_pool),
     )
 
 
@@ -497,6 +507,145 @@ def _plot_group_decomposition(
                  fontsize=9, fontweight="bold")
     ax.legend(fontsize=6, loc="lower right", framealpha=0.8)
     plt.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_group_prevalence(
+    group_name: str,
+    group_traits: Dict[str, TraitDecompResult],
+    out_dir: Path,
+) -> Path:
+    """Per-group vertical bar chart: pool / liked / feed prevalence with 95% CIs.
+
+    For each trait, three bars show the raw trait prevalence in the random pool,
+    in users' liked posts (averaged across users), and in the model's top-K
+    synthetic feed (averaged across users).  A directed arrow from the liked
+    estimate to the feed estimate visualises the model's bias.
+    """
+    z95 = 1.96
+    excluded = _EXCLUDED_TRAITS.get(group_name, set())
+
+    records: Dict[str, Dict[str, float]] = {}
+    for label, tr in group_traits.items():
+        if label in excluded:
+            continue
+        user_actual = tr.pool_mean + tr.user_pref_std * tr.pool_sd
+        user_feed = tr.pool_mean + tr.model_excess_std * tr.pool_sd
+
+        pool_prev = tr.pool_mean
+        pool_ci = z95 * tr.pool_sd / np.sqrt(tr.n_pool_finite)
+        liked_prev = float(np.mean(user_actual))
+        liked_ci = z95 * float(np.std(user_actual, ddof=1)) / np.sqrt(tr.n_users)
+        feed_prev = float(np.mean(user_feed))
+        feed_ci = z95 * float(np.std(user_feed, ddof=1)) / np.sqrt(tr.n_users)
+
+        raw_shift = float(np.mean(tr.model_amp_std)) * tr.pool_sd
+
+        records[label] = {
+            "pool": pool_prev, "pool_ci": pool_ci,
+            "liked": liked_prev, "liked_ci": liked_ci,
+            "feed": feed_prev, "feed_ci": feed_ci,
+            "raw_shift": raw_shift,
+            "cohen_d_amp": tr.cohen_d_amp,
+            "p_amp": tr.p_amp,
+        }
+
+    labels = sorted(
+        records,
+        key=lambda k: abs(records[k]["feed"] - records[k]["liked"]),
+        reverse=True,
+    )
+    n = len(labels)
+    path = out_dir / f"{group_name}_synthetic_feed_prevalence.png"
+    if n == 0:
+        return path
+
+    x = np.arange(n)
+    w = 0.25
+
+    pool_vals = [records[l]["pool"] for l in labels]
+    pool_cis = [records[l]["pool_ci"] for l in labels]
+    liked_vals = [records[l]["liked"] for l in labels]
+    liked_cis = [records[l]["liked_ci"] for l in labels]
+    feed_vals = [records[l]["feed"] for l in labels]
+    feed_cis = [records[l]["feed_ci"] for l in labels]
+
+    PLOT_H = 4.5
+    BOTTOM = 1.8
+    total_h = PLOT_H + BOTTOM
+    fig_w, fig_h = scaled_figsize(max(6, 0.7 * n), total_h)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # Four columns per trait: pool, liked, feed, arrow.  Centre the group on x.
+    offsets = np.array([-1.5, -0.5, 0.5, 1.5]) * w
+
+    ax.bar(
+        x + offsets[0], pool_vals, width=w, yerr=pool_cis,
+        color="#aaaaaa", alpha=0.85, capsize=3,
+        error_kw=dict(linewidth=0.8), label="Pool",
+    )
+    ax.bar(
+        x + offsets[1], liked_vals, width=w, yerr=liked_cis,
+        color="#4878CF", alpha=0.85, capsize=3,
+        error_kw=dict(linewidth=0.8), label="Liked (user avg)",
+    )
+    ax.bar(
+        x + offsets[2], feed_vals, width=w, yerr=feed_cis,
+        color="#D65F5F", alpha=0.85, capsize=3,
+        error_kw=dict(linewidth=0.8), label="Feed (user avg)",
+    )
+
+    arrow_x = offsets[3]
+    annotation_pad = w * 0.15
+    for i in range(n):
+        ax.annotate(
+            "",
+            xy=(x[i] + arrow_x, feed_vals[i]),
+            xytext=(x[i] + arrow_x, liked_vals[i]),
+            arrowprops=dict(
+                arrowstyle="->,head_width=0.25,head_length=0.15",
+                color="#D65F5F",
+                lw=1.5,
+                shrinkA=2,
+                shrinkB=2,
+            ),
+        )
+        r = records[labels[i]]
+        stars = _significance_stars(r["p_amp"])
+        mid_y = (liked_vals[i] + feed_vals[i]) / 2
+        ax.text(
+            x[i] + arrow_x + annotation_pad, mid_y,
+            f"{r['raw_shift']:+.4f}\nd={r['cohen_d_amp']:+.2f}{stars}",
+            fontsize=5, va="center", ha="left", color="#333333",
+        )
+
+    arrow_proxy = plt.Line2D(
+        [0, 0], [0, 1],
+        color="#D65F5F", lw=1.5,
+        marker="^", markersize=6, markevery=[1],
+    )
+
+    ax.axhline(0, color="black", linewidth=0.4)
+    ax.set_xlim(x[0] + offsets[0] - w, x[-1] + offsets[3] + 3 * w)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("Trait prevalence (raw units)", fontsize=8)
+
+    title = group_name.replace("_", " ").title()
+    ax.set_title(
+        f"{title}: pool / liked / feed prevalence",
+        fontsize=10, fontweight="bold",
+    )
+    ax.tick_params(axis="y", labelsize=7)
+    handles, leg_labels = ax.get_legend_handles_labels()
+    handles.append(arrow_proxy)
+    leg_labels.append("Model bias (F\u2212L)")
+    ax.legend(handles, leg_labels, fontsize=7, loc="best", framealpha=0.8)
+    fig.subplots_adjust(
+        bottom=BOTTOM / total_h, top=0.92, left=0.10, right=0.97,
+    )
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -910,6 +1059,9 @@ class SyntheticFeedModule(EvalModule):
                     str(_plot_group_decomposition(
                         gname, gt, out_dir, standardize=False,
                     ))
+                )
+                plot_paths.append(
+                    str(_plot_group_prevalence(gname, gt, out_dir))
                 )
 
         return {
