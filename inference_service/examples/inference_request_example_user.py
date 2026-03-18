@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -49,12 +48,12 @@ def main() -> None:
       - The inference service must be configured with `GE_INFERENCE_MODELS` including "user-tower".
       - Defaults assume MiniLM-style embeddings (D=384).
     """
-    inference_url = os.getenv("PREDICT_URL", "http://127.0.0.1:8000/models/user-tower/predict")
+    inference_url = "http://127.0.0.1:8000/models/user-tower/predict"
 
-    batch_size = int(os.getenv("BATCH_SIZE", "3"))
-    max_history_len = int(os.getenv("MAX_HISTORY_LEN", os.getenv("MAX_SEQ_LEN", "128")))
-    embed_dim = int(os.getenv("EMBED_DIM", "384"))
-    embedding_model = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    batch_size = 3
+    max_history_len = 128
+    embed_dim = 384
+    embedding_model = "all-MiniLM-L12-v2"
 
     rng = np.random.default_rng()
 

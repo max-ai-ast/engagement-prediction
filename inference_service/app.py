@@ -39,7 +39,7 @@ GE_INFERENCE_WARMUP = os.getenv("GE_INFERENCE_WARMUP", "1") == "1"
 
 # If you know these shapes, set them to validate and to create dummy warmup.
 GE_INFERENCE_EMBED_DIM = int(os.getenv("GE_INFERENCE_EMBED_DIM", "0")) # 0 means unknown/skip dim validation
-GE_INFERENCE_MAX_SEQ_LEN = int(os.getenv("GE_INFERENCE_MAX_SEQ_LEN", "0"))  # 0 means unknown/skip T validation
+GE_INFERENCE_MAX_HISTORY_LEN = int(os.getenv("GE_INFERENCE_MAX_HISTORY_LEN", "0"))  # 0 means unknown/skip T validation
 
 DTYPE = torch.float32
 
@@ -117,8 +117,8 @@ class UserTowerPredictRequest(BaseModel):
                     if not (isinstance(row, list) and len(row) == d0):
                         raise ValueError("history_embeddings must be rectangular with shape [B, T, D]")
 
-        if GE_INFERENCE_MAX_SEQ_LEN and seq_len != GE_INFERENCE_MAX_SEQ_LEN:
-            raise ValueError(f"expected T == {GE_INFERENCE_MAX_SEQ_LEN}, got T={seq_len}")
+        if GE_INFERENCE_MAX_HISTORY_LEN and seq_len != GE_INFERENCE_MAX_HISTORY_LEN:
+            raise ValueError(f"expected T == {GE_INFERENCE_MAX_HISTORY_LEN}, got T={seq_len}")
         if GE_INFERENCE_EMBED_DIM and d0 != GE_INFERENCE_EMBED_DIM:
             raise ValueError(f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d0}")
 
@@ -355,12 +355,12 @@ def _warmup_entry(entry: LoadedModel) -> None:
             return
 
         if entry.signature == "history":
-            if GE_INFERENCE_EMBED_DIM <= 0 or GE_INFERENCE_MAX_SEQ_LEN <= 0:
+            if GE_INFERENCE_EMBED_DIM <= 0 or GE_INFERENCE_MAX_HISTORY_LEN <= 0:
                 return
             history_embeddings = torch.zeros(
-                (1, GE_INFERENCE_MAX_SEQ_LEN, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device
+                (1, GE_INFERENCE_MAX_HISTORY_LEN, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device
             )
-            history_mask = torch.ones((1, GE_INFERENCE_MAX_SEQ_LEN), dtype=torch.bool, device=device)
+            history_mask = torch.ones((1, GE_INFERENCE_MAX_HISTORY_LEN), dtype=torch.bool, device=device)
             _ = model(history_embeddings, history_mask)
             return
 
@@ -595,7 +595,7 @@ def ready():
         "ready": all_ready,
         "registry_error": _models_init_error,
         "embed_dim": GE_INFERENCE_EMBED_DIM if GE_INFERENCE_EMBED_DIM > 0 else None,
-        "max_seq_len": GE_INFERENCE_MAX_SEQ_LEN if GE_INFERENCE_MAX_SEQ_LEN > 0 else None,
+        "max_seq_len": GE_INFERENCE_MAX_HISTORY_LEN if GE_INFERENCE_MAX_HISTORY_LEN > 0 else None,
         "models": models_payload,
     }
 

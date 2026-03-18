@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import requests
 
 
 def main() -> None:
-    url = os.getenv("PREDICT_URL", "http://127.0.0.1:8000/models/post-tower/predict")
+    url = "http://127.0.0.1:8000/models/post-tower/predict"
 
     # input dimensions
     batch_size = 3
