@@ -1,0 +1,15 @@
+us-central1-a
+us-central1-b
+us-central1-c
+us-central1-f
+us-east1-c
+us-east4-a
+us-east4-b
+us-east4-c
+us-west1-a
+us-west1-b
+us-west2-b
+us-west2-c
+us-west3-b
+us-west4-a
+us-west4-b
