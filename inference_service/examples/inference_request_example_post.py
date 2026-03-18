@@ -7,7 +7,7 @@ import requests
 
 
 def main() -> None:
-    url = os.getenv("PREDICT_URL", "http://localhost:8080/predict")
+    url = os.getenv("PREDICT_URL", "http://127.0.0.1:8000/models/post-tower/predict")
 
     # input dimensions
     batch_size = 3
@@ -16,8 +16,8 @@ def main() -> None:
     # generate inputs
     post_embedding = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
 
-    # Preferred field name for post tower is "post_embedding" (also accepts legacy "inputs").
-    payload = {"post_embedding": post_embedding}
+    # Field name for post tower is "post_embedding".
+    payload = {"post_embeddings": post_embedding}
 
     # hit api
     resp = requests.post(url, json=payload, timeout=30)
