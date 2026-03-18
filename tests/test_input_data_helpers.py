@@ -15,7 +15,7 @@ from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
     get_user_tower_input_from_single_raw_history_embeddings,
     query_user_tower_with_processed_history_embeddings,
-    query_user_tower_with_raw_history_embeddings,
+    get_user_tower_input_from_raw_history_embeddings,
 )
 
 
@@ -309,60 +309,46 @@ def test_query_user_tower_with_processed_history_embeddings_invalid_json(monkeyp
         query_user_tower_with_processed_history_embeddings([[[0.0]]], [[True]], inference_url)
 
 
-def test_query_user_tower_with_raw_history_embeddings_single_and_batched(monkeypatch):
-    import shared.input_data_helpers as helpers
-
+def test_get_user_tower_input_from_raw_history_embeddings_single_and_batched():
     embedding_model = "model_b"
     max_history_len = 3
     embed_dim = 3
-    inference_url = "http://example.test/predict"
 
     raw_single = [
         [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}],
         [{"key": embedding_model, "value": _encode_embedding([0.4, 0.5, 0.6])}],
     ]
 
-    captured = {}
-
-    def _stub_processed(padded_history_embeddings, history_mask, inference_url):
-        captured["padded"] = padded_history_embeddings
-        captured["mask"] = history_mask
-        captured["url"] = inference_url
-        # return [B, output_dim]
-        return [[1.0, 2.0] for _ in padded_history_embeddings]
-
-    monkeypatch.setattr(helpers, "query_user_tower_with_processed_history_embeddings", _stub_processed)
-
-    out_single = query_user_tower_with_raw_history_embeddings(
-        raw_single, embedding_model, max_history_len, embed_dim, inference_url
+    padded_single, mask_single = get_user_tower_input_from_raw_history_embeddings(
+        raw_single, embedding_model, max_history_len, embed_dim
     )
-    assert out_single == [[1.0, 2.0]]
-    assert captured["url"] == inference_url
-    assert captured["mask"] == [[True, True, False]]
-    assert captured["padded"][0][0] == pytest.approx([0.1, 0.2, 0.3], rel=1e-6, abs=1e-6)
-    assert captured["padded"][0][1] == pytest.approx([0.4, 0.5, 0.6], rel=1e-6, abs=1e-6)
+    assert mask_single == [[True, True, False]]
+    assert padded_single[0][0] == pytest.approx([0.1, 0.2, 0.3], rel=1e-6, abs=1e-6)
+    assert padded_single[0][1] == pytest.approx([0.4, 0.5, 0.6], rel=1e-6, abs=1e-6)
+    assert padded_single[0][2] == pytest.approx([0.0, 0.0, 0.0], rel=0, abs=0)
 
     raw_batched = [
         raw_single,
         None,  # should turn into all-zero padded history and all-false mask
     ]
-    out_batched = query_user_tower_with_raw_history_embeddings(
-        raw_batched, embedding_model, max_history_len, embed_dim, inference_url
+    padded_batched, mask_batched = get_user_tower_input_from_raw_history_embeddings(
+        raw_batched, embedding_model, max_history_len, embed_dim
     )
-    assert out_batched == [[1.0, 2.0], [1.0, 2.0]]
-    assert captured["mask"][1] == [False, False, False]
-    assert captured["padded"][1] == [[0.0, 0.0, 0.0]] * max_history_len
+    assert len(padded_batched) == 2
+    assert mask_batched[0] == [True, True, False]
+    assert mask_batched[1] == [False, False, False]
+    assert padded_batched[1] == [[0.0, 0.0, 0.0]] * max_history_len
 
 
-def test_query_user_tower_with_raw_history_embeddings_rejects_invalid_batched_shape():
+def test_get_user_tower_input_from_raw_history_embeddings_rejects_invalid_batched_shape():
     with pytest.raises(ValueError, match="Invalid batched input"):
-        query_user_tower_with_raw_history_embeddings(
-            [[123]], embedding_model="model_b", max_history_len=3, embed_dim=3, inference_url="http://x"
+        get_user_tower_input_from_raw_history_embeddings(
+            [[123]], embedding_model="model_b", max_history_len=3, embed_dim=3
         )
 
 
-def test_query_user_tower_with_raw_history_embeddings_rejects_empty():
+def test_get_user_tower_input_from_raw_history_embeddings_rejects_empty():
     with pytest.raises(ValueError, match="non-empty list"):
-        query_user_tower_with_raw_history_embeddings(
-            [], embedding_model="model_b", max_history_len=3, embed_dim=3, inference_url="http://x"
+        get_user_tower_input_from_raw_history_embeddings(
+            [], embedding_model="model_b", max_history_len=3, embed_dim=3
         )

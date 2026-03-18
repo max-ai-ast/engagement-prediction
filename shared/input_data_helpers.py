@@ -289,15 +289,14 @@ def query_user_tower_with_processed_history_embeddings(
     return data["outputs"]
 
 
-def query_user_tower_with_raw_history_embeddings(
+def get_user_tower_input_from_raw_history_embeddings(
     # Single: list of embeddings-structs (one per history item).
     # Batched: list of single-history lists.
     raw_history_embeddings: Union[List[Any], List[List[Any]]],
     embedding_model: str,
     max_history_len: int,
     embed_dim: int,
-    inference_url: str,
-) -> List[List[float]]:
+) -> Tuple[List[List[List[float]]], List[List[float]]]:
     """
     Convert raw history embeddings into user-tower inputs and query the inference endpoint.
 
@@ -370,8 +369,4 @@ def query_user_tower_with_raw_history_embeddings(
             batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
             batch_history_mask.append(history_mask.tolist())
     
-    return query_user_tower_with_processed_history_embeddings(
-        padded_history_embeddings=batch_padded_history_embeddings,
-        history_mask=batch_history_mask,
-        inference_url=inference_url,
-    )
+    return batch_padded_history_embeddings, batch_history_mask

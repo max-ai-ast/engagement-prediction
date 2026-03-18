@@ -11,7 +11,7 @@ from .input_data_helpers import (
     get_embedding_dim_for_known_model,
     get_user_tower_input_from_single_raw_history_embeddings,
     query_user_tower_with_processed_history_embeddings,
-    query_user_tower_with_raw_history_embeddings
+    get_user_tower_input_from_raw_history_embeddings
 )
 
 __all__ = [
@@ -20,6 +20,6 @@ __all__ = [
     "get_embedding_dim_for_known_model",
     "get_user_tower_input_from_single_raw_history_embeddings",
     "query_user_tower_with_processed_history_embeddings",
-    "query_user_tower_with_raw_history_embeddings",
+    "get_user_tower_input_from_raw_history_embeddings",
 ]
 
