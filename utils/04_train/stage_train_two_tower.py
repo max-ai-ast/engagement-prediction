@@ -827,12 +827,14 @@ def run(context: Context, args) -> Dict[str, Any]:
         torchscript_user_name = "engagement_user_tower"
         torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
         torch.jit.script(trained_model.user_tower.cpu()).save(torchscript_user_path)
-        context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        user_model_id = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        logger.info(f"User tower model id: {user_model_id}")
 
         torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
         torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
-        context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        logger.info(f"Post tower model id: {post_model_id}")
 
     # --- save predictions ---
     predictions_dir = out_dir / "predictions"

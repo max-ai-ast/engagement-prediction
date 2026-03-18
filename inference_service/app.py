@@ -307,7 +307,7 @@ def _load_model_inner() -> None:
     else:
         model_id = os.getenv("GE_INFERENCE_CLEARML_MODEL_ID")
         if not model_id:
-            raise RuntimeError("Either MODEL_PATH, MODEL_URI, or CLEARML_MODEL_ID env var is required")
+            raise RuntimeError("Either GE_INFERENCE_MODEL_PATH, GE_INFERENCE_MODEL_URI, or GE_INFERENCE_CLEARML_MODEL_ID env var is required")
 
         cm = Model(model_id=model_id)
         local_copy = cm.get_local_copy()

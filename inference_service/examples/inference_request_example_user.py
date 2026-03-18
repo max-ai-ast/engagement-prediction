@@ -10,7 +10,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from shared.input_data_helpers import query_user_tower_with_raw_history_embeddings  # noqa: E402
+from shared.input_data_helpers import (
+    get_user_tower_input_from_raw_history_embeddings,
+    query_user_tower_with_processed_history_embeddings,
+)
 
 
 def _encode_embedding(vec: list[float]) -> str:
@@ -36,7 +39,7 @@ def main() -> None:
 
     This generates batched raw histories where each history item contains a list of
     {"key": <embedding_model>, "value": <compressed_embedding>} dicts, then calls
-    `query_user_tower_with_raw_history_embeddings(...)` which:
+    `get_user_tower_input_from_raw_history_embeddings(...)` which:
       - extracts the requested embedding model
       - pads/truncates to `MAX_HISTORY_LEN`
       - builds the boolean mask
@@ -46,7 +49,7 @@ def main() -> None:
       - The inference service must be running with `MODEL_TYPE=user_tower`.
       - Defaults assume MiniLM-style embeddings (D=384).
     """
-    inference_url = os.getenv("PREDICT_URL", "http://localhost:8080/predict")
+    inference_url = os.getenv("PREDICT_URL", "http://127.0.0.1:8000/predict")
 
     batch_size = int(os.getenv("BATCH_SIZE", "3"))
     max_history_len = int(os.getenv("MAX_HISTORY_LEN", os.getenv("MAX_SEQ_LEN", "20")))
@@ -74,12 +77,16 @@ def main() -> None:
     print(f"History dimension: {len(batch_raw_history_embeddings[0])}")
     print(f"Input example: {batch_raw_history_embeddings[0][0]}")
 
-    outputs = query_user_tower_with_raw_history_embeddings(
+    batch_padded_history_embeddings, batch_history_mask = get_user_tower_input_from_raw_history_embeddings(
         raw_history_embeddings=batch_raw_history_embeddings,
         embedding_model=embedding_model,
         max_history_len=max_history_len,
         embed_dim=embed_dim,
-        inference_url=inference_url,
+    )
+    outputs = query_user_tower_with_processed_history_embeddings(
+        batch_padded_history_embeddings,
+        batch_history_mask,
+        inference_url
     )
     print(f"Batch size: {len(outputs)}")
     print(f"Output dim: {len(outputs[0])}")
