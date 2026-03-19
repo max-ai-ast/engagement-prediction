@@ -28,7 +28,7 @@ Outputs under <run_dir>/target_posts/<timestamp>/:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional
 import argparse
 import hashlib
 import polars as pl
@@ -48,6 +48,28 @@ from utils.helpers import (
 
 STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
 RAW_TS_COL_NAME = 'record_created_at'
+
+
+def _resolve_negative_bucket_index(row: Dict[str, Any]) -> Optional[int]:
+    """
+    Convert an unliked rank within a bucket into the actual post index while only
+    storing the sorted liked indices for that (user, bucket) pair.
+    """
+    neg_rank = row.get('neg_rank')
+    bucket_size = row.get('bucket_size')
+    liked_idx_list = row.get('liked_idx_list') or []
+
+    if neg_rank is None or bucket_size is None:
+        return None
+
+    actual_idx = int(neg_rank)
+    for liked_idx in liked_idx_list:
+        liked_idx = int(liked_idx)
+        if liked_idx > actual_idx:
+            break
+        actual_idx += 1
+
+    return actual_idx if actual_idx < int(bucket_size) else None
 
 
 def _get_liked_target_posts(
@@ -159,49 +181,37 @@ def _get_negative_target_posts(
         .with_columns(
             pl.col('liked_idx_list')
             .fill_null(pl.lit([], dtype=pl.List(pl.Int64)))
-            .alias('liked_idx_list')
+            .alias('liked_idx_list'),
+            pl.col('liked_count')
+            .fill_null(0)
+            .cast(pl.Int64)
+            .alias('liked_count'),
+            (pl.col('bucket_size') - pl.col('liked_count').fill_null(0).cast(pl.Int64)).alias('unliked_count'),
         )
-        .with_columns(
-            pl.int_ranges(0, pl.col('bucket_size')).alias('all_idx'),
-        )
-        .with_columns(
-            pl.col('all_idx')
-            .list
-            .set_difference(pl.col('liked_idx_list'))
-            .list
-            .sort()
-            .alias('unliked_idx_list')
-        )
-        .with_columns(
-            pl.col('unliked_idx_list').list.len().alias('unliked_count')
-        )
-        .select(['target_did', 'bucket', 'unliked_idx_list', 'unliked_count'])
+        .select(['target_did', 'bucket', 'bucket_size', 'liked_idx_list', 'unliked_count'])
     )
 
     likes_lf = (
         likes_with_bucket_lf
-        # join to get bucket_size for the like's bucket
-        .join(bucket_sizes_lf, on="bucket", how="inner")
+        .join(user_bucket_candidates_lf, on=['target_did', 'bucket'], how='left')
         .with_columns(
             # deterministic "random" seed per (user, liked_post)
             pl.struct(
                 [pl.col('target_did'), pl.col('like_uri')]
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
-        )
-        .join(user_bucket_candidates_lf, on=['target_did', 'bucket'], how='left')
-        .with_columns(
             # seed and neg_rank together assign a random *unliked* post in the bucket to each like
             # (multiple likes can be assigned to the same negative post, which is what we want)
+        )
+        .with_columns(
             pl.when(pl.col('unliked_count') > 0)
             .then((pl.col('seed') % pl.col('unliked_count').cast(pl.UInt64)).cast(pl.Int64))
             .otherwise(None)
             .alias('neg_rank'),
         )
         .with_columns(
-            pl.when(pl.col('neg_rank').is_not_null())
-            .then(pl.col('unliked_idx_list').list.get(pl.col('neg_rank')))
-            .otherwise(None)
-            .alias('neg_idx'),
+            pl.struct(['liked_idx_list', 'neg_rank', 'bucket_size'])
+            .map_elements(_resolve_negative_bucket_index, return_dtype=pl.Int64)
+            .alias('neg_idx')
         )
     ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did' 'bucket', 'bucket_size', 'seed', 'neg_idx'
 
@@ -225,14 +235,14 @@ def _get_negative_target_posts(
         context.tracker.log_single_value('Target Posts - Dropped Likes with No Unliked Negatives', n_likes_without_neg)
         likes_lf = likes_lf.filter(pl.col('neg_idx').is_not_null())
 
-    posts_keyed_lf = posts_lf.with_columns(
-        pl.concat_str(['bucket', 'idx_in_bucket']).alias('key')
-    ).select(['key', 'neg_uri', 'neg_posted_at', 'neg_emb_idx', 'neg_author_did'])
-
     final_lf = (
         likes_lf
-        .with_columns(pl.concat_str([pl.col('bucket'), pl.col(f"neg_idx")]).alias('key'))
-        .join(posts_keyed_lf, on='key', how='left')
+        .join(
+            posts_lf.select(['bucket', 'idx_in_bucket', 'neg_uri', 'neg_emb_idx', 'neg_author_did']),
+            left_on=['bucket', 'neg_idx'],
+            right_on=['bucket', 'idx_in_bucket'],
+            how='left'
+        )
         .select([
             'target_did',
             'seen_at',
@@ -326,15 +336,6 @@ def _user_is_holdout(did: str, seed: int, fraction: float) -> bool:
     return (int(digest, 16) % 10_000) / 10_000 < fraction
 
 
-def _select_holdout_users(
-    all_dids: list[str],
-    seed: int,
-    fraction: float,
-) -> Set[str]:
-    """Return the set of user IDs assigned to holdout."""
-    return {did for did in all_dids if _user_is_holdout(did, seed, fraction)}
-
-
 def _apply_splits(
     args: argparse.Namespace,
     lf: pl.LazyFrame,
@@ -355,9 +356,9 @@ def _apply_splits(
     (``val_start <= seen_at < holdout_start``, or unbounded when
     ``holdout_start`` is ``None``).
 
-    Only the unique ``target_did`` values are collected to determine the
-    holdout set; the full dataset remains lazy so it can be streamed to
-    disk via ``sink_parquet`` without materializing all rows in memory.
+    Holdout assignment is computed from the unique ``target_did`` values in a
+    lazy side table, then joined back so the full dataset can still be streamed
+    to disk via ``sink_parquet`` without materializing all rows in memory.
     """
     ts_col = "seen_at"
 
@@ -385,18 +386,40 @@ def _apply_splits(
             f"holdout_user_fraction must be in (0, 1), got {holdout_fraction}"
         )
 
-    all_dids = lf.select("target_did").unique().collect()["target_did"].to_list()
-    holdout_dids = _select_holdout_users(all_dids, holdout_seed, holdout_fraction)
+    holdout_users_lf = (
+        lf
+        .select("target_did")
+        .unique()
+        .with_columns(
+            pl.col("target_did")
+            .map_elements(
+                lambda did: _user_is_holdout(did, holdout_seed, holdout_fraction),
+                return_dtype=pl.Boolean,
+            )
+            .alias("is_holdout_user")
+        )
+    )
 
-    n_holdout = len(holdout_dids)
-    n_trainval = len(all_dids) - n_holdout
+    user_split_counts = (
+        holdout_users_lf
+        .group_by("is_holdout_user")
+        .len()
+        .collect(engine="streaming")
+    )
+    counts_by_holdout = {
+        row["is_holdout_user"]: row["len"]
+        for row in user_split_counts.iter_rows(named=True)
+    }
+    n_holdout = int(counts_by_holdout.get(True, 0))
+    n_trainval = int(counts_by_holdout.get(False, 0))
     logger.info(
         f"User split: {n_holdout} holdout (unseen) users, "
         f"{n_trainval} train/val users "
         f"(fraction={holdout_fraction}, seed={holdout_seed})"
     )
 
-    is_holdout_user = pl.col("target_did").is_in(holdout_dids)
+    lf = lf.join(holdout_users_lf, on="target_did", how="left")
+    is_holdout_user = pl.col("is_holdout_user").fill_null(False)
     before_end = (pl.col(ts_col) < pl.lit(holdout_end)) if holdout_end is not None else pl.lit(True)
 
     # --- unseen-users holdout ---
@@ -437,7 +460,7 @@ def _apply_splits(
         .alias("split")
     )
 
-    return lf.with_columns(split_expr)
+    return lf.with_columns(split_expr).drop("is_holdout_user")
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:

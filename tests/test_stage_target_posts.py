@@ -207,6 +207,21 @@ def test_negative_target_posts_requires_bucket(
         ).collect()
 
 
+def test_resolve_negative_bucket_index_skips_liked_positions(stage_target_posts_module):
+    assert stage_target_posts_module._resolve_negative_bucket_index(
+        {"liked_idx_list": [1, 4], "neg_rank": 0, "bucket_size": 6}
+    ) == 0
+    assert stage_target_posts_module._resolve_negative_bucket_index(
+        {"liked_idx_list": [1, 4], "neg_rank": 1, "bucket_size": 6}
+    ) == 2
+    assert stage_target_posts_module._resolve_negative_bucket_index(
+        {"liked_idx_list": [1, 4], "neg_rank": 2, "bucket_size": 6}
+    ) == 3
+    assert stage_target_posts_module._resolve_negative_bucket_index(
+        {"liked_idx_list": [1, 4], "neg_rank": 3, "bucket_size": 6}
+    ) == 5
+
+
 def test_get_target_posts_emits_negative_pairs(
     stage_target_posts_module, dummy_logger, dummy_context
 ):
