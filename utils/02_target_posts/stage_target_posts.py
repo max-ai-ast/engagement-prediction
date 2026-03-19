@@ -201,6 +201,8 @@ def _get_negative_target_posts(
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
             # seed and neg_rank together assign a random *unliked* post in the bucket to each like
             # (multiple likes can be assigned to the same negative post, which is what we want)
+        )
+        .with_columns(
             pl.when(pl.col('unliked_count') > 0)
             .then((pl.col('seed') % pl.col('unliked_count').cast(pl.UInt64)).cast(pl.Int64))
             .otherwise(None)
