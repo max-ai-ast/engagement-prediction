@@ -525,3 +525,261 @@ def test_apply_splits_no_seen_holdout_without_holdout_start(stage_target_posts_m
 
     seen_holdout = out.filter(pl.col("split") == "holdout_seen_users")
     assert seen_holdout.height == 0, "No holdout_seen_users expected when holdout_start is None"
+
+
+def _reference_negative_target_posts_old_impl(
+    *,
+    args: argparse.Namespace,
+    posts_df: pl.DataFrame,
+    liked_target_posts_df: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Reference implementation that mirrors the pre-mem-reduction approach:
+    construct `unliked_idx_list` via set-difference, then index into it by `neg_rank`.
+    """
+    bucket = args.neg_sample_bucket
+    if bucket is None:
+        raise ValueError("No bucket size specified for negative samples!")
+
+    posts_lf = (
+        posts_df.lazy()
+        .select(
+            [
+                pl.col("at_uri").alias("neg_uri"),
+                pl.col("record_created_at").alias("neg_posted_at"),
+                pl.col("emb_idx").alias("neg_emb_idx"),
+                pl.col("did").alias("neg_author_did"),
+            ]
+        )
+        .with_columns(pl.col("neg_posted_at").dt.truncate(bucket).alias("bucket"))
+        .sort(["bucket", "neg_posted_at", "neg_uri"])
+        .with_columns(
+            (pl.col("neg_uri").cum_count().over("bucket") - 1)
+            .cast(pl.Int64)
+            .alias("idx_in_bucket")
+        )
+    )
+
+    bucket_sizes_lf = posts_lf.group_by("bucket").len().rename({"len": "bucket_size"})
+
+    likes_with_bucket_lf = (
+        liked_target_posts_df.lazy()
+        .with_columns(pl.col("like_posted_at").dt.truncate(bucket).alias("bucket"))
+    )
+
+    liked_idx_by_user_bucket_lf = (
+        liked_target_posts_df.lazy()
+        .join(
+            posts_lf.select(["neg_uri", "bucket", "idx_in_bucket"]),
+            left_on="like_uri",
+            right_on="neg_uri",
+            how="inner",
+        )
+        .group_by(["target_did", "bucket"])
+        .agg(pl.col("idx_in_bucket").unique().sort().alias("liked_idx_list"))
+        .with_columns(pl.col("liked_idx_list").list.len().alias("liked_count"))
+    )
+
+    user_bucket_candidates_lf = (
+        likes_with_bucket_lf.join(bucket_sizes_lf, on="bucket", how="inner")
+        .select(["target_did", "bucket", "bucket_size"])
+        .unique()
+        .join(liked_idx_by_user_bucket_lf, on=["target_did", "bucket"], how="left")
+        .with_columns(
+            pl.col("liked_idx_list")
+            .fill_null(pl.lit([], dtype=pl.List(pl.Int64)))
+            .alias("liked_idx_list")
+        )
+        .with_columns(pl.int_ranges(0, pl.col("bucket_size")).alias("all_idx"))
+        .with_columns(
+            pl.col("all_idx")
+            .list.set_difference(pl.col("liked_idx_list"))
+            .list.sort()
+            .alias("unliked_idx_list")
+        )
+        .with_columns(pl.col("unliked_idx_list").list.len().alias("unliked_count"))
+        .select(["target_did", "bucket", "unliked_idx_list", "unliked_count"])
+    )
+
+    likes_lf = (
+        likes_with_bucket_lf.join(bucket_sizes_lf, on="bucket", how="inner")
+        .with_columns(
+            pl.struct([pl.col("target_did"), pl.col("like_uri")])
+            .hash(seed=args.random_seed)
+            .cast(pl.UInt64)
+            .alias("seed")
+        )
+        .join(user_bucket_candidates_lf, on=["target_did", "bucket"], how="left")
+        .with_columns(
+            pl.when(pl.col("unliked_count") > 0)
+            .then((pl.col("seed") % pl.col("unliked_count").cast(pl.UInt64)).cast(pl.Int64))
+            .otherwise(None)
+            .alias("neg_rank")
+        )
+        .with_columns(
+            pl.when(pl.col("neg_rank").is_not_null())
+            .then(pl.col("unliked_idx_list").list.get(pl.col("neg_rank")))
+            .otherwise(None)
+            .alias("neg_idx")
+        )
+    )
+
+    likes_lf = likes_lf.filter(pl.col("neg_idx").is_not_null())
+
+    return (
+        likes_lf.join(
+            posts_lf.select(
+                ["bucket", "idx_in_bucket", "neg_uri", "neg_emb_idx", "neg_author_did"]
+            ),
+            left_on=["bucket", "neg_idx"],
+            right_on=["bucket", "idx_in_bucket"],
+            how="left",
+        )
+        .select(
+            [
+                "target_did",
+                "seen_at",
+                "like_uri",
+                "like_emb_idx",
+                "like_author_did",
+                "neg_uri",
+                "neg_emb_idx",
+                "neg_author_did",
+            ]
+        )
+        .collect()
+    )
+
+
+def test_negative_sampling_matches_pre_mem_reduction_reference(
+    stage_target_posts_module, dummy_logger, dummy_context
+):
+    args = argparse.Namespace(random_seed=123, neg_sample_bucket="1d")
+
+    posts_df = pl.DataFrame(
+        [
+            # Jan 1 bucket (5 posts)
+            {"at_uri": "p:a", "record_created_at": _dt(2024, 1, 1, 1), "emb_idx": 1, "did": "auth_1"},
+            {"at_uri": "p:b", "record_created_at": _dt(2024, 1, 1, 2), "emb_idx": 2, "did": "auth_2"},
+            {"at_uri": "p:c", "record_created_at": _dt(2024, 1, 1, 3), "emb_idx": 3, "did": "auth_3"},
+            {"at_uri": "p:d", "record_created_at": _dt(2024, 1, 1, 4), "emb_idx": 4, "did": "auth_4"},
+            {"at_uri": "p:e", "record_created_at": _dt(2024, 1, 1, 5), "emb_idx": 5, "did": "auth_5"},
+            # Jan 2 bucket (3 posts)
+            {"at_uri": "p:f", "record_created_at": _dt(2024, 1, 2, 1), "emb_idx": 6, "did": "auth_6"},
+            {"at_uri": "p:g", "record_created_at": _dt(2024, 1, 2, 2), "emb_idx": 7, "did": "auth_7"},
+            {"at_uri": "p:h", "record_created_at": _dt(2024, 1, 2, 3), "emb_idx": 8, "did": "auth_8"},
+        ]
+    )
+
+    likes_df = pl.DataFrame(
+        [
+            # user_1 likes 2/5 in Jan 1 bucket
+            {"did": "user_1", "subject_uri": "p:b", "record_created_at": _dt(2024, 1, 1, 12), "emb_idx": 10},
+            {"did": "user_1", "subject_uri": "p:d", "record_created_at": _dt(2024, 1, 1, 13), "emb_idx": 11},
+            # user_2 likes 3/5 in Jan 1 bucket
+            {"did": "user_2", "subject_uri": "p:a", "record_created_at": _dt(2024, 1, 1, 14), "emb_idx": 12},
+            {"did": "user_2", "subject_uri": "p:c", "record_created_at": _dt(2024, 1, 1, 15), "emb_idx": 13},
+            {"did": "user_2", "subject_uri": "p:e", "record_created_at": _dt(2024, 1, 1, 16), "emb_idx": 14},
+            # user_2 likes ALL posts in Jan 2 bucket -> these should be dropped (no valid negatives)
+            {"did": "user_2", "subject_uri": "p:f", "record_created_at": _dt(2024, 1, 2, 12), "emb_idx": 20},
+            {"did": "user_2", "subject_uri": "p:g", "record_created_at": _dt(2024, 1, 2, 13), "emb_idx": 21},
+            {"did": "user_2", "subject_uri": "p:h", "record_created_at": _dt(2024, 1, 2, 14), "emb_idx": 22},
+        ]
+    )
+
+    liked_df = stage_target_posts_module._get_liked_target_posts(
+        likes_df.lazy(), posts_df.lazy()
+    ).collect()
+
+    stage_out = stage_target_posts_module._get_negative_target_posts(
+        args, posts_df.lazy(), liked_df.lazy(), dummy_logger, dummy_context
+    ).collect()
+
+    ref_out = _reference_negative_target_posts_old_impl(
+        args=args, posts_df=posts_df, liked_target_posts_df=liked_df
+    )
+
+    stage_out = stage_out.sort(["target_did", "like_uri"])
+    ref_out = ref_out.sort(["target_did", "like_uri"])
+
+    assert stage_out.columns == ref_out.columns
+    assert stage_out.height == ref_out.height
+    assert stage_out.to_dicts() == ref_out.to_dicts()
+
+    # Confirm the "all posts liked in bucket" case still drops those likes.
+    assert "p:f" not in stage_out["like_uri"].to_list()
+    assert "p:g" not in stage_out["like_uri"].to_list()
+    assert "p:h" not in stage_out["like_uri"].to_list()
+
+
+def test_apply_splits_matches_reference_holdout_assignment(
+    stage_target_posts_module, dummy_logger
+):
+    df = pl.DataFrame(
+        [
+            # before train_start (potentially None for non-holdout users)
+            {"seen_at": _dt(2023, 12, 31, 23), "target_did": "u1", "like_uri": "u1_p0", "like_emb_idx": 0, "like_author_did": "a1", "neg_uri": "u1_n0", "neg_emb_idx": 10, "neg_author_did": "a2"},
+            # train / val / holdout_seen_users windows
+            {"seen_at": _dt(2024, 1, 2, 0), "target_did": "u1", "like_uri": "u1_p1", "like_emb_idx": 1, "like_author_did": "a1", "neg_uri": "u1_n1", "neg_emb_idx": 11, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 16, 0), "target_did": "u1", "like_uri": "u1_p2", "like_emb_idx": 2, "like_author_did": "a1", "neg_uri": "u1_n2", "neg_emb_idx": 12, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 20, 0), "target_did": "u1", "like_uri": "u1_p3", "like_emb_idx": 3, "like_author_did": "a1", "neg_uri": "u1_n3", "neg_emb_idx": 13, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 2, 0), "target_did": "u2", "like_uri": "u2_p1", "like_emb_idx": 1, "like_author_did": "a1", "neg_uri": "u2_n1", "neg_emb_idx": 11, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 16, 0), "target_did": "u2", "like_uri": "u2_p2", "like_emb_idx": 2, "like_author_did": "a1", "neg_uri": "u2_n2", "neg_emb_idx": 12, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 20, 0), "target_did": "u2", "like_uri": "u2_p3", "like_emb_idx": 3, "like_author_did": "a1", "neg_uri": "u2_n3", "neg_emb_idx": 13, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 2, 0), "target_did": "u3", "like_uri": "u3_p1", "like_emb_idx": 1, "like_author_did": "a1", "neg_uri": "u3_n1", "neg_emb_idx": 11, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 16, 0), "target_did": "u3", "like_uri": "u3_p2", "like_emb_idx": 2, "like_author_did": "a1", "neg_uri": "u3_n2", "neg_emb_idx": 12, "neg_author_did": "a2"},
+            {"seen_at": _dt(2024, 1, 20, 0), "target_did": "u3", "like_uri": "u3_p3", "like_emb_idx": 3, "like_author_did": "a1", "neg_uri": "u3_n3", "neg_emb_idx": 13, "neg_author_did": "a2"},
+            # beyond holdout_end -> should be None for everyone
+            {"seen_at": _dt(2024, 1, 25, 0), "target_did": "u3", "like_uri": "u3_p4", "like_emb_idx": 4, "like_author_did": "a1", "neg_uri": "u3_n4", "neg_emb_idx": 14, "neg_author_did": "a2"},
+        ]
+    )
+
+    args = _make_split_args(
+        train_start="2024-01-01T00:00:00",
+        val_start="2024-01-15T00:00:00",
+        holdout_start="2024-01-18T00:00:00",
+        holdout_end="2024-01-22T00:00:00",
+        holdout_user_fraction=0.5,
+        holdout_user_seed=42,
+    )
+
+    out = stage_target_posts_module._apply_splits(args, df.lazy(), dummy_logger).collect()
+
+    holdout_dids = {
+        did
+        for did in df["target_did"].unique().to_list()
+        if stage_target_posts_module._user_is_holdout(
+            did, args.holdout_user_seed, args.holdout_user_fraction
+        )
+    }
+
+    train_start = stage_target_posts_module.parse_one_ts_strict(args.train_start)
+    val_start = stage_target_posts_module.parse_one_ts_strict(args.val_start)
+    holdout_start = stage_target_posts_module.parse_one_ts(args.holdout_start)
+    holdout_end = stage_target_posts_module.parse_one_ts(args.holdout_end)
+
+    df_sorted = df.sort(["target_did", "seen_at", "like_uri"])
+    expected = []
+    for row in df_sorted.iter_rows(named=True):
+        seen_at = row["seen_at"]
+        did = row["target_did"]
+        if holdout_end is not None and seen_at >= holdout_end:
+            split = None
+        elif did in holdout_dids:
+            split = "holdout_unseen_users"
+        elif holdout_start is not None and seen_at >= holdout_start:
+            split = "holdout_seen_users"
+        elif seen_at >= train_start and seen_at < val_start:
+            split = "train"
+        elif seen_at >= val_start and (holdout_start is None or seen_at < holdout_start):
+            split = "val"
+        else:
+            split = None
+        expected.append(split)
+
+    out = out.sort(["target_did", "seen_at", "like_uri"])
+
+    assert out["target_did"].to_list() == df_sorted["target_did"].to_list()
+    assert out["seen_at"].to_list() == df_sorted["seen_at"].to_list()
+    assert out["like_uri"].to_list() == df_sorted["like_uri"].to_list()
+    assert out["split"].to_list() == expected
