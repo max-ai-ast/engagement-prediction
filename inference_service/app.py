@@ -1,10 +1,11 @@
 import os
 import threading
 import time
+from dataclasses import dataclass
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union, Annotated, get_args
 from urllib.parse import urlparse
 import logging
 
@@ -12,12 +13,12 @@ import torch
 from clearml import Model
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Discriminator, Tag, model_validator
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    ensure_model_loaded()
+    ensure_models_loaded()
     yield
 
 
@@ -35,46 +36,164 @@ logger = logging.getLogger(__name__)
 GE_INFERENCE_MAX_BATCH = int(os.getenv("GE_INFERENCE_MAX_BATCH", "1024"))
 GE_INFERENCE_PREFER_CUDA = os.getenv("GE_INFERENCE_PREFER_CUDA", "1") == "1"
 GE_INFERENCE_WARMUP = os.getenv("GE_INFERENCE_WARMUP", "1") == "1"
-GE_INFERENCE_WARMUP_SECONDS_BUDGET = float(os.getenv("GE_INFERENCE_WARMUP_SECONDS_BUDGET", "5.0"))
-
-# Which model signature to serve (required).
-# Supported: post_tower (1 input), user_tower (2 inputs), mlp (3 inputs)
-GE_INFERENCE_MODEL_TYPE = os.getenv("GE_INFERENCE_MODEL_TYPE")
-if not GE_INFERENCE_MODEL_TYPE:
-    raise RuntimeError("GE_INFERENCE_MODEL_TYPE env var is required (post_tower | user_tower | mlp).")
 
 # If you know these shapes, set them to validate and to create dummy warmup.
 GE_INFERENCE_EMBED_DIM = int(os.getenv("GE_INFERENCE_EMBED_DIM", "0")) # 0 means unknown/skip dim validation
-GE_INFERENCE_MAX_SEQ_LEN = int(os.getenv("GE_INFERENCE_MAX_SEQ_LEN", "0"))  # 0 means unknown/skip T validation
+GE_INFERENCE_MAX_HISTORY_LEN = int(os.getenv("GE_INFERENCE_MAX_HISTORY_LEN", "0")) 
+if GE_INFERENCE_MAX_HISTORY_LEN <= 0:
+    raise ValueError("Must supply a valid GE_INFERENCE_MAX_HISTORY_LEN!")
 
 DTYPE = torch.float32
 
 # -------------------------
 # State
 # -------------------------
-_model_lock = threading.Lock()
-_model: Optional[torch.jit.ScriptModule] = None
-_device: Optional[torch.device] = None
-_model_path: Optional[str] = None
+ModelType = Literal["user-tower", "post-tower"]
+ModelSignature = Literal["vector", "history"]
 
-_loaded_event = threading.Event()
-_load_error: Optional[str] = None
-_load_started_at: Optional[float] = None
-_load_finished_at: Optional[float] = None
+
+@dataclass
+class LoadedModel:
+    model_type: ModelType
+    signature: ModelSignature
+    configured_model_path: Optional[str] = None
+    configured_model_uri: Optional[str] = None
+    configured_clearml_model_id: Optional[str] = None
+
+    module: Optional[torch.jit.ScriptModule] = None
+    device: Optional[torch.device] = None
+    resolved_model_path: Optional[str] = None
+    resolved_model_id: Optional[str] = None
+
+    load_error: Optional[str] = None
+    load_started_at: Optional[float] = None
+    load_finished_at: Optional[float] = None
+
+
+_models_lock = threading.Lock()
+_models_initialized = False
+_models_init_error: Optional[str] = None
+_models: Dict[str, LoadedModel] = {}
 
 
 # -------------------------
 # API schema
 # -------------------------
-class PredictRequest(BaseModel):
-    # User tower / MLP inputs.
+class UserTowerPredictRequest(BaseModel):
     # history_embeddings: [T, D] or [B, T, D]
-    history_embeddings: Optional[Union[List[List[float]], List[List[List[float]]]]] = None
+    history_embeddings: Union[List[List[float]], List[List[List[float]]]]
     # history_mask: [T] or [B, T]
-    history_mask: Optional[Union[List[Union[int, bool, float]], List[List[Union[int, bool, float]]]]] = None
+    history_mask: Union[List[Union[int, bool, float]], List[List[Union[int, bool, float]]]]
 
-    # Post embedding: [D] or [B, D]
-    post_embedding: Optional[Union[List[float], List[List[float]]]] = None
+    @model_validator(mode="after")
+    def _validate_history(self) -> "UserTowerPredictRequest":
+        he = self.history_embeddings
+        if not isinstance(he, list) or len(he) == 0:
+            raise ValueError("'history_embeddings' must be a non-empty list")
+
+        # Determine shape: [T, D] vs [B, T, D]
+        if isinstance(he[0], list) and len(he[0]) > 0 and not isinstance(he[0][0], list):
+            # [T, D]
+            seq_len = len(he)
+            d0 = len(he[0])
+            if d0 == 0:
+                raise ValueError("history_embeddings must have shape [T, D] with D>0")
+            if not all(isinstance(row, list) and len(row) == d0 for row in he):
+                raise ValueError("history_embeddings must be rectangular with shape [T, D]")
+            batch = 1
+        else:
+            # [B, T, D]
+            batch = len(he)
+            if batch > GE_INFERENCE_MAX_BATCH:
+                raise ValueError(f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
+            if not (isinstance(he[0], list) and len(he[0]) > 0 and isinstance(he[0][0], list)):
+                raise ValueError("history_embeddings must have shape [T, D] or [B, T, D]")
+            seq_len = len(he[0])
+            d0 = len(he[0][0])
+            if seq_len == 0 or d0 == 0:
+                raise ValueError("history_embeddings must have shape [B, T, D] with T>0 and D>0")
+            for b in he:
+                if not (isinstance(b, list) and len(b) == seq_len):
+                    raise ValueError("history_embeddings must be rectangular with shape [B, T, D]")
+                for row in b:
+                    if not (isinstance(row, list) and len(row) == d0):
+                        raise ValueError("history_embeddings must be rectangular with shape [B, T, D]")
+
+        if seq_len != GE_INFERENCE_MAX_HISTORY_LEN:
+            raise ValueError(f"expected T == {GE_INFERENCE_MAX_HISTORY_LEN}, got T={seq_len}")
+        if GE_INFERENCE_EMBED_DIM and d0 != GE_INFERENCE_EMBED_DIM:
+            raise ValueError(f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d0}")
+
+        mask = self.history_mask
+
+        if not isinstance(mask, list) or len(mask) == 0:
+            raise ValueError("'history_mask' must be a non-empty list")
+
+        is_mask_batched = isinstance(mask[0], list)
+        if is_mask_batched:
+            mb = mask  # type: ignore[assignment]
+            if len(mb) != batch:
+                raise ValueError(f"history_mask must have shape [B, T] = [{batch}, {seq_len}]. got B={len(mb)}")
+            for row in mb:
+                if not (isinstance(row, list) and len(row) == seq_len):
+                    raise ValueError(f"history_mask must have shape [B, T] = [{batch}, {seq_len}]")
+        else:
+            mv = mask  # type: ignore[assignment]
+            if batch != 1:
+                raise ValueError(f"history_mask must have shape [B, T] = [{batch}, {seq_len}]")
+            if len(mv) != seq_len:
+                raise ValueError(f"history_mask must have shape [T] = [{seq_len}]")
+
+        return self
+
+
+class PostTowerPredictRequest(BaseModel):
+    # post_embeddings: [D] or [B, D]
+    post_embeddings: Union[List[float], List[List[float]]]
+
+    @model_validator(mode="after")
+    def _validate_post_embeddings(self) -> "PostTowerPredictRequest":
+        pe = self.post_embeddings
+        if not isinstance(pe, list) or len(pe) == 0:
+            raise ValueError("'post_embeddings' must be a non-empty list")
+
+        is_batched = isinstance(pe[0], list)
+        if is_batched:
+            batch = pe  # type: ignore[assignment]
+            if len(batch) > GE_INFERENCE_MAX_BATCH:
+                raise ValueError(f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
+            d0 = len(batch[0]) if len(batch) > 0 else 0
+            if d0 == 0:
+                raise ValueError("each post_embeddings vector must be non-empty")
+            if not all(isinstance(v, list) and len(v) == d0 for v in batch):
+                raise ValueError("all post_embeddings vectors must have the same length")
+            if GE_INFERENCE_EMBED_DIM and d0 != GE_INFERENCE_EMBED_DIM:
+                raise ValueError(f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d0}")
+        else:
+            vec = pe  # type: ignore[assignment]
+            if len(vec) == 0:
+                raise ValueError("'post_embeddings' must be non-empty")
+            if GE_INFERENCE_EMBED_DIM and len(vec) != GE_INFERENCE_EMBED_DIM:
+                raise ValueError(f"expected D={GE_INFERENCE_EMBED_DIM}, got D={len(vec)}")
+        return self
+
+
+def _predict_request_discriminator(value: Any) -> str:
+    if isinstance(value, dict):
+        if "post_embeddings" in value:
+            return "post-tower"
+        if "history_embeddings" in value and "history_mask" in value:
+            return "user-tower"
+    raise ValueError("Request must contain one of: 'post_embeddings' or 'history_embeddings'+'history_mask'.")
+
+
+PredictRequest = Annotated[
+    Union[
+        Annotated[UserTowerPredictRequest, Tag("user-tower")],
+        Annotated[PostTowerPredictRequest, Tag("post-tower")],
+    ],
+    Discriminator(_predict_request_discriminator),
+]
 
 
 # -------------------------
@@ -127,20 +246,10 @@ def _download_gcs_uri_to_local(gs_uri: str) -> str:
     return local_path
 
 
-def _normalize_model_type(model_type: Optional[str]) -> str:
-    if model_type is None:
-        raise HTTPException(status_code=400, detail="GE_INFERENCE_MODEL_TYPE env var is required")
-    mt = (model_type or "").strip().lower()
-    if mt in {"post", "post_tower", "post-tower"}:
-        return "post_tower"
-    if mt in {"user", "user_tower", "user-tower"}:
-        return "user_tower"
-    if mt in {"mlp"}:
-        return "mlp"
-    raise HTTPException(
-        status_code=400,
-        detail=f"Unknown GE_INFERENCE_MODEL_TYPE '{model_type}'. Expected: post_tower, user_tower, mlp",
-    )
+def _validate_model_type(model_type: str) -> ModelType:
+    if model_type in get_args(ModelType):
+        return model_type # type: ignore[return-value]
+    raise RuntimeError(f"Unsupported model type: '{model_type}'")
 
 
 def _tensor_from_nested_list(name: str, value: Any, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -155,75 +264,30 @@ def _tensor_from_nested_list(name: str, value: Any, dtype: torch.dtype, device: 
     return t
 
 
-def _coerce_history_embeddings(value: Any, device: torch.device) -> torch.Tensor:
-    t = _tensor_from_nested_list("history_embeddings", value, dtype=DTYPE, device=device)
-    if t.dim() == 2:
-        t = t.unsqueeze(0)  # [1, T, D]
-    if t.dim() != 3:
-        raise HTTPException(status_code=400, detail="history_embeddings must have shape [T, D] or [B, T, D]")
+def _model_env_key(model_type: str) -> str:
+    # Model names may contain "-" which isn't valid in env vars.
+    # Example: "user-tower" -> "USER_TOWER"
+    return "".join((c if c.isalnum() else "_") for c in model_type).upper()
 
-    b, seq_len, d = t.shape
-    if b > GE_INFERENCE_MAX_BATCH:
-        raise HTTPException(status_code=400, detail=f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
-    if GE_INFERENCE_MAX_SEQ_LEN and seq_len > GE_INFERENCE_MAX_SEQ_LEN:
-        raise HTTPException(status_code=400, detail=f"expected T<= {GE_INFERENCE_MAX_SEQ_LEN}, got T={seq_len}")
-    if GE_INFERENCE_EMBED_DIM and d != GE_INFERENCE_EMBED_DIM:
-        raise HTTPException(status_code=400, detail=f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d}")
+
+def _read_model_env(model_type: str, suffix: str) -> Optional[str]:
+    key = _model_env_key(model_type)
+    return os.getenv(f"GE_INFERENCE_{key}_{suffix}")
+
+
+def _infer_signature(model_type: str) -> ModelSignature:
+    if model_type == "user-tower":
+        return "history"
+    if model_type == "post-tower":
+        return "vector"
+    raise RuntimeError(f"Unsupported model type: '{model_type}'")
+
+
+def _coerce_input(name: str, value: Any, dtype: torch.dtype, device: torch.device, non_batched_dim: int) -> torch.Tensor:
+    t = _tensor_from_nested_list(name, value, dtype, device)
+    if t.dim() == non_batched_dim:
+        t = t.unsqueeze(0) # add a batch dimension of size 1 at the beginning
     return t
-
-
-def _coerce_history_mask(value: Any, device: torch.device, *, batch: int, seq_len: int) -> torch.Tensor:
-    if value is None:
-        if seq_len != 1:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required field 'history_mask' (only optional when seq_len == 1).",
-            )
-        return torch.ones((batch, seq_len), dtype=torch.bool, device=device)
-
-    t = _tensor_from_nested_list("history_mask", value, dtype=torch.int64, device=device)
-    if t.dim() == 1:
-        t = t.unsqueeze(0)  # [1, T]
-    if t.dim() != 2:
-        raise HTTPException(status_code=400, detail="history_mask must have shape [T] or [B, T]")
-
-    b, t_len = t.shape
-    if b != batch or t_len != seq_len:
-        raise HTTPException(
-            status_code=400,
-            detail=f"history_mask shape must match history_embeddings [B, T] = [{batch}, {seq_len}]",
-        )
-    return t.to(torch.bool)
-
-
-def _coerce_post_embedding_from_request(req: PredictRequest, device: torch.device) -> torch.Tensor:
-    if req.post_embedding is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing required post_embedding input",
-        )
-    if len(req.post_embedding) == 0:
-        raise HTTPException(status_code=400, detail="post_embedding must be non-empty")
-
-    is_batched = isinstance(req.post_embedding[0], list)  # type: ignore[index]
-    if is_batched:
-        batch: List[List[float]] = req.post_embedding  # type: ignore[assignment]
-        if len(batch) > GE_INFERENCE_MAX_BATCH:
-            raise HTTPException(status_code=400, detail=f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
-        d0 = len(batch[0])
-        if d0 == 0:
-            raise HTTPException(status_code=400, detail="each input vector must be non-empty")
-        if not all(len(v) == d0 for v in batch):
-            raise HTTPException(status_code=400, detail="all input vectors must have the same length")
-        if GE_INFERENCE_EMBED_DIM and d0 != GE_INFERENCE_EMBED_DIM:
-            raise HTTPException(status_code=400, detail=f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d0}")
-        return torch.tensor(batch, dtype=DTYPE, device=device)
-    else:
-        vec: List[float] = req.post_embedding # type: ignore[assignment]
-        if GE_INFERENCE_EMBED_DIM and len(vec) != GE_INFERENCE_EMBED_DIM:
-            raise HTTPException(status_code=400, detail=f"expected D={GE_INFERENCE_EMBED_DIM}, got D={len(vec)}")
-        x = torch.tensor(vec, dtype=DTYPE, device=device)
-        return x.unsqueeze(0)  # [1, D]
 
 
 def _to_python(obj: Any) -> Any:
@@ -239,124 +303,241 @@ def _to_python(obj: Any) -> Any:
     return obj
 
 
-def _warmup_model(model: torch.jit.ScriptModule, device: torch.device) -> None:
-    """
-    Warmup does two things:
-      - validates that the model can run on the target device
-      - forces CUDA context init and (sometimes) JIT internal setup
-    """
+def _warmup_entry(entry: LoadedModel) -> None:
+    """Best-effort warmup to initialize CUDA context and validate the forward pass."""
+    if entry.device is None or entry.module is None:
+        return
+    device = entry.device
+    model = entry.module
     if device.type != "cuda":
         return
     if not GE_INFERENCE_WARMUP:
         return
-    if GE_INFERENCE_EMBED_DIM <= 0:
-        # Without knowing D, we can't safely warm up.
-        return
 
-    start = time.time()
     with torch.inference_mode():
-        mt = _normalize_model_type(GE_INFERENCE_MODEL_TYPE)
-
-        # A couple of warmup passes; keep it short.
-        if mt == "post_tower":
+        # Keep warmup short.
+        if entry.signature == "vector":
+            if GE_INFERENCE_EMBED_DIM <= 0:
+                return
             dummy = torch.zeros((1, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device)
             _ = model(dummy)
-            if time.time() - start < GE_INFERENCE_WARMUP_SECONDS_BUDGET:
-                _ = model(dummy)
             return
 
-        if GE_INFERENCE_MAX_SEQ_LEN <= 0:
-            # Without knowing T, we can't safely warm up these signatures.
-            return
-
-        history_embeddings = torch.zeros((1, GE_INFERENCE_MAX_SEQ_LEN, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device)
-        history_mask = torch.ones((1, GE_INFERENCE_MAX_SEQ_LEN), dtype=torch.bool, device=device)
-
-        if mt == "user_tower":
+        if entry.signature == "history":
+            if GE_INFERENCE_EMBED_DIM <= 0:
+                return
+            history_embeddings = torch.zeros(
+                (1, GE_INFERENCE_MAX_HISTORY_LEN, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device
+            )
+            history_mask = torch.ones((1, GE_INFERENCE_MAX_HISTORY_LEN), dtype=torch.bool, device=device)
             _ = model(history_embeddings, history_mask)
-            if time.time() - start < GE_INFERENCE_WARMUP_SECONDS_BUDGET:
-                _ = model(history_embeddings, history_mask)
-            return
-
-        if mt == "mlp":
-            post_embedding = torch.zeros((1, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device)
-            _ = model(history_embeddings, history_mask, post_embedding)
-            if time.time() - start < GE_INFERENCE_WARMUP_SECONDS_BUDGET:
-                _ = model(history_embeddings, history_mask, post_embedding)
             return
 
 
-def _load_model_inner() -> None:
-    global _model, _device, _model_path
+def _init_registry() -> None:
+    global _models_initialized, _models_init_error, _models
+    if _models_initialized:
+        return
 
-    device = _choose_device()
+    with _models_lock:
+        if _models_initialized:
+            return
 
+        try:
+            models: Dict[str, LoadedModel] = {}
+
+            models_env = os.getenv("GE_INFERENCE_MODELS", "").strip()
+            if not models_env:
+                raise RuntimeError(
+                    "No models configured. Set GE_INFERENCE_MODELS (e.g. 'user-tower,post-tower') "
+                    "and per-model MODEL_PATH/MODEL_URI/CLEARML_MODEL_ID env vars."
+                )
+
+            env_model_types: List[str] = []
+            env_model_types: List[str] = models_env.split(",")
+            if len(env_model_types) > 2:
+                raise RuntimeError(f"Too many models configured ({len(env_model_types)}). Max is 2.")
+
+            seen: set[str] = set()
+            for env_model_type in env_model_types:
+                if env_model_type in seen:
+                    continue
+                seen.add(env_model_type)
+
+                model_type: ModelType = _validate_model_type(env_model_type)
+                signature: ModelSignature = _infer_signature(model_type)
+
+                # Per-model sources.
+                model_path = _read_model_env(model_type, "MODEL_PATH")
+                model_uri = _read_model_env(model_type, "MODEL_URI")
+                clearml_id = _read_model_env(model_type, "CLEARML_MODEL_ID")
+
+                if not (model_path or model_uri or clearml_id):
+                    raise RuntimeError(
+                        f"Model '{model_type}' is missing a source. "
+                        f"Set one of: GE_INFERENCE_{_model_env_key(model_type)}_MODEL_PATH | "
+                        f"GE_INFERENCE_{_model_env_key(model_type)}_MODEL_URI | "
+                        f"GE_INFERENCE_{_model_env_key(model_type)}_CLEARML_MODEL_ID"
+                    )
+
+                models[model_type] = LoadedModel(
+                    model_type=model_type,
+                    signature=signature,
+                    configured_model_path=model_path,
+                    configured_model_uri=model_uri,
+                    configured_clearml_model_id=clearml_id,
+                )
+
+            _models = models
+            _models_init_error = None
+        except Exception as e:
+            _models = {}
+            _models_init_error = str(e)
+        finally:
+            _models_initialized = True
+
+
+def _resolve_model_file(entry: LoadedModel) -> tuple[str, Optional[str]]:
     model_id = None
-    model_path_env = os.getenv("GE_INFERENCE_MODEL_PATH")
-    model_uri_env = os.getenv("GE_INFERENCE_MODEL_URI")
-
-    if model_path_env:
-        model_file = _find_model_file(model_path_env)
-    elif model_uri_env:
-        parsed = urlparse(model_uri_env)
+    if entry.configured_model_path:
+        model_file = _find_model_file(entry.configured_model_path)
+    elif entry.configured_model_uri:
+        parsed = urlparse(entry.configured_model_uri)
         if parsed.scheme == "gs":
-            model_file = _find_model_file(_download_gcs_uri_to_local(model_uri_env))
+            model_file = _find_model_file(_download_gcs_uri_to_local(entry.configured_model_uri))
         else:
-            # Treat as local path (supports relative paths too).
-            model_file = _find_model_file(model_uri_env)
+            model_file = _find_model_file(entry.configured_model_uri)
     else:
-        model_id = os.getenv("GE_INFERENCE_CLEARML_MODEL_ID")
+        model_id = entry.configured_clearml_model_id
         if not model_id:
-            raise RuntimeError("Either GE_INFERENCE_MODEL_PATH, GE_INFERENCE_MODEL_URI, or GE_INFERENCE_CLEARML_MODEL_ID env var is required")
-
+            raise RuntimeError(
+                f"Model '{entry.model_type}' is missing a source (MODEL_PATH | MODEL_URI | CLEARML_MODEL_ID)"
+            )
         cm = Model(model_id=model_id)
         local_copy = cm.get_local_copy()
         model_file = _find_model_file(local_copy)
+    return model_file, model_id
+
+
+def _load_entry(entry: LoadedModel) -> None:
+    device = _choose_device()
+    model_file, model_id = _resolve_model_file(entry)
 
     m = torch.jit.load(model_file, map_location=device)
     m.eval()
 
-    _warmup_model(m, device)
+    entry.module = m
+    entry.device = device
+    entry.resolved_model_path = model_file
+    entry.resolved_model_id = model_id
 
-    _model = m
-    _device = device
-    _model_path = model_file
+    _warmup_entry(entry)
 
     logger.info(
-        "Model loaded successfully | model_id=%s | model_path=%s | device=%s",
+        "Model loaded | type=%s | signature=%s | model_id=%s | model_path=%s | device=%s",
+        entry.model_type,
+        entry.signature,
         model_id,
         model_file,
         device,
     )
 
 
-def ensure_model_loaded() -> None:
-    """
-    Concurrency-safe, idempotent load.
-    Also sets readiness state & captures errors for /ready.
-    """
-    global _load_error, _load_started_at, _load_finished_at
-
-    if _model is not None:
-        _loaded_event.set()
+def ensure_models_loaded() -> None:
+    """Concurrency-safe, idempotent load of all configured models."""
+    _init_registry()
+    if _models_init_error is not None:
+        logger.error("Model registry init failed: %s", _models_init_error)
         return
 
-    with _model_lock:
-        if _model is not None:
-            _loaded_event.set()
-            return
+    with _models_lock:
+        for entry in _models.values():
+            if entry.module is not None:
+                continue
+            if entry.load_started_at is not None and entry.load_finished_at is None:
+                continue
 
-        _load_started_at = time.time()
-        try:
-            _load_model_inner()
-            _load_error = None
-        except Exception as e:
-            _load_error = str(e)
-            raise
-        finally:
-            _load_finished_at = time.time()
-            if _model is not None:
-                _loaded_event.set()
+            entry.load_started_at = time.time()
+            try:
+                _load_entry(entry)
+                entry.load_error = None
+            except Exception as e:
+                entry.load_error = str(e)
+                logger.exception("Model load failed | type=%s | error=%s", entry.model_type, entry.load_error)
+            finally:
+                entry.load_finished_at = time.time()
+
+
+def _get_entry_or_404(model_name: str) -> LoadedModel:
+    _init_registry()
+    if _models_init_error is not None:
+        raise HTTPException(status_code=500, detail=f"Model registry init failed: {_models_init_error}")
+
+    entry = _models.get(model_name)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{model_name}'")
+    return entry
+
+
+def _require_ready(entry: LoadedModel) -> None:
+    if entry.module is not None and entry.device is not None:
+        return
+    ensure_models_loaded()
+    if entry.module is None or entry.device is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"model_type": entry.model_type, "ready": False, "load_error": entry.load_error},
+        )
+
+def _predict_with_entry(entry: LoadedModel, req: PredictRequest) -> Any:
+    _require_ready(entry)
+    assert entry.module is not None and entry.device is not None
+
+    # Enforce schema against registered model type.
+    if entry.model_type == "user-tower" and not isinstance(req, UserTowerPredictRequest):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Model type '{entry.model_type}' expects a user-tower request body with 'history_embeddings'",
+        )
+    if entry.model_type == "post-tower" and not isinstance(req, PostTowerPredictRequest):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Model type '{entry.model_type}' expects a post-tower request body with 'post_embeddings'",
+        )
+
+    with torch.inference_mode():
+        if entry.model_type == "user-tower":
+            assert isinstance(req, UserTowerPredictRequest)
+            history_embeddings = _coerce_input(
+                value=req.history_embeddings,
+                name="history_embeddings",
+                dtype=DTYPE,
+                device=entry.device,
+                non_batched_dim=2,
+            )
+            history_mask = _coerce_input(
+                value=req.history_mask,
+                name="history_mask",
+                dtype=torch.int64,
+                device=entry.device,
+                non_batched_dim=1,
+            )
+            y = entry.module(history_embeddings, history_mask)
+            return y
+
+        if entry.model_type == "post-tower":
+            assert isinstance(req, PostTowerPredictRequest)
+            post_embeddings = _coerce_input(
+                value=req.post_embeddings,
+                name="post_embeddings",
+                dtype=DTYPE,
+                device=entry.device,
+                non_batched_dim=1,
+            )
+            y = entry.module(post_embeddings)
+            return y
+
+    raise HTTPException(status_code=500, detail=f"Unsupported model type: {entry.model_type}")
 
 
 # -------------------------
@@ -370,68 +551,68 @@ def health() -> dict:
 
 @app.get("/ready")
 def ready():
-    ready = _loaded_event.is_set()
+    _init_registry()
+    ensure_models_loaded()
+
+    models_payload: List[dict[str, Any]] = []
+    all_ready = _models_init_error is None and len(_models) > 0
+    for entry in _models.values():
+        model_ready = entry.module is not None and entry.device is not None and entry.load_error is None
+        all_ready = all_ready and model_ready
+        models_payload.append(
+            {
+                "type": entry.model_type,
+                "signature": entry.signature,
+                "ready": model_ready,
+                "device": str(entry.device) if entry.device else None,
+                "model_path": entry.resolved_model_path,
+                "model_id": entry.resolved_model_id,
+                "load_error": entry.load_error,
+                "load_started_at": entry.load_started_at,
+                "load_finished_at": entry.load_finished_at,
+            }
+        )
 
     payload = {
-        "ready": ready,
-        "device": str(_device) if _device else None,
-        "model_type": _normalize_model_type(GE_INFERENCE_MODEL_TYPE),
+        "ready": all_ready,
+        "registry_error": _models_init_error,
         "embed_dim": GE_INFERENCE_EMBED_DIM if GE_INFERENCE_EMBED_DIM > 0 else None,
-        "max_seq_len": GE_INFERENCE_MAX_SEQ_LEN if GE_INFERENCE_MAX_SEQ_LEN > 0 else None,
-        "load_error": _load_error,
-        "load_started_at": _load_started_at,
-        "load_finished_at": _load_finished_at
+        "max_seq_len": GE_INFERENCE_MAX_HISTORY_LEN,
+        "models": models_payload,
     }
 
-    status = 200 if ready else 503
+    status = 200 if all_ready else 503
     return JSONResponse(content=payload, status_code=status)
 
+@app.get("/models")
+def list_models() -> dict:
+    _init_registry()
+    ensure_models_loaded()
+    models_payload: List[dict[str, Any]] = []
+    for entry in _models.values():
+        models_payload.append(
+            {
+                "type": entry.model_type,
+                "signature": entry.signature,
+                "ready": entry.module is not None and entry.device is not None and entry.load_error is None,
+                "device": str(entry.device) if entry.device else None,
+                "model_path": entry.resolved_model_path,
+                "model_id": entry.resolved_model_id,
+                "load_error": entry.load_error,
+                "load_started_at": entry.load_started_at,
+                "load_finished_at": entry.load_finished_at,
+            }
+        )
+    return {"models": models_payload, "registry_error": _models_init_error}
 
-@app.post("/predict")
-def predict(req: PredictRequest) -> dict:
-    # If startup load hasn't completed, do a guarded sync load here.
-    if _model is None:
-        try:
-            ensure_model_loaded()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Model not available: {e}")
 
-    assert _model is not None and _device is not None
-
-    mt = _normalize_model_type(GE_INFERENCE_MODEL_TYPE)
+@app.post("/models/{model_name}/predict")
+def predict_model(model_name: str, req: PredictRequest) -> dict:
+    entry = _get_entry_or_404(model_name)
     try:
-        with torch.inference_mode():
-            if mt == "post_tower":
-                post_embedding = _coerce_post_embedding_from_request(req, device=_device)
-                y = _model(post_embedding)
-            elif mt == "user_tower":
-                history_embeddings = _coerce_history_embeddings(req.history_embeddings, device=_device)
-                history_mask = _coerce_history_mask(
-                    req.history_mask,
-                    device=_device,
-                    batch=int(history_embeddings.shape[0]),
-                    seq_len=int(history_embeddings.shape[1]),
-                )
-                y = _model(history_embeddings, history_mask)
-            elif mt == "mlp":
-                history_embeddings = _coerce_history_embeddings(req.history_embeddings, device=_device)
-                history_mask = _coerce_history_mask(
-                    req.history_mask,
-                    device=_device,
-                    batch=int(history_embeddings.shape[0]),
-                    seq_len=int(history_embeddings.shape[1]),
-                )
-                post_embedding = _coerce_post_embedding_from_request(req, device=_device)
-                if int(post_embedding.shape[0]) != int(history_embeddings.shape[0]):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Batch size mismatch: history_embeddings has B={int(history_embeddings.shape[0])}, post_embedding has B={int(post_embedding.shape[0])}",
-                    )
-                y = _model(history_embeddings, history_mask, post_embedding)
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported model type: {mt}")
+        y = _predict_with_entry(entry, req)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Inference failed: {e}")
-
-    return {"outputs": _to_python(y), "model_type": mt}
-
+    return {"outputs": _to_python(y), "model_type": entry.model_type}
