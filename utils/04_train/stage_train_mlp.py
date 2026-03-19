@@ -612,7 +612,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         torchscript_name = f"engagement_mlp"
         torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
         torch.jit.script(trained_model).save(torchscript_path)
-        context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
+        mlp_model_id = context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
+        logger.info(f"MLP model id: {mlp_model_id}")
 
     # --- save predictions ---
     predictions_dir = out_dir / "predictions"

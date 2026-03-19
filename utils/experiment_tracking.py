@@ -199,7 +199,7 @@ class ClearMLExperimentTracker:
             iteration=iteration,
         )
 
-    def log_artifact(self, name: str, path: Path) -> None:
+    def log_artifact(self, name: str, path: Path) -> Optional[str]:
         from clearml import OutputModel
         p = Path(path)
         if not p.exists():
@@ -222,6 +222,8 @@ class ClearMLExperimentTracker:
         om.set_metadata("git_repo", getattr(script, "repository", ""))
         om.set_metadata("git_branch", getattr(script, "branch", ""))
         om.set_metadata("git_sha", getattr(script, "version_num", ""))
+
+        return om.id
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         # ClearML expects values to be JSON-serializable; normalize common types (e.g. Path).
