@@ -14,9 +14,10 @@ def main() -> None:
     embed_dim = 384
 
     # generate inputs
-    post_embeddings = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
+    post_embedding = (np.random.random((batch_size, embed_dim,)) - 0.5).tolist()
 
-    payload = {"inputs": post_embeddings}
+    # Preferred field name for post tower is "post_embedding" (also accepts legacy "inputs").
+    payload = {"post_embedding": post_embedding}
 
     # hit api
     resp = requests.post(url, json=payload, timeout=30)
