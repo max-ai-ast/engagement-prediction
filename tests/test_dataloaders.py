@@ -8,6 +8,9 @@ from torch.utils.data import DataLoader
 from utils.dataloaders import (
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
+    SummarizedUserTower,
+    TransformerDualPoolingEncoder,
+    CrossAttentionPoolingEncoder,
     create_data_loaders,
     MeanSummarizer,
 )
@@ -501,3 +504,123 @@ def test_create_data_loaders_iteration(mock_embeddings_mmap, mock_target_posts_d
     batch = train_batches[0]
     assert "features" in batch
     assert "label" in batch
+
+
+# =============================================================================
+# Cold-start embedding behavior Tests
+# =============================================================================
+
+def test_summarized_user_tower_uses_empty_embedding_when_no_history():
+    """SummarizedUserTower should swap in a learnable embedding for empty histories."""
+    torch.manual_seed(0)
+    embed_dim = 8
+    tower = SummarizedUserTower(embed_dim=embed_dim)
+    tower.eval()
+
+    with torch.no_grad():
+        tower.empty_user_embedding.copy_(torch.arange(embed_dim, dtype=torch.float32))
+
+    history_embeddings = torch.stack(
+        [
+            torch.full((1, embed_dim), 2.0),  # summary token
+            torch.full((1, embed_dim), 3.0),  # summary token (ignored when mask=False)
+        ],
+        dim=0,
+    )  # [B=2, T=1, D]
+    history_mask = torch.tensor([[True], [False]], dtype=torch.bool)  # [B, T]
+
+    out = tower(history_embeddings, history_mask)
+    assert out.shape == (2, embed_dim)
+    assert torch.allclose(out[0], history_embeddings[0, 0, :])
+    assert torch.allclose(out[1], tower.empty_user_embedding)
+
+    out_no_mask = tower(history_embeddings, None)
+    assert torch.allclose(out_no_mask[0], history_embeddings[0, 0, :])
+    assert torch.allclose(out_no_mask[1], history_embeddings[1, 0, :])
+
+
+@pytest.mark.parametrize(
+    "encoder_factory",
+    [
+        lambda input_dim, hidden_dim, output_dim, max_seq_len: TransformerDualPoolingEncoder(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            num_attention_heads=4,
+            num_attention_layers=1,
+            max_seq_len=max_seq_len,
+            dropout_rate=0.0,
+        ),
+        lambda input_dim, hidden_dim, output_dim, max_seq_len: CrossAttentionPoolingEncoder(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            max_seq_len=max_seq_len,
+            dropout_rate=0.0,
+        ),
+    ],
+)
+def test_attention_encoders_empty_history_depends_on_learnable_token(encoder_factory):
+    """Empty-history outputs should depend on the encoder's learnable cold-start token."""
+    torch.manual_seed(0)
+    batch_size = 3
+    seq_len = 5
+    input_dim = 8
+    hidden_dim = 16
+    output_dim = 12
+
+    encoder = encoder_factory(input_dim, hidden_dim, output_dim, max_seq_len=seq_len)
+    encoder.eval()
+
+    history_embeddings = torch.zeros(batch_size, seq_len, input_dim)
+    history_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+
+    with torch.no_grad():
+        encoder.empty_history_embedding.fill_(0.1)
+    out1 = encoder(history_embeddings, history_mask)
+
+    with torch.no_grad():
+        encoder.empty_history_embedding.fill_(0.2)
+    out2 = encoder(history_embeddings, history_mask)
+
+    assert out1.shape == (batch_size, output_dim)
+    assert torch.isfinite(out1).all()
+    assert not torch.allclose(out1, out2), "Output should change when the cold-start token changes"
+
+
+def test_attention_encoder_raises_on_zero_sequence_length():
+    """Attention encoders should reject degenerate seq_len==0 inputs."""
+    encoder = CrossAttentionPoolingEncoder(
+        input_dim=8,
+        hidden_dim=16,
+        output_dim=12,
+        max_seq_len=5,
+        dropout_rate=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="non-zero sequence length"):
+        encoder(
+            history_embeddings=torch.zeros(2, 0, 8),
+            history_mask=torch.zeros(2, 0, dtype=torch.bool),
+        )
+
+
+def test_attention_encoder_empty_history_embedding_receives_grad():
+    """When history is empty, the cold-start token should participate in backprop."""
+    encoder = CrossAttentionPoolingEncoder(
+        input_dim=8,
+        hidden_dim=16,
+        output_dim=12,
+        max_seq_len=5,
+        dropout_rate=0.0,
+    )
+
+    history_embeddings = torch.zeros(2, 5, 8)
+    history_mask = torch.zeros(2, 5, dtype=torch.bool)  # all-masked => inject token
+
+    out = encoder(history_embeddings, history_mask)
+    loss = out.sum()
+    loss.backward()
+
+    assert encoder.empty_history_embedding.grad is not None
+    assert torch.isfinite(encoder.empty_history_embedding.grad).all()
