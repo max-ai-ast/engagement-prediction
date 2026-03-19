@@ -240,6 +240,229 @@ def test_get_target_posts_emits_negative_pairs(
     assert out["neg_author_did"].null_count() == 0
 
 
+def test_holdout_assignment_stable_when_adding_users(stage_target_posts_module):
+    seed = 123
+    fraction = 0.5
+    dids = ["user_u1", "user_u2", "user_u3"]
+    dids_with_extra = dids + ["some_new_user"]
+
+    holdout_before = stage_target_posts_module._select_holdout_users(dids, seed, fraction)
+    holdout_after = stage_target_posts_module._select_holdout_users(
+        dids_with_extra, seed, fraction
+    )
+
+    assert {did: (did in holdout_before) for did in dids} == {
+        did: (did in holdout_after) for did in dids
+    }
+
+
+def test_run_regression_snapshot_small_dataset(stage_target_posts_module, tmp_path):
+    from utils.pipeline.core import Context
+
+    # --- create a minimal prior 01_get_data output ---
+    prior_dir = tmp_path / "01_get_data" / "20240101_000000"
+    prior_dir.mkdir(parents=True, exist_ok=True)
+
+    posts_df = pl.DataFrame(
+        [
+            {
+                "did": "author_1",
+                "at_uri": "post:1",
+                "record_created_at": _dt(2024, 1, 1, 1),
+                "emb_idx": 1,
+                "record_text": "t1",
+                "is_liked": False,
+                "in_random_sample": True,
+            },
+            {
+                "did": "author_2",
+                "at_uri": "post:2",
+                "record_created_at": _dt(2024, 1, 1, 2),
+                "emb_idx": 2,
+                "record_text": "t2",
+                "is_liked": False,
+                "in_random_sample": True,
+            },
+            {
+                "did": "author_3",
+                "at_uri": "post:3",
+                "record_created_at": _dt(2024, 1, 1, 3),
+                "emb_idx": 3,
+                "record_text": "t3",
+                "is_liked": False,
+                "in_random_sample": True,
+            },
+            {
+                "did": "author_4",
+                "at_uri": "post:4",
+                "record_created_at": _dt(2024, 1, 2, 1),
+                "emb_idx": 4,
+                "record_text": "t4",
+                "is_liked": False,
+                "in_random_sample": True,
+            },
+            {
+                "did": "author_5",
+                "at_uri": "post:5",
+                "record_created_at": _dt(2024, 1, 2, 2),
+                "emb_idx": 5,
+                "record_text": "t5",
+                "is_liked": False,
+                "in_random_sample": True,
+            },
+            {
+                "did": "author_6",
+                "at_uri": "post:6",
+                "record_created_at": _dt(2024, 1, 2, 3),
+                "emb_idx": 6,
+                "record_text": "t6",
+                "is_liked": False,
+                "in_random_sample": True,
+            },
+        ]
+    )
+    likes_df = pl.DataFrame(
+        [
+            {
+                "did": "user_u1",
+                "subject_uri": "post:1",
+                "record_created_at": _dt(2024, 1, 2, 10),
+                "emb_idx": 101,
+            },
+            {
+                "did": "user_u1",
+                "subject_uri": "post:2",
+                "record_created_at": _dt(2024, 1, 4, 10),
+                "emb_idx": 102,
+            },
+            {
+                "did": "user_u2",
+                "subject_uri": "post:4",
+                "record_created_at": _dt(2024, 1, 6, 10),
+                "emb_idx": 201,
+            },
+            {
+                "did": "user_u3",
+                "subject_uri": "post:5",
+                "record_created_at": _dt(2024, 1, 2, 11),
+                "emb_idx": 301,
+            },
+            {
+                "did": "user_u3",
+                "subject_uri": "post:6",
+                "record_created_at": _dt(2024, 1, 4, 11),
+                "emb_idx": 302,
+            },
+            {
+                "did": "user_u3",
+                "subject_uri": "post:3",
+                "record_created_at": _dt(2024, 1, 6, 11),
+                "emb_idx": 303,
+            },
+        ]
+    )
+
+    posts_df.write_parquet(prior_dir / "posts_core_20240101_000000.parquet")
+    likes_df.write_parquet(prior_dir / "likes_core_20240101_000000.parquet")
+
+    context = Context(
+        run_dir=tmp_path,
+        run_timestamp="20240108_000000",
+        prior_outputs={"01_get_data": prior_dir},
+    )
+
+    args = argparse.Namespace(
+        random_seed=7,
+        neg_sample_bucket="1d",
+        train_start="2024-01-01T00:00:00+0000",
+        val_start="2024-01-03T00:00:00+0000",
+        holdout_start="2024-01-05T00:00:00+0000",
+        holdout_end="2024-01-07T00:00:00+0000",
+        holdout_user_fraction=0.5,
+        holdout_user_seed=123,
+        posts_start=None,
+        likes_start=None,
+    )
+
+    res = stage_target_posts_module.run(context, args)
+    out_path = Path(res["artifacts"]["user_summary_path"])
+    out_df = pl.read_parquet(out_path).sort(["target_did", "like_uri"])
+
+    expected = pl.DataFrame(
+        [
+            {
+                "target_did": "user_u1",
+                "seen_at": _dt(2024, 1, 2, 10),
+                "like_uri": "post:1",
+                "like_emb_idx": 101,
+                "like_author_did": "author_1",
+                "neg_uri": "post:3",
+                "neg_emb_idx": 3,
+                "neg_author_did": "author_3",
+                "split": "holdout_unseen_users",
+            },
+            {
+                "target_did": "user_u1",
+                "seen_at": _dt(2024, 1, 4, 10),
+                "like_uri": "post:2",
+                "like_emb_idx": 102,
+                "like_author_did": "author_2",
+                "neg_uri": "post:3",
+                "neg_emb_idx": 3,
+                "neg_author_did": "author_3",
+                "split": "holdout_unseen_users",
+            },
+            {
+                "target_did": "user_u2",
+                "seen_at": _dt(2024, 1, 6, 10),
+                "like_uri": "post:4",
+                "like_emb_idx": 201,
+                "like_author_did": "author_4",
+                "neg_uri": "post:6",
+                "neg_emb_idx": 6,
+                "neg_author_did": "author_6",
+                "split": "holdout_unseen_users",
+            },
+            {
+                "target_did": "user_u3",
+                "seen_at": _dt(2024, 1, 6, 11),
+                "like_uri": "post:3",
+                "like_emb_idx": 303,
+                "like_author_did": "author_3",
+                "neg_uri": "post:1",
+                "neg_emb_idx": 1,
+                "neg_author_did": "author_1",
+                "split": "holdout_seen_users",
+            },
+            {
+                "target_did": "user_u3",
+                "seen_at": _dt(2024, 1, 2, 11),
+                "like_uri": "post:5",
+                "like_emb_idx": 301,
+                "like_author_did": "author_5",
+                "neg_uri": "post:4",
+                "neg_emb_idx": 4,
+                "neg_author_did": "author_4",
+                "split": "train",
+            },
+            {
+                "target_did": "user_u3",
+                "seen_at": _dt(2024, 1, 4, 11),
+                "like_uri": "post:6",
+                "like_emb_idx": 302,
+                "like_author_did": "author_6",
+                "neg_uri": "post:4",
+                "neg_emb_idx": 4,
+                "neg_author_did": "author_4",
+                "split": "val",
+            },
+        ]
+    ).sort(["target_did", "like_uri"])
+
+    assert out_df.columns == expected.columns
+    assert out_df.to_dicts() == expected.to_dicts()
+
+
 def test_get_train_start_fallbacks(stage_target_posts_module):
     args = argparse.Namespace(train_start="2024-01-02", posts_start="2024-01-03", likes_start="2024-01-04")
     assert stage_target_posts_module._get_train_start(args) == "2024-01-02"
