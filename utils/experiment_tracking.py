@@ -226,8 +226,10 @@ class ClearMLExperimentTracker:
         return om.id
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
-        # ClearML expects values to be JSON-serializable; normalize common types (e.g. Path).
-        self._task.connect(normalize_params(params), name=name)
+        normalized = normalize_params(params)
+        if name:
+            normalized = {f"{name}/{key}": value for key, value in normalized.items()}
+        self._task.set_parameters_as_dict(normalized)
 
     def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
         """Connect an argparse.Namespace to ClearML and return the (possibly) updated args.

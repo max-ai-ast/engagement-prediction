@@ -772,7 +772,10 @@ def run(context: Context, args) -> Dict[str, Any]:
     if training_results is not None:
         best_val_auc = training_results["best_val_auc"]
     else:
+        best_train_auc = roc_auc_score(train_eval["predictions"]["y_true"], train_eval["predictions"]["y_pred"])
         best_val_auc = roc_auc_score(val_eval["predictions"]["y_true"], val_eval["predictions"]["y_pred"])
+        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=float(best_train_auc), iteration=0)
+        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=float(best_val_auc), iteration=0)
 
     if generate_plots:
         try:
