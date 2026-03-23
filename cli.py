@@ -49,7 +49,7 @@ DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
     "debug": False,
     "random_seed": 42,
-    "embedding_model": "all_MiniLM_L6_v2",
+    "embedding_model": "all_MiniLM_L12_v2",
     "skip_embeddings": False,
     # Stage 2 Target posts and Split
     "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
