@@ -246,7 +246,7 @@ def _plot_group_over_serving(
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     path = out_dir / f"{group_name}_over_serving.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -325,7 +325,7 @@ def _plot_summary_bar(
     plt.tight_layout()
 
     path = out_dir / "over_serving_summary_bar.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 

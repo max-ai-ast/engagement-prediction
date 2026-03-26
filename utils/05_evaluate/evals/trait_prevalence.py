@@ -77,7 +77,7 @@ def _plot_group(
     plt.tight_layout()
 
     path = out_dir / f"{group_name}_prevalence.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 

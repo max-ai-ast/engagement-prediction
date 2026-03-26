@@ -220,7 +220,7 @@ def _plot_volume_points(
         fig, ax = plt.subplots(figsize=scaled_figsize(4, 3))
         ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes,
                 ha="center", va="center", fontsize=9, color="#999999")
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=300)
         plt.close(fig)
         return path, {}, []
 
@@ -296,7 +296,7 @@ def _plot_volume_points(
                         right=0.97)
 
     path = out_dir / fname
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=300)
     plt.close(fig)
     return path, raw_stats, labels
 
@@ -334,7 +334,7 @@ def _save_legend(pct_hi_str: str, out_dir: Path) -> Path:
         fig.dpi_scale_trans.inverted()
     )
     path = out_dir / "liked_trait_volume_legend.png"
-    fig.savefig(path, dpi=150, bbox_inches=bbox)
+    fig.savefig(path, dpi=300, bbox_inches=bbox)
     plt.close(fig)
     return path
 

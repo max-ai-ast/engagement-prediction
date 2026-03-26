@@ -86,6 +86,29 @@ _SUBSET_TRAITS: Dict[str, Tuple[str, set]] = {
     ),
 }
 
+# Groups for which to also produce a top-N-by-pool-prevalence subset plot.
+# Maps group name -> (subset plot name, N).
+_TOP_N_SUBSETS: Dict[str, Tuple[str, int]] = {
+    "topic": ("topic_top10", 10),
+}
+
+# --- decomposition bar plots (stacked / grouped) ---
+DECOMP_USER_PREF_COLOR = "#4878CF"
+DECOMP_MODEL_AMP_COLOR = "#D65F5F"
+DECOMP_TOTAL_EXCESS_COLOR = "#2ca02c"
+
+# --- prevalence bar plots (pool / liked / feed) ---
+PREV_POOL_COLOR = "#aaaaaa"
+PREV_LIKED_COLOR = "#4fa16a"###
+PREV_FEED_COLOR = "#4878CF"
+PREV_ARROW_COLOR = "#4878CF"
+PREV_ANNOTATION_COLOR = "#333333"
+
+# --- prevalence detail: volume-split point overlays ---
+PREV_LIKED_LO_VOL_COLOR = "#774BD2"
+PREV_LIKED_HI_VOL_COLOR = "#D2784B"
+
+# --- per-group color cycle for headline decomposition chart ---
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -422,10 +445,10 @@ def _plot_decomposition_bar(
     pref = [_scale(k, "user_pref_std") for k in sorted_keys]
     amp = [_scale(k, "model_amp_std") for k in sorted_keys]
 
-    ax.barh(y, pref, height=0.6, color="#4878CF", alpha=0.85,
+    ax.barh(y, pref, height=0.6, color=DECOMP_USER_PREF_COLOR, alpha=0.85,
             label="User preference (likes \u2212 pool)")
-    ax.barh(y, amp, height=0.6, left=pref, color="#D65F5F", alpha=0.85,
-            label="Model amplification (feed \u2212 likes)")
+    ax.barh(y, amp, height=0.6, left=pref, color=DECOMP_MODEL_AMP_COLOR,
+            alpha=0.85, label="Model amplification (feed \u2212 likes)")
 
     fmt = "+.3f" if standardize else "+.4f"
     for i, k in enumerate(sorted_keys):
@@ -457,7 +480,7 @@ def _plot_decomposition_bar(
     )
     ax.legend(fontsize=7, loc="lower right", framealpha=0.8)
     plt.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=360, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -498,12 +521,12 @@ def _plot_group_decomposition(
     amp = [_scale(k, "model_amp_std") for k in labels]
     excess = [_scale(k, "model_excess_std") for k in labels]
 
-    ax.barh(y - h, pref, height=h, color="#4878CF", alpha=0.85,
+    ax.barh(y - h, pref, height=h, color=DECOMP_USER_PREF_COLOR, alpha=0.85,
             label="User pref")
-    ax.barh(y, amp, height=h, color="#D65F5F", alpha=0.85,
+    ax.barh(y, amp, height=h, color=DECOMP_MODEL_AMP_COLOR, alpha=0.85,
             label="Model amp")
-    ax.barh(y + h, excess, height=h, color="#2ca02c", alpha=0.85,
-            label="Total excess")
+    ax.barh(y + h, excess, height=h, color=DECOMP_TOTAL_EXCESS_COLOR,
+            alpha=0.85, label="Total excess")
 
     for i, k in enumerate(labels):
         tr = group_traits[k]
@@ -529,7 +552,7 @@ def _plot_group_decomposition(
                  fontsize=9, fontweight="bold")
     ax.legend(fontsize=6, loc="lower right", framealpha=0.8)
     plt.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=360, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -609,17 +632,17 @@ def _plot_group_prevalence(
 
     ax.bar(
         x + offsets[0], pool_vals, width=w, yerr=pool_cis,
-        color="#aaaaaa", alpha=0.85, capsize=3,
+        color=PREV_POOL_COLOR, alpha=0.85, capsize=3,
         error_kw=dict(linewidth=0.8), label="Pool",
     )
     ax.bar(
         x + offsets[1], liked_vals, width=w, yerr=liked_cis,
-        color="#4878CF", alpha=0.85, capsize=3,
+        color=PREV_LIKED_COLOR, alpha=0.85, capsize=3,
         error_kw=dict(linewidth=0.8), label="Liked (user avg)",
     )
     ax.bar(
         x + offsets[2], feed_vals, width=w, yerr=feed_cis,
-        color="#D65F5F", alpha=0.85, capsize=3,
+        color=PREV_FEED_COLOR, alpha=0.85, capsize=3,
         error_kw=dict(linewidth=0.8), label="Feed (user avg)",
     )
 
@@ -633,7 +656,7 @@ def _plot_group_prevalence(
             xy=(ax_x, fv), xytext=(ax_x, lv),
             arrowprops=dict(
                 arrowstyle="->,head_width=0.25,head_length=0.15",
-                color="#D65F5F", lw=1.5,
+                color=PREV_ARROW_COLOR, lw=1.5,
                 shrinkA=0, shrinkB=0,
             ),
         )
@@ -644,7 +667,7 @@ def _plot_group_prevalence(
         ax.text(
             ax_x + annotation_pad, mid_y,
             f"{r['raw_shift']:+.4f}\nd={r['cohen_d_amp']:+.2f}{stars}",
-            fontsize=5, va="center", ha="left", color="#333333",
+            fontsize=5, va="center", ha="left", color=PREV_ANNOTATION_COLOR,
         )
 
     ax.axhline(0, color="black", linewidth=0.4)
@@ -665,7 +688,7 @@ def _plot_group_prevalence(
         bottom=BOTTOM / total_h, top=0.92, left=0.10, right=0.97,
     )
     actual_ylim = ax.get_ylim()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=360, bbox_inches="tight")
     plt.close(fig)
     return path, actual_ylim
 
@@ -759,17 +782,17 @@ def _plot_group_prevalence_detail(
 
     ax.bar(
         x + offsets[0], pool_vals, width=w, yerr=pool_cis,
-        color="#aaaaaa", alpha=0.85, capsize=3,
+        color=PREV_POOL_COLOR, alpha=0.85, capsize=3,
         error_kw=dict(linewidth=0.8), label="Pool",
     )
     ax.bar(
         x + offsets[1], liked_vals, width=w, yerr=liked_cis,
-        color="#4878CF", alpha=0.85, capsize=3,
+        color=PREV_LIKED_COLOR, alpha=0.85, capsize=3,
         error_kw=dict(linewidth=0.8), label="Liked (user avg)",
     )
     ax.bar(
         x + offsets[2], feed_vals, width=w, yerr=feed_cis,
-        color="#D65F5F", alpha=0.85, capsize=3,
+        color=PREV_FEED_COLOR, alpha=0.85, capsize=3,
         error_kw=dict(linewidth=0.8), label="Feed (user avg)",
     )
 
@@ -782,13 +805,13 @@ def _plot_group_prevalence_detail(
 
     ax.errorbar(
         x + offsets[1] - dodge, lo_vals, yerr=lo_cis,
-        fmt="o", color="#6baed6", markersize=4, capsize=2, capthick=0.7,
-        linewidth=0.7, zorder=5, label="Liked lo-vol",
+        fmt="o", color=PREV_LIKED_LO_VOL_COLOR, markersize=4, capsize=2,
+        capthick=0.7, linewidth=0.7, zorder=5, label="Liked lo-vol",
     )
     ax.errorbar(
         x + offsets[1] + dodge, hi_vals_pts, yerr=hi_cis,
-        fmt="o", color="#08519c", markersize=4, capsize=2, capthick=0.7,
-        linewidth=0.7, zorder=5,
+        fmt="o", color=PREV_LIKED_HI_VOL_COLOR, markersize=4, capsize=2,
+        capthick=0.7, linewidth=0.7, zorder=5,
         label=f"Liked hi-vol (top {pct_hi_str}%)",
     )
 
@@ -802,7 +825,7 @@ def _plot_group_prevalence_detail(
             xy=(ax_x, fv), xytext=(ax_x, lv),
             arrowprops=dict(
                 arrowstyle="->,head_width=0.25,head_length=0.15",
-                color="#D65F5F", lw=1.5,
+                color=PREV_ARROW_COLOR, lw=1.5,
                 shrinkA=0, shrinkB=0,
             ),
         )
@@ -813,7 +836,7 @@ def _plot_group_prevalence_detail(
         ax.text(
             ax_x + annotation_pad, mid_y,
             f"{r['raw_shift']:+.4f}\nd={r['cohen_d_amp']:+.2f}{stars}",
-            fontsize=5, va="center", ha="left", color="#333333",
+            fontsize=5, va="center", ha="left", color=PREV_ANNOTATION_COLOR,
         )
 
     ax.axhline(0, color="black", linewidth=0.4)
@@ -834,7 +857,7 @@ def _plot_group_prevalence_detail(
         bottom=BOTTOM / total_h, top=0.92, left=0.10, right=0.97,
     )
     actual_ylim = ax.get_ylim()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=360, bbox_inches="tight")
     plt.close(fig)
     return path, actual_ylim
 
@@ -844,14 +867,14 @@ def _save_prevalence_legends(pct_hi_str: str, out_dir: Path) -> List[str]:
     paths: List[str] = []
 
     arrow_proxy = plt.Line2D(
-        [0, 0], [0, 1], color="#D65F5F", lw=1.5,
+        [0, 0], [0, 1], color=PREV_ARROW_COLOR, lw=1.5,
         marker="^", markersize=6, markevery=[1],
     )
 
     base_handles = [
-        plt.Rectangle((0, 0), 1, 1, fc="#aaaaaa", alpha=0.85),
-        plt.Rectangle((0, 0), 1, 1, fc="#4878CF", alpha=0.85),
-        plt.Rectangle((0, 0), 1, 1, fc="#D65F5F", alpha=0.85),
+        plt.Rectangle((0, 0), 1, 1, fc=PREV_POOL_COLOR, alpha=0.85),
+        plt.Rectangle((0, 0), 1, 1, fc=PREV_LIKED_COLOR, alpha=0.85),
+        plt.Rectangle((0, 0), 1, 1, fc=PREV_FEED_COLOR, alpha=0.85),
         arrow_proxy,
     ]
     base_labels = [
@@ -866,12 +889,12 @@ def _save_prevalence_legends(pct_hi_str: str, out_dir: Path) -> List[str]:
             [
                 plt.Line2D(
                     [0], [0], marker="o", color="w",
-                    markerfacecolor="#6baed6", markersize=7,
+                    markerfacecolor=PREV_LIKED_LO_VOL_COLOR, markersize=7,
                     label="Liked lo-vol",
                 ),
                 plt.Line2D(
                     [0], [0], marker="o", color="w",
-                    markerfacecolor="#08519c", markersize=7,
+                    markerfacecolor=PREV_LIKED_HI_VOL_COLOR, markersize=7,
                     label=f"Liked hi-vol (top {pct_hi_str}%)",
                 ),
             ],
@@ -893,7 +916,7 @@ def _save_prevalence_legends(pct_hi_str: str, out_dir: Path) -> List[str]:
             fig_leg.dpi_scale_trans.inverted(),
         )
         p = out_dir / f"synthetic_feed_{suffix}_legend.png"
-        fig_leg.savefig(p, dpi=150, bbox_inches=bbox)
+        fig_leg.savefig(p, dpi=300, bbox_inches=bbox)
         plt.close(fig_leg)
         paths.append(str(p))
 
@@ -1334,6 +1357,22 @@ class SyntheticFeedModule(EvalModule):
                 if gname in _SUBSET_TRAITS:
                     sub_name, sub_keep = _SUBSET_TRAITS[gname]
                     sub_gt = {k: v for k, v in gt.items() if k in sub_keep}
+                    if sub_gt:
+                        sub_detail, sub_ylim = _plot_group_prevalence_detail(
+                            sub_name, sub_gt, is_high, pct_hi_str, out_dir,
+                        )
+                        sub_prev, _ = _plot_group_prevalence(
+                            sub_name, sub_gt, out_dir, ylim=sub_ylim,
+                        )
+                        plot_paths.append(str(sub_prev))
+                        plot_paths.append(str(sub_detail))
+
+                if gname in _TOP_N_SUBSETS:
+                    sub_name, top_n = _TOP_N_SUBSETS[gname]
+                    top_keys = sorted(
+                        gt.keys(), key=lambda t: gt[t].pool_mean, reverse=True
+                    )[:top_n]
+                    sub_gt = {k: gt[k] for k in top_keys}
                     if sub_gt:
                         sub_detail, sub_ylim = _plot_group_prevalence_detail(
                             sub_name, sub_gt, is_high, pct_hi_str, out_dir,

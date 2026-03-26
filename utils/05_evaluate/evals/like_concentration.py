@@ -76,7 +76,7 @@ def _plot_lorenz(
     plt.tight_layout()
 
     path = out_dir / "lorenz_likes.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -116,7 +116,7 @@ def _plot_distribution(
     plt.tight_layout()
 
     path = out_dir / "likes_distribution.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 

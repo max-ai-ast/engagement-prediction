@@ -533,7 +533,7 @@ def _plot_scatter(
     plt.tight_layout()
 
     path = out_dir / f"amplification_scatter{suffix}.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -595,7 +595,7 @@ def _plot_group_bars(
     plt.tight_layout()
 
     path = out_dir / f"{group_name}{suffix}_amplification.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -674,7 +674,7 @@ def _plot_per_trait_scatter(
     plt.tight_layout()
 
     path = out_dir / f"{group_name}_per_user_scatter.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 

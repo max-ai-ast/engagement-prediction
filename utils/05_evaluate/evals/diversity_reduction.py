@@ -216,7 +216,7 @@ def _plot_entropy_histogram(
     plt.tight_layout()
 
     path = out_dir / f"{group_name}_entropy.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -258,7 +258,7 @@ def _plot_category_shift(
     plt.tight_layout()
 
     path = out_dir / f"{group_name}_category_shift.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -303,7 +303,7 @@ def _plot_summary_bars(
     plt.tight_layout()
 
     path = out_dir / "diversity_summary_bars.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 

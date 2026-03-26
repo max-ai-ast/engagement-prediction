@@ -232,7 +232,7 @@ def _plot_group_ecological(
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     path = out_dir / f"{group_name}_ecological.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -294,7 +294,7 @@ def _plot_group_diff(
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     path = out_dir / f"{group_name}_ecological_diff.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -366,7 +366,7 @@ def _plot_group_p90(
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     path = out_dir / f"{group_name}_ecological_p90.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -438,7 +438,7 @@ def _plot_group_p90_diff(
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     path = out_dir / f"{group_name}_ecological_p90_diff.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -547,7 +547,7 @@ def _plot_group_split_points(
         fig, ax = plt.subplots(figsize=scaled_figsize(4, 3))
         ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes,
                 ha="center", va="center", fontsize=9, color="#999999")
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=300)
         plt.close(fig)
         return path
 
@@ -616,7 +616,7 @@ def _plot_group_split_points(
     plt.tight_layout()
 
     path = out_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -659,7 +659,7 @@ def _plot_gap_summary(
     plt.tight_layout()
 
     path = out_dir / "ecological_gap_summary.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 

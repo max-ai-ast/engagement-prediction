@@ -129,7 +129,7 @@ def _plot_scatter(
     plt.tight_layout()
 
     path = out_dir / f"mainstreamness_vs_{metric_name}.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -168,7 +168,7 @@ def _plot_quintile_bars(
     plt.tight_layout()
 
     path = out_dir / "performance_by_mainstreamness_quintile.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
