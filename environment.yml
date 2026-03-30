@@ -29,6 +29,11 @@ dependencies:
   # HF / embeddings
   - sentence-transformers
 
+  # serving / inference service
+  - fastapi
+  - pydantic
+  - uvicorn
+
   # pytorch + cuda (conda)
   - pytorch
   - torchvision

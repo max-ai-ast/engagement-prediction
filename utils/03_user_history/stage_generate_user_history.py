@@ -27,7 +27,7 @@ import logging
 import polars as pl
 import time
 
-from utils.pipeline.core import select_prior_output, Context
+from utils.pipeline.core import Context
 from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
 from utils.memory_helpers import MemoryTracker
 
@@ -299,7 +299,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     Creates a parquet file mapping each target row to a list of prior liked
     post embedding indices for efficient on-the-fly lookup during training.
     """
-    run_dir = Path(context.run_dir).resolve()
     out_dir = context.new_stage_dir('03_user_history')
 
     # Initialize logger and memory tracker
@@ -311,25 +310,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # === Locate prior stage outputs ===
 
     # 1. Likes from get_data stage
-    prior_get_data = select_prior_output(
-        run_dir, '01_get_data',
-        use_latest=context.use_latest,
+    prior_get_data = context.resolve_prior_output(
+        '01_get_data',
         prior_path=context.prior_outputs.get('01_get_data'),
     )
-    if prior_get_data is None:
-        raise FileNotFoundError("Could not find 01_get_data output")
 
     # 2. Target posts from 02_target_posts stage
-    prior_target_posts_dir = select_prior_output(
-        run_dir, '02_target_posts',
-        use_latest=context.use_latest,
+    prior_target_posts_dir = context.resolve_prior_output(
+        '02_target_posts',
         prior_path=context.prior_outputs.get('02_target_posts'),
     )
-    if prior_target_posts_dir is None:
-        raise FileNotFoundError(
-            "Could not find 02_target_posts output. "
-            "Run the target_posts stage first, or use --pick-prior to select interactively."
-        )
     logger.info(f"Using likes from: {prior_get_data}")
     logger.info(f"Using target posts from: {prior_target_posts_dir}")
 

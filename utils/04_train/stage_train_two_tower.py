@@ -398,7 +398,7 @@ class TwoTowerModel(nn.Module):
             # (e.g., mean/EMA/linear-recency summary). The model treats the
             # history input as an already-encoded user embedding (placed at
             # position 0 in a padded sequence for a consistent forward() signature).
-            self.user_tower = SummarizedUserTower()
+            self.user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
@@ -553,18 +553,20 @@ class TwoTowerModel(nn.Module):
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device) # [B, embed_dim*2]
-            history_embeddings = features[:, :embed_dim].unsqueeze(1)  # [B, 1, D] (summary token at position 0)
-            post_embeddings = features[:, embed_dim:]
-            history_mask = torch.ones(
-                (history_embeddings.shape[0], history_embeddings.shape[1]),
-                dtype=torch.bool,
-                device=device,
-            )
+            user_summary = features[:, :embed_dim] # [B, embed_dim]
+            history_embeddings = user_summary.unsqueeze(1)  # [B, 1, embed_dim] (summary token at position 0)
+            post_embeddings = features[:, embed_dim:] # [B, embed_dim]
+            # Cold-start handling: empty histories have an all-zero summary sentinel.
+            # Use the mask to indicate whether the summary came from at least one
+            # history item so the summarized user tower can inject a learnable
+            # cold-start embedding.
+            has_history = user_summary.abs().sum(dim=1) > 0 # [B]
+            history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
             assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
-            history_embeddings = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            post_embeddings = batch["target_post_embedding"].to(device)
+            history_embeddings = batch["history_embeddings"].to(device) # [B, seq_len, embed_dim]
+            history_mask = batch["history_mask"].to(device) # [B, seq_len]
+            post_embeddings = batch["target_post_embedding"].to(device) # [B, embed_dim]
         labels = batch["label"].to(device)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
@@ -770,7 +772,6 @@ def _evaluate_two_tower_model(
 
 def run(context: Context, args) -> Dict[str, Any]:
     """Pipeline entry point for two-tower training."""
-    run_dir = Path(context.run_dir).resolve()
     device = get_device(args.device)
     timestamp = context.run_timestamp
 
@@ -795,7 +796,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
     embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
-        run_dir, context, logger=logger,
+        context, logger=logger,
     )
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---
@@ -950,7 +951,10 @@ def run(context: Context, args) -> Dict[str, Any]:
     if training_results is not None:
         best_val_auc = training_results["best_val_auc"]
     else:
+        best_train_auc = roc_auc_score(train_eval["predictions"]["y_true"], train_eval["predictions"]["y_pred"])
         best_val_auc = roc_auc_score(val_eval["predictions"]["y_true"], val_eval["predictions"]["y_pred"])
+        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=float(best_train_auc), iteration=0)
+        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=float(best_val_auc), iteration=0)
 
     if generate_plots:
         try:
@@ -1015,12 +1019,14 @@ def run(context: Context, args) -> Dict[str, Any]:
         torchscript_user_name = "engagement_user_tower"
         torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
         torch.jit.script(trained_model.user_tower.cpu()).save(torchscript_user_path)
-        context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        user_model_id = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        logger.info(f"User tower model id: {user_model_id}")
 
         torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
         torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
-        context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        logger.info(f"Post tower model id: {post_model_id}")
 
     # --- save predictions ---
     predictions_dir = out_dir / "predictions"

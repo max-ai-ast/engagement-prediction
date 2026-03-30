@@ -151,7 +151,7 @@ class MLPModel(nn.Module):
                 raise ValueError(
                     f"user_encoder_type='summarized' requires user_output_dim ({user_output_dim}) == post_embedding_dim ({post_embedding_dim})"
                 )
-            self.user_encoder = SummarizedUserTower()
+            self.user_encoder = SummarizedUserTower(embed_dim=post_embedding_dim)
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}' for MLPModel. "
@@ -195,18 +195,18 @@ class MLPModel(nn.Module):
     def compute_loss_and_preds(self, batch: Dict[str, Any], device: str):
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device)  # [B, 2*D]
-            user_summary = features[:, : self.post_embedding_dim]
-            post_embedding = features[:, self.post_embedding_dim :]
+            user_summary = features[:, : self.post_embedding_dim] # [B, D]
+            post_embedding = features[:, self.post_embedding_dim :] # [B, D]
             history_embeddings = user_summary.unsqueeze(1)  # [B, 1, D]
-            history_mask = torch.ones(
-                (history_embeddings.shape[0], history_embeddings.shape[1]),
-                dtype=torch.bool,
-                device=device,
-            )
+            # Cold-start handling: for truly empty histories, the summary vector is
+            # an all-zero sentinel. Use the mask to indicate "has history" so the
+            # summarized user tower can swap in a learnable cold-start embedding.
+            has_history = user_summary.abs().sum(dim=1) > 0 # [B]
+            history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
         else:
-            history_embeddings = batch["history_embeddings"].to(device)
-            history_mask = batch["history_mask"].to(device)
-            post_embedding = batch["target_post_embedding"].to(device)
+            history_embeddings = batch["history_embeddings"].to(device) # [B, seq_len, embed_dim]
+            history_mask = batch["history_mask"].to(device) # [B, seq_len]
+            post_embedding = batch["target_post_embedding"].to(device) # [B, embed_dim]
 
         labels = batch["label"].to(device)
         preds = self(history_embeddings, history_mask, post_embedding).squeeze(-1)
@@ -331,7 +331,6 @@ def train_mlp_model(
 # =============================================================================
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
-    run_dir = Path(context.run_dir).resolve()
     device = get_device(args.device)
     timestamp = context.run_timestamp
 
@@ -356,7 +355,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
     embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
-        run_dir, context, logger=logger,
+        context, logger=logger,
     )
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---
@@ -613,7 +612,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         torchscript_name = f"engagement_mlp"
         torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
         torch.jit.script(trained_model).save(torchscript_path)
-        context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
+        mlp_model_id = context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
+        logger.info(f"MLP model id: {mlp_model_id}")
 
     # --- save predictions ---
     predictions_dir = out_dir / "predictions"

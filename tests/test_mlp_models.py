@@ -149,6 +149,76 @@ def test_summarized_mlp_compute_loss_and_preds():
     assert (preds >= 0).all() and (preds <= 1).all()
 
 
+def test_summarized_mlp_compute_loss_and_preds_empty_history_uses_empty_embedding():
+    """Empty-history summarized batches should route through the cold-start embedding."""
+    torch.manual_seed(0)
+    embed_dim = 16
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[],
+        dropout_rate=0.0,
+        user_hidden_dim=32,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=10,
+        attention_dropout=0.0,
+        user_encoder_type="summarized",
+    )
+    model.eval()
+
+    batch_size = 8
+    user_summary = torch.zeros(batch_size, embed_dim)
+    post_embedding = torch.randn(batch_size, embed_dim)
+    features = torch.cat([user_summary, post_embedding], dim=1)
+    batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
+
+    with torch.no_grad():
+        model.user_encoder.empty_user_embedding.fill_(0.1)
+    _, preds1 = model.compute_loss_and_preds(batch, device="cpu")
+
+    with torch.no_grad():
+        model.user_encoder.empty_user_embedding.fill_(0.2)
+    _, preds2 = model.compute_loss_and_preds(batch, device="cpu")
+
+    assert not torch.allclose(preds1, preds2), "Predictions should depend on the cold-start embedding for empty histories"
+
+
+def test_summarized_mlp_compute_loss_and_preds_non_empty_history_ignores_empty_embedding():
+    """Non-empty summarized batches should ignore the cold-start embedding."""
+    torch.manual_seed(0)
+    embed_dim = 16
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[],
+        dropout_rate=0.0,
+        user_hidden_dim=32,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=10,
+        attention_dropout=0.0,
+        user_encoder_type="summarized",
+    )
+    model.eval()
+
+    batch_size = 8
+    user_summary = torch.ones(batch_size, embed_dim)
+    post_embedding = torch.randn(batch_size, embed_dim)
+    features = torch.cat([user_summary, post_embedding], dim=1)
+    batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
+
+    with torch.no_grad():
+        model.user_encoder.empty_user_embedding.fill_(0.1)
+    _, preds1 = model.compute_loss_and_preds(batch, device="cpu")
+
+    with torch.no_grad():
+        model.user_encoder.empty_user_embedding.fill_(0.2)
+    _, preds2 = model.compute_loss_and_preds(batch, device="cpu")
+
+    assert torch.allclose(preds1, preds2), "Predictions should not depend on the cold-start embedding when history exists"
+
+
 def test_summarized_mlp_backward_pass():
     """Test summarized MLPModel gradients flow correctly."""
     embed_dim = 128
@@ -507,6 +577,10 @@ def test_attention_mlp_backward_pass():
     
     # Check gradients exist in both encoder and MLP
     for name, param in model.named_parameters():
+        # `empty_history_embedding` is only used when an example has an empty history
+        # (all-masked). For fully non-empty batches, it's expected to have no grad.
+        if "empty_history_embedding" in name:
+            continue
         assert param.grad is not None, f"Parameter {name} should have gradient"
 
 

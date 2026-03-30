@@ -16,19 +16,33 @@ Usage examples:
 import argparse
 import os
 import sys
+import subprocess
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import json
 import copy
 
-from utils.experiment_tracking import build_experiment_tracker, normalize_params
-from utils.pipeline.core import Context, generate_run_timestamp
+from utils.pipeline import registry as reg
+from utils.experiment_tracking import build_experiment_tracker
+from utils.pipeline.core import (
+    Context,
+    generate_run_timestamp,
+    DEFAULT_ARTIFACTS_DIR,
+    DEFAULT_RUNS_DIR,
+    LINEAGE_FILENAME,
+    new_pipeline_run_dir,
+    ensure_pipeline_run_dir,
+    update_latest_symlink,
+)
 
 
 # Avoid heavy imports at module import time; import lazily inside handlers
 
 CLI_FILE_DIR = Path(__file__).parent
-DEFAULT_OUTPUTS_DIR = CLI_FILE_DIR / "outputs"
+
+TRAIN_PLACEHOLDER = 'train_placeholder'
+STAGE_ORDER = ['get_data', 'target_posts', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -49,7 +63,7 @@ DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
     "debug": False,
     "random_seed": 42,
-    "embedding_model": "all_MiniLM_L6_v2",
+    "embedding_model": "all_MiniLM_L12_v2",
     "skip_embeddings": False,
     # Stage 2 Target posts and Split
     "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
@@ -116,6 +130,12 @@ DEFAULTS: Dict[str, Any] = {
     "start_from": None,
     "stop_after": None,
     "pick_prior": False,
+    # Prior pins (optional): may be a stage_run_id (dir name under artifacts/<stage>/)
+    # or a path (absolute, or relative to --output-dir).
+    "prior_01_get_data": None,
+    "prior_02_target_posts": None,
+    "prior_03_user_history": None,
+    "prior_04_train": None,
     # Execution behavior
     # Default is foreground execution (recommended for ClearML remote execution).
     "background": False,
@@ -214,7 +234,7 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _build_effective_config_for_background_run(
-    args: argparse.Namespace, *, run_dir: Path, initial_log: Path
+    args: argparse.Namespace, *, output_root: Path, initial_log: Path
 ) -> Dict[str, Any]:
     """Materialize an effective config to re-invoke run-all in the background.
 
@@ -223,7 +243,7 @@ def _build_effective_config_for_background_run(
     (e.g. `use_post_encoder` is controlled via `--post-encoder/--no-post-encoder`).
     """
     cfg: Dict[str, Any] = {k: getattr(args, k) for k in DEFAULTS.keys()}
-    cfg["output_dir"] = str(run_dir.resolve())
+    cfg["output_dir"] = str(Path(output_root).resolve())
     cfg["_initial_log"] = str(initial_log)
     # Prevent recursive backgrounding: the child process should run in the foreground.
     cfg["background"] = False
@@ -245,12 +265,24 @@ def _generate_run_name(args: argparse.Namespace) -> str:
             else:
                 stages_str += args.stop_after
 
-    stages_str += f"_{args.model_type}"
+    # Add the model type if the training stage is included
+    model_type = args.model_type
+    train_key = _get_train_key(model_type)
+    stage_order = _get_stage_order_for_model_type(train_key)
+    _, _, includes_train = _get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key
+    )
+    if includes_train:
+        stages_str += f"_{model_type}"
+
     return stages_str
 
 
 def _resolve_run_dir(args: argparse.Namespace, run_timestamp: str) -> Path:
-    """Resolve the effective run directory as an absolute path.
+    """Resolve the output root directory as an absolute path.
 
     ClearML remote execution may run with a different working directory than local runs.
     If `--output-dir` is provided as a relative path, interpret it relative to the repo root
@@ -262,8 +294,53 @@ def _resolve_run_dir(args: argparse.Namespace, run_timestamp: str) -> Path:
         if not p.is_absolute():
             p = (CLI_FILE_DIR / p)
         return p.resolve()
-    # Default: write directly under ./outputs (no per-run subdirectory).
-    return (Path(DEFAULT_OUTPUTS_DIR) / run_timestamp).resolve()
+    return (CLI_FILE_DIR / "outputs").resolve()
+
+
+def _resolve_pipeline_run_dir(args: argparse.Namespace, *, output_root: Path, run_timestamp: str) -> Path:
+    runs_dir = (Path(output_root) / "runs").resolve()
+    pinned = (os.environ.get("ENGAGEMENT_PIPELINE_RUN_ID") or "").strip()
+    if pinned:
+        return ensure_pipeline_run_dir(runs_dir, pipeline_run_id=pinned).resolve()
+    run_name = _generate_run_name(args)
+    base_name = f"{run_timestamp}_{run_name}"
+    return new_pipeline_run_dir(runs_dir, base_name=base_name).resolve()
+
+
+def _resolve_prior_spec(
+    spec: Optional[str],
+    *,
+    output_root: Path,
+    artifacts_dir: Path,
+    stage_folder: str,
+) -> Optional[Path]:
+    """Resolve a prior pin to a concrete artifact directory path.
+
+    `spec` may be:
+      - an absolute path
+      - a path relative to output_root
+      - a stage_run_id (directory name under artifacts/<stage_folder>/)
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip()
+    if not s:
+        return None
+
+    p = Path(s).expanduser()
+    candidate = p if p.is_absolute() else (Path(output_root) / p)
+    if candidate.exists():
+        return candidate.resolve()
+
+    by_id = (Path(artifacts_dir) / stage_folder / s)
+    if by_id.exists():
+        return by_id.resolve()
+
+    raise FileNotFoundError(
+        f"Could not resolve prior spec for '{stage_folder}': {spec!r}. "
+        f"Expected an existing path (absolute or relative to {Path(output_root).resolve()}) "
+        f"or a stage_run_id under {Path(artifacts_dir).resolve() / stage_folder}."
+    )
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
@@ -271,58 +348,52 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     Creates a run directory up front and backgrounds itself with nohup if --background.
     """
-    # Get the specified output directory. If not provided, create an outputs/ directory in the same directory as this cli.py file.
-    output_dir = args.output_dir
-    if output_dir is None:
-        DEFAULT_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
-    # Create run_dir deterministically up front
-    run_dir = _resolve_run_dir(args, run_timestamp=run_timestamp)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Choose log path inside run_dir
-    if args._initial_log:
-        initial_log = Path(args._initial_log)
-    else:
-        # If we're writing directly into ./outputs, avoid collisions between runs.
-        initial_log = (run_dir / f"run-all_{run_timestamp}.log") if (not output_dir) else (run_dir / "run-all.log")
-    try:
-        initial_log.parent.mkdir(parents=True, exist_ok=True)
-        with open(initial_log, 'a') as f:
-            f.write(f"run-all started at {run_timestamp}\n")
-    except Exception:
-        pass
-
     if bool(args.background):
+        output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
+        output_root.mkdir(parents=True, exist_ok=True)
+        run_dir = _resolve_pipeline_run_dir(args, output_root=output_root, run_timestamp=run_timestamp)
+        update_latest_symlink(output_root / "runs", run_dir)
+
+        # Choose log path inside run_dir
+        if args._initial_log:
+            initial_log = Path(args._initial_log)
+        else:
+            initial_log = (run_dir / "run-all.log")
+        try:
+            initial_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(initial_log, 'a') as f:
+                f.write(f"run-all started at {run_timestamp}\n")
+        except Exception:
+            pass
+
         # Background via nohup by re-invoking run-all in the foreground (background disabled)
         # with a pinned --output-dir.
         import shlex
-        effective_config = _build_effective_config_for_background_run(
-            args, run_dir=run_dir, initial_log=initial_log
+        resolved_config = _build_effective_config_for_background_run(
+            args, output_root=output_root, initial_log=initial_log
         )
-        effective_config_path = (
-            run_dir / f"run-all_{run_timestamp}.effective-config.json"
-            if (not output_dir)
-            else (run_dir / "run-all.effective-config.json")
-        )
-        effective_config_path.write_text(json.dumps(effective_config, indent=2, sort_keys=True) + "\n")
-        cli_args = ["--config", str(effective_config_path)]
+        resolved_config_path = run_dir / "run-all.resolved-config.json"
+        resolved_config_path.write_text(json.dumps(resolved_config, indent=2, sort_keys=True) + "\n")
+        cli_args = ["--config", str(resolved_config_path)]
 
         py = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
         args_str = ' '.join(shlex.quote(a) for a in cli_args)
         redir = shlex.quote(str(initial_log))
-        env_prefix = f"ENGAGEMENT_RUN_TIMESTAMP={shlex.quote(run_timestamp)}"
+        env_prefix = (
+            f"ENGAGEMENT_RUN_TIMESTAMP={shlex.quote(run_timestamp)} "
+            f"ENGAGEMENT_PIPELINE_RUN_ID={shlex.quote(run_dir.name)}"
+        )
         cmd = f"{env_prefix} nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
         print(f"▶️  Backgrounding run-all with nohup. Log: {initial_log}")
         import subprocess as sp
         proc = sp.run(["bash", "-lc", cmd], stdout=sp.PIPE, stderr=sp.PIPE, text=True)
         if proc.returncode == 0:
             pid_str = (proc.stdout or "").strip().splitlines()[-1] if (proc.stdout or "").strip() else None
-            pid_file = (run_dir / f"run-all_{run_timestamp}.pid") if (not output_dir) else (run_dir / "run-all.pid")
+            pid_file = (run_dir / "run-all.pid")
             if pid_str and pid_str.isdigit():
                 try:
                     with open(pid_file, "w") as f:
@@ -357,33 +428,161 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
     args = tracker.connect_args(args, "Args")
-    # Re-resolve run_dir after ClearML connects args, since output_dir might have been overridden.
-    run_dir = _resolve_run_dir(args, run_timestamp=run_timestamp)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    # Ensure args.output_dir is set so subsequent stages use this run_dir (and so Context uses an absolute path).
-    setattr(args, 'output_dir', str(run_dir))
+
+    output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    # Resolve pipeline run dir after ClearML connects args, since output_dir might have been overridden.
+    run_dir = _resolve_pipeline_run_dir(args, output_root=output_root, run_timestamp=run_timestamp)
+    update_latest_symlink(output_root / "runs", run_dir)
+    tracker.log_params(params={
+            "run_dir": str(run_dir.resolve()),
+            "run_name": run_dir.name
+        },
+        name="Directories"
+    )
+
+    # Ensure args.output_dir is set (this is the output root).
+    setattr(args, 'output_dir', str(output_root))
+    setattr(args, "_argv", sys.argv[:])
+
+    # Pipeline run scaffolding
+    artifacts_dir = (output_root / "artifacts").resolve()
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("tmp", "metrics", "plots", "logs"):
+        (run_dir / name).mkdir(parents=True, exist_ok=True)
+
+    run_resolved_config_path = run_dir / "run-all.resolved-config.json"
+    args_dict = {k: v for k, v in vars(args).items() if k != "func" and not callable(v)}
+    run_resolved_config_path.write_text(json.dumps(args_dict, indent=2, sort_keys=True) + "\n")
+
+    lineage_path = run_dir / LINEAGE_FILENAME
+    if not lineage_path.exists():
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(CLI_FILE_DIR),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            git_sha = (proc.stdout or "").strip() if proc.returncode == 0 else None
+        except Exception:
+            git_sha = None
+        lineage_path.write_text(json.dumps({
+            "pipeline_run_id": run_dir.name,
+            "created_at": datetime.now().isoformat(),
+            "git_sha": git_sha,
+            "argv": sys.argv[:],
+            "stages": {},
+        }, indent=2, sort_keys=True) + "\n")
+
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, run_timestamp=run_timestamp, use_latest=True, tracker=tracker)
+    ctx = Context(
+        run_dir=run_dir,
+        artifacts_dir=artifacts_dir,
+        runs_dir=(output_root / "runs").resolve(),
+        pipeline_run_id=run_dir.name,
+        run_timestamp=run_timestamp,
+        use_latest=True,
+        tracker=tracker,
+    )
     return cmd__run_all_exec(args, ctx)
+
+
+def _get_train_key(model_type: str) -> str:
+    # Do not default to MLP if model name is not recognized - raise error instead
+    if model_type == 'mlp':
+        return 'train_mlp'
+    elif model_type == 'two-tower':
+        return 'train_two_tower'
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+
+def _get_stage_order_for_model_type(train_key: str) -> List[str]:
+    # replace the generic 'train_placeholder' with the actual train stage key based on train_key:
+    stage_order = copy.deepcopy(STAGE_ORDER)
+    return [train_key if s == TRAIN_PLACEHOLDER else s for s in stage_order]
+
+
+def _get_stage_folder(stage_order: List[str]) -> Dict[str, str]:
+    stage_folder = {}
+    for key in stage_order:
+        _mp, _folder = reg.get_stage_spec(key)
+        stage_folder[key] = _folder
+    return stage_folder
+
+
+def _get_stage_folder_and_start_stop_indices(
+    stage_order: List[str],
+    start_from: Optional[str],
+    stop_after: Optional[str],
+    train_key: str,
+) -> Tuple[int, int, bool]:
+    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
+    if start_from == 'train':
+        start_from = train_key
+    if stop_after == 'train':
+        stop_after = train_key
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
+    start_idx = stage_order.index(start_from) if start_from in stage_order else 0
+    stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
+
+    # Does this run include the training stage? Used for naming the run
+    train_idx = stage_order.index(train_key)
+    includes_train = False
+    if start_idx <= train_idx <= stop_idx:
+        includes_train = True
+
+    return start_idx, stop_idx, includes_train
 
 
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the modular pipeline stages in the foreground sequentially."""
-    # Build Context and invoke stages via registry
-    from utils.pipeline import registry as reg
+    run_dir = Path(ctx.run_dir).resolve()
+    artifacts_dir = Path(ctx.artifacts_dir).resolve()
+    output_root = Path(args.output_dir).resolve()
 
-    run_dir = Path(args.output_dir).resolve()
+    # Apply non-interactive prior pins (paths or stage_run_ids).
+    prior_01_get_data = _resolve_prior_spec(
+        args.prior_01_get_data,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="01_get_data",
+    )
+    prior_02_target_posts = _resolve_prior_spec(
+        args.prior_02_target_posts,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="02_target_posts",
+    )
+    prior_03_user_history = _resolve_prior_spec(
+        args.prior_03_user_history,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="03_user_history",
+    )
+    prior_04_train = _resolve_prior_spec(
+        args.prior_04_train,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="04_train",
+    )
+    if prior_01_get_data is not None:
+        ctx.prior_outputs["01_get_data"] = prior_01_get_data
+    if prior_02_target_posts is not None:
+        ctx.prior_outputs["02_target_posts"] = prior_02_target_posts
+    if prior_03_user_history is not None:
+        ctx.prior_outputs["03_user_history"] = prior_03_user_history
+    if prior_04_train is not None:
+        ctx.prior_outputs["04_train"] = prior_04_train
     
-    # Override train stage key if --model-type is specified
-    # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
-    train_key = 'train_mlp'  # default MLP
-    if model_type == 'mlp':
-        train_key = 'train_mlp'
-    elif model_type == 'two-tower':
-        train_key = 'train_two_tower'
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
 
     # --- Validation for --user-encoder ---
     user_encoder = args.user_encoder
@@ -398,32 +597,23 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             + f"Allowed values: {allowed}"
         )
     
-    stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
-    stage_folder = {}
-    for key in stage_order:
-        _mp, _folder = reg.get_stage_spec(key)
-        stage_folder[key] = _folder
-
-    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
-    start_from = args.start_from
-    if start_from == 'train':
-        start_from = train_key
-    stop_after = args.stop_after
-    if stop_after == 'train':
-        stop_after = train_key
-    if start_from and start_from not in stage_order:
-        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
-    if stop_after and stop_after not in stage_order:
-        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
-    start_idx = stage_order.index(start_from) if start_from in stage_order else 0
-    stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
+    # Override train stage key if --model-type is specified
+    train_key = _get_train_key(model_type)
+    stage_order = _get_stage_order_for_model_type(train_key)
+    stage_folder = _get_stage_folder(stage_order)
+    start_idx, stop_idx, _ = _get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key
+    )
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
         if not args.pick_prior:
             return
         folder = stage_folder[stage_key]
-        base = (run_dir / folder)
+        base = (artifacts_dir / folder)
         if not base.exists():
             return
         subdirs = [p for p in base.iterdir() if p.is_dir()]
@@ -664,6 +854,14 @@ def build_parser() -> argparse.ArgumentParser:
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
+    _add_arg_with_default(p_all, "--prior-01-get-data", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin prior Stage 1 (01_get_data) artifact dir by stage_run_id or path")
+    _add_arg_with_default(p_all, "--prior-02-target-posts", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin prior Stage 2 (02_target_posts) artifact dir by stage_run_id or path")
+    _add_arg_with_default(p_all, "--prior-03-user-history", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin prior Stage 3 (03_user_history) artifact dir by stage_run_id or path")
+    _add_arg_with_default(p_all, "--prior-04-train", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin prior Stage 4 (04_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior
     _add_arg_with_default(p_all, "--background", action="store_true", default=argparse.SUPPRESS,
                           help_text="Run in background with nohup (default: foreground)")

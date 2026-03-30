@@ -17,7 +17,7 @@ Inputs (from prior pipeline stages):
 - history_posts_*.parquet from 03_user_history
 - predictions/holdout_<type>.parquet from 04_train  (e.g. holdout_unseen_users.parquet)
 
-Outputs under <train_dir>/evals/<timestamp>/
+Outputs under artifacts/05_evaluate/<stage_run_id>/
 - eval_summary.json: Combined results from all modules
 - stage_info.txt: Stage metadata
 - <module_name>/: Subdirectory for each evaluation module's artifacts
@@ -34,7 +34,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 import polars as pl
 
-from utils.pipeline.core import select_prior_output, Context
+from utils.pipeline.core import Context
 from utils.helpers import get_stage_logger, log_operation_start
 from utils.dataloaders import filter_split_and_join_history, load_training_data
 
@@ -80,7 +80,6 @@ STAGE_LOG_NAME = 'STAGE_05_EVALUATE'
 # ---------------------------------------------------------------------------
 
 def resolve_train_output(
-    run_dir: Path,
     context: Context,
 ) -> Path:
     """
@@ -100,17 +99,7 @@ def resolve_train_output(
         if art_dir is not None and Path(art_dir).exists():
             return Path(art_dir)
 
-    train_dir = select_prior_output(
-        run_dir, '04_train',
-        use_latest=context.use_latest,
-        prior_path=context.prior_outputs.get('04_train'),
-    )
-    if train_dir is None:
-        raise FileNotFoundError(
-            "Could not find training output (04_train). "
-            "Please ensure Stage 4 (train) has completed."
-        )
-    return train_dir
+    return context.resolve_prior_output("04_train", prior_path=context.prior_outputs.get("04_train"))
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +275,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     Loads holdout predictions from the training stage and runs all evaluation
     modules.
     """
-    run_dir = Path(context.run_dir).resolve()
     t0 = time.time()
 
     # --- hyperparams ---
@@ -297,16 +285,12 @@ def run(context: Context, args) -> Dict[str, Any]:
     if skip_modules and isinstance(skip_modules, str):
         skip_modules = [m.strip() for m in skip_modules.split(',')]
 
-    # Resolve training output first so we can nest eval outputs inside it
-    train_dir = resolve_train_output(run_dir, context)
+    # Resolve training output (inputs)
+    train_dir = resolve_train_output(context)
     predictions_dir = train_dir / 'predictions'
 
-    # Create output directory inside the training directory
-    evals_base = train_dir / 'evals'
-    evals_base.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = evals_base / ts
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Canonical stage output
+    out_dir = context.new_stage_dir("05_evaluate", tag=eval_holdout_type)
 
     # Initialize logger
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / 'stage.log')
@@ -317,7 +301,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
     _, target_posts_df, history_df, embed_dim = load_training_data(
-        run_dir, context, logger=logger,
+        context, logger=logger,
     )
 
     holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
