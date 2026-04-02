@@ -11,46 +11,21 @@
 #
 # Usage (survives SSH disconnect):
 #   tmux new-session -d -s training-sweep './run_training_sweep.sh'
-#   tmux new-session -d -s training-sweep './run_training_sweep.sh --use-fit'
 #   tmux attach -t training-sweep   # to watch live
 #   # Ctrl-B D to detach; reconnect later with tmux attach -t training-sweep
 #
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-Usage: ./run_training_sweep.sh [--use-fit]
-
-Options:
-  --use-fit  Add FIT-enabled two-tower train/eval runs to the standard sweep.
-  -h, --help Show this help text.
-EOF
-}
-
-INCLUDE_FIT_SWEEP="false"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --use-fit)
-      INCLUDE_FIT_SWEEP="true"
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
-
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260305_224327"
+OUTPUT_DIR="outputs"
+
+# Prior artifact stage_run_ids from outputs/runs/20260326_193148_all_mlp
+PRIOR_01_GET_DATA="20260326_193156_a1ae97da"
+PRIOR_02_TARGET_POSTS="20260326_225118_20c7e58f"
+PRIOR_03_USER_HISTORY="20260326_225143_08cdab73"
 
 EPOCHS=300
-BATCH_SIZE=2048
+BATCH_SIZE=256
 PATIENCE=50
 EMA_ALPHA=0.1    # only used when user-summarization=ema
 MAX_PARALLEL=4   # max concurrent MLP jobs
@@ -68,23 +43,16 @@ MLP_EXPERIMENTS=(
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
 TT_EXPERIMENTS=(
-  "full_transformer::nofit"
-  "cross_attention::nofit"
+  "full_transformer:"
+  "cross_attention:"
 )
-
-if [[ "$INCLUDE_FIT_SWEEP" == "true" ]]; then
-  TT_EXPERIMENTS+=(
-    "full_transformer::fit"
-    "cross_attention::fit"
-  )
-fi
 
 # ── Resolve paths ──────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-DATA_DIR_ABS="$(cd "$DATA_DIR" && pwd)"
-LOG_DIR="$DATA_DIR_ABS/sweep_logs"
+OUTPUT_DIR_ABS="$(cd "$OUTPUT_DIR" && pwd)"
+LOG_DIR="$OUTPUT_DIR_ABS/sweep_logs"
 mkdir -p "$LOG_DIR"
 
 SWEEP_LOG="$LOG_DIR/sweep_$(date +%Y%m%d_%H%M%S).log"
@@ -96,27 +64,30 @@ log "═════════════════════════
 log "Training sweep: $TOTAL experiments"
 log "  MLP:       ${#MLP_EXPERIMENTS[@]} (parallel, up to $MAX_PARALLEL at a time)"
 log "  Two-tower: ${#TT_EXPERIMENTS[@]} (sequential)"
-log "Data dir: $DATA_DIR_ABS"
+log "Output dir: $OUTPUT_DIR_ABS"
+log "Priors: 01=$PRIOR_01_GET_DATA  02=$PRIOR_02_TARGET_POSTS  03=$PRIOR_03_USER_HISTORY"
 log "Epochs=$EPOCHS  Batch=$BATCH_SIZE  Patience=$PATIENCE  EMA_alpha=$EMA_ALPHA"
 log "════════════════════════════════════════════════════════════════"
 
 # ── Helper: launch one experiment ──────────────────────────────────────
 # Writes exit code to a status file so we can collect results later.
-# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  USE_FIT  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
+# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
 run_one() {
   local MODEL_TYPE="$1"
   local USER_ENCODER="$2"
   local USER_SUMM="$3"
-  local USE_FIT="$4"
-  local RUN_TAG="$5"
-  local RUN_LABEL="$6"
-  local RUN_LOG="$7"
-  local STATUS_FILE="$8"
+  local RUN_TAG="$4"
+  local RUN_LABEL="$5"
+  local RUN_LOG="$6"
+  local STATUS_FILE="$7"
 
   local CMD=(
     python3 cli.py
-    --output-dir "$DATA_DIR_ABS"
+    --output-dir "$OUTPUT_DIR_ABS"
     --start-from train --stop-after evaluate
+    --prior-01-get-data "$PRIOR_01_GET_DATA"
+    --prior-02-target-posts "$PRIOR_02_TARGET_POSTS"
+    --prior-03-user-history "$PRIOR_03_USER_HISTORY"
     --model-type "$MODEL_TYPE"
     --user-encoder "$USER_ENCODER"
     --run-tag "$RUN_TAG"
@@ -131,10 +102,6 @@ run_one() {
     if [[ "$USER_SUMM" == "ema" ]]; then
       CMD+=(--ema-alpha "$EMA_ALPHA")
     fi
-  fi
-
-  if [[ "$USE_FIT" == "true" ]]; then
-    CMD+=(--use-fit)
   fi
 
   log "[$RUN_LABEL] Launching: ${CMD[*]}"
@@ -190,7 +157,7 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
     done
   done
 
-  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "false" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
+  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
   MLP_PIDS+=($!)
   MLP_STATUS_FILES+=("$STATUS_FILE")
   MLP_LABELS+=("$RUN_LABEL")
@@ -228,17 +195,9 @@ log "╚════════════════════════
 for i in "${!TT_EXPERIMENTS[@]}"; do
   SPEC="${TT_EXPERIMENTS[$i]}"
   USER_ENCODER="${SPEC%%:*}"
-  REST="${SPEC#*:}"
-  USER_SUMM="${REST%%:*}"
-  FIT_MODE="${REST#*:}"
+  USER_SUMM="${SPEC#*:}"
   RUN_NUM=$((i + 1))
-  USE_FIT="false"
-  if [[ "$FIT_MODE" == "fit" ]]; then
-    USE_FIT="true"
-    RUN_TAG="two-tower_${USER_ENCODER}_fit"
-  else
-    RUN_TAG="two-tower_${USER_ENCODER}"
-  fi
+  RUN_TAG="two-tower_${USER_ENCODER}"
   RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  ${RUN_TAG}"
   RUN_LOG="$LOG_DIR/run_${RUN_TAG}.log"
   STATUS_FILE="$LOG_DIR/.status_${RUN_TAG}"
@@ -248,7 +207,7 @@ for i in "${!TT_EXPERIMENTS[@]}"; do
   log "[$RUN_LABEL] Starting…"
   log "────────────────────────────────────────────────────────────────"
 
-  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$USE_FIT" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
+  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
 
   if [[ -f "$STATUS_FILE" ]] && [[ "$(cat "$STATUS_FILE")" == "0" ]]; then
     (( PASSED++ )) || true
