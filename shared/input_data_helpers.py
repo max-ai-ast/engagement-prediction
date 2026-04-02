@@ -1,10 +1,30 @@
 from __future__ import annotations
 
-from typing import Any, Tuple, Dict, List, Optional, Union
-import numpy as np
 import base64
+import hashlib
 import struct
+from typing import Any, Tuple, Dict, List, Optional, Union
 import zlib
+
+import numpy as np
+
+# ----------------------------------------
+# String hashing helpers
+# ----------------------------------------
+
+def get_hashed_value_from_string(value: str, variant: int) -> int:
+    """
+    Deterministically hash a string into a 64-bit unsigned integer.
+
+    ``variant`` provides domain separation so callers can derive multiple
+    stable hashes from the same input string.
+    """
+    if variant < 0:
+        raise ValueError("variant must be non-negative")
+
+    digest = hashlib.sha256(f"{variant}:{value}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
 
 # ----------------------------------------
 # Embeddings helpers
