@@ -1198,19 +1198,6 @@ class SummarizedEngagementDataset(Dataset):
         self._neg_post_embs = torch.from_numpy(neg_embs)
 
         if logger:
-            def _tensor_nbytes(t: torch.Tensor) -> int:
-                return int(t.nelement() * t.element_size())
-
-            user_gib = _tensor_nbytes(self._user_summaries) / (1024 ** 3)
-            pos_gib = _tensor_nbytes(self._pos_post_embs) / (1024 ** 3)
-            neg_gib = _tensor_nbytes(self._neg_post_embs) / (1024 ** 3)
-            total_gib = user_gib + pos_gib + neg_gib
-            logger.info(
-                "  Cached tensors (GiB): "
-                f"user_summaries={user_gib:.3f}, pos_post_embs={pos_gib:.3f}, "
-                f"neg_post_embs={neg_gib:.3f} (total={total_gib:.3f})"
-            )
-
             mem_mb = (user_summaries.nbytes + pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
             logger.info(
                 f"  SummarizedEngagementDataset('{split}'): "
