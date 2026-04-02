@@ -89,7 +89,7 @@ DEFAULTS: Dict[str, Any] = {
     "num_attention_layers": 2,
     "max_history_len": 20,
     "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
-    "similarity_temperature": 1.0,
+    "similarity_temperature": 0.2,
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
