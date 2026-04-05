@@ -14,8 +14,13 @@ GE_GCP_PROJECT_ID="${GE_GCP_PROJECT_ID:-greenearth-471522}"
 GE_GCP_REGION="${GE_GCP_REGION:-us-east1}"
 GE_ENVIRONMENT="${GE_ENVIRONMENT:-stage}"
 
-# Model URI — required, no default
-GE_INFERENCE_MODEL_URI="${GE_INFERENCE_MODEL_URI:-}"
+# Multi-model config — required, no defaults
+GE_INFERENCE_MODELS="${GE_INFERENCE_MODELS:-}"
+GE_INFERENCE_USER_TOWER_MODEL_URI="${GE_INFERENCE_USER_TOWER_MODEL_URI:-}"
+GE_INFERENCE_POST_TOWER_MODEL_URI="${GE_INFERENCE_POST_TOWER_MODEL_URI:-}"
+GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID="${GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID:-}"
+GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID="${GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID:-}"
+GE_INFERENCE_MAX_HISTORY_LEN="${GE_INFERENCE_MAX_HISTORY_LEN:-}"
 
 # Cloud DNS zone for stable internal service URL
 GE_DNS_ZONE_NAME="${GE_DNS_ZONE_NAME:-ge-internal}"
@@ -46,11 +51,29 @@ log_build() {
 validate_config() {
     log_info "Validating configuration..."
 
-    if [ -z "$GE_INFERENCE_MODEL_URI" ]; then
-        log_error "GE_INFERENCE_MODEL_URI is required. Set it via env var or --model-uri flag."
-        log_error "Example: GE_INFERENCE_MODEL_URI=gs://my-bucket/model/ ./deploy.sh"
+    if [ -z "$GE_INFERENCE_MODELS" ]; then
+        log_error "GE_INFERENCE_MODELS is required. Set it via env var or --models flag."
+        log_error "Example: GE_INFERENCE_MODELS=user-tower,post-tower ./deploy.sh"
         exit 1
     fi
+
+    if [ -z "$GE_INFERENCE_MAX_HISTORY_LEN" ] || ! [[ "$GE_INFERENCE_MAX_HISTORY_LEN" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "GE_INFERENCE_MAX_HISTORY_LEN is required and must be a positive integer."
+        log_error "Example: GE_INFERENCE_MAX_HISTORY_LEN=50 ./deploy.sh"
+        exit 1
+    fi
+
+    IFS=',' read -ra _model_types <<< "$GE_INFERENCE_MODELS"
+    for _model_type in "${_model_types[@]}"; do
+        local _key
+        _key=$(echo "$_model_type" | tr '[:lower:]-' '[:upper:]_')
+        local _uri_var="GE_INFERENCE_${_key}_MODEL_URI"
+        local _clearml_var="GE_INFERENCE_${_key}_CLEARML_MODEL_ID"
+        if [ -z "${!_uri_var}" ] && [ -z "${!_clearml_var}" ]; then
+            log_error "Model '$_model_type' is missing a source. Set one of: $_uri_var or $_clearml_var"
+            exit 1
+        fi
+    done
 
     gcloud config set project "$GE_GCP_PROJECT_ID"
 
@@ -93,10 +116,20 @@ deploy_inference_service() {
     temp_var_dir=$(mktemp -d)
     trap "rm -rf $temp_var_dir" EXIT
     cat > "$temp_var_dir/env-vars.yaml" <<EOF
-GE_INFERENCE_MODEL_URI: "$GE_INFERENCE_MODEL_URI"
+GE_INFERENCE_MODELS: "$GE_INFERENCE_MODELS"
+GE_INFERENCE_MAX_HISTORY_LEN: "$GE_INFERENCE_MAX_HISTORY_LEN"
 GE_INFERENCE_PREFER_CUDA: "0"
 GE_INFERENCE_WARMUP: "0"
 EOF
+    # Append per-model sources if set.
+    [ -n "$GE_INFERENCE_USER_TOWER_MODEL_URI" ] && \
+        echo "GE_INFERENCE_USER_TOWER_MODEL_URI: \"$GE_INFERENCE_USER_TOWER_MODEL_URI\"" >> "$temp_var_dir/env-vars.yaml"
+    [ -n "$GE_INFERENCE_POST_TOWER_MODEL_URI" ] && \
+        echo "GE_INFERENCE_POST_TOWER_MODEL_URI: \"$GE_INFERENCE_POST_TOWER_MODEL_URI\"" >> "$temp_var_dir/env-vars.yaml"
+    [ -n "$GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID" ] && \
+        echo "GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID: \"$GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID\"" >> "$temp_var_dir/env-vars.yaml"
+    [ -n "$GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID" ] && \
+        echo "GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID: \"$GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID\"" >> "$temp_var_dir/env-vars.yaml"
 
     local deploy_cmd="gcloud run deploy $service_name"
     deploy_cmd="$deploy_cmd --source=."
@@ -159,11 +192,12 @@ update_dns_record() {
 
 main() {
     log_info "Starting engagement prediction inference service deployment..."
-    log_info "Project:     $GE_GCP_PROJECT_ID"
-    log_info "Region:      $GE_GCP_REGION"
-    log_info "Environment: $GE_ENVIRONMENT"
-    log_info "Model URI:   $GE_INFERENCE_MODEL_URI"
-    log_info "DNS zone:    $GE_DNS_ZONE_NAME"
+    log_info "Project:         $GE_GCP_PROJECT_ID"
+    log_info "Region:          $GE_GCP_REGION"
+    log_info "Environment:     $GE_ENVIRONMENT"
+    log_info "DNS zone:        $GE_DNS_ZONE_NAME"
+    log_info "Models:          $GE_INFERENCE_MODELS"
+    log_info "Max history len: $GE_INFERENCE_MAX_HISTORY_LEN"
 
     validate_config
     verify_vpc_connector
@@ -188,8 +222,20 @@ while [[ $# -gt 0 ]]; do
             GE_ENVIRONMENT="$2"
             shift 2
             ;;
-        --model-uri)
-            GE_INFERENCE_MODEL_URI="$2"
+        --models)
+            GE_INFERENCE_MODELS="$2"
+            shift 2
+            ;;
+        --user-tower-model-uri)
+            GE_INFERENCE_USER_TOWER_MODEL_URI="$2"
+            shift 2
+            ;;
+        --post-tower-model-uri)
+            GE_INFERENCE_POST_TOWER_MODEL_URI="$2"
+            shift 2
+            ;;
+        --max-history-len)
+            GE_INFERENCE_MAX_HISTORY_LEN="$2"
             shift 2
             ;;
         --dns-zone)
@@ -203,20 +249,34 @@ while [[ $# -gt 0 ]]; do
             echo "  --project-id ID          GCP project ID (default: greenearth-471522)"
             echo "  --region REGION          GCP region (default: us-east1)"
             echo "  --environment ENV        Environment name (default: stage)"
-            echo "  --model-uri URI          GCS URI for the model (required)"
             echo "  --dns-zone ZONE          Cloud DNS zone name (default: ge-internal)"
+            echo "  --models TYPES                   Comma-separated model types to deploy (required)"
+            echo "                                   Supported: user-tower, post-tower"
+            echo "  --user-tower-model-uri URI        GCS URI for the user-tower model"
+            echo "  --post-tower-model-uri URI        GCS URI for the post-tower model"
+            echo "  --max-history-len N              Maximum user history sequence length (required)"
             echo "  --help                   Show this help message"
             echo ""
             echo "Environment variables:"
             echo "  GE_GCP_PROJECT_ID        Same as --project-id"
             echo "  GE_GCP_REGION            Same as --region"
             echo "  GE_ENVIRONMENT           Same as --environment"
-            echo "  GE_INFERENCE_MODEL_URI   Same as --model-uri (required)"
             echo "  GE_DNS_ZONE_NAME         Same as --dns-zone"
+            echo "  GE_INFERENCE_MODELS                      Same as --models (required)"
+            echo "  GE_INFERENCE_MAX_HISTORY_LEN             Same as --max-history-len (required)"
+            echo "  GE_INFERENCE_USER_TOWER_MODEL_URI        GCS URI for user-tower model"
+            echo "  GE_INFERENCE_POST_TOWER_MODEL_URI        GCS URI for post-tower model"
+            echo "  GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID ClearML model ID for user-tower"
+            echo "  GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID ClearML model ID for post-tower"
+            echo ""
+            echo "Each model listed in --models requires either a _MODEL_URI or _CLEARML_MODEL_ID."
             echo ""
             echo "Examples:"
-            echo "  GE_INFERENCE_MODEL_URI=gs://my-bucket/model/ $0 --environment stage"
-            echo "  $0 --environment stage --model-uri gs://my-bucket/model/"
+            echo "  $0 --environment stage \\"
+            echo "     --models user-tower,post-tower \\"
+            echo "     --user-tower-model-uri gs://my-bucket/user_tower.pt \\"
+            echo "     --post-tower-model-uri gs://my-bucket/post_tower.pt \\"
+            echo "     --max-history-len 50"
             exit 0
             ;;
         *)
