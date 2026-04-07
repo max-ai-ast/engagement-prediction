@@ -22,9 +22,6 @@ GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID="${GE_INFERENCE_USER_TOWER_CLEARML_MODE
 GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID="${GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID:-}"
 GE_INFERENCE_MAX_HISTORY_LEN="${GE_INFERENCE_MAX_HISTORY_LEN:-}"
 
-# Cloud DNS zone for stable internal service URL
-GE_DNS_ZONE_NAME="${GE_DNS_ZONE_NAME:-ge-internal}"
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -162,47 +159,17 @@ EOF
     log_info "(Note: --ingress=internal — only reachable from within the VPC)"
 }
 
-update_dns_record() {
-    local service_name="engagement-prediction-inference-$GE_ENVIRONMENT"
-    local dns_name="inference-$GE_ENVIRONMENT.ge.internal."
-
-    log_info "Updating Cloud DNS CNAME record for stable service URL..."
-
-    local service_url
-    service_url=$(gcloud run services describe "$service_name" --region="$GE_GCP_REGION" --format="value(status.url)")
-
-    # Strip the https:// scheme — DNS CNAME targets must be hostnames
-    local cloud_run_hostname="${service_url#https://}"
-
-    # Delete existing record if present (gcloud errors if it doesn't exist, so suppress)
-    gcloud dns record-sets delete "$dns_name" \
-        --zone="$GE_DNS_ZONE_NAME" \
-        --type=CNAME \
-        > /dev/null 2>&1 || true
-
-    gcloud dns record-sets create "$dns_name" \
-        --zone="$GE_DNS_ZONE_NAME" \
-        --type=CNAME \
-        --ttl=300 \
-        --rrdatas="${cloud_run_hostname}."
-
-    log_info "✓ DNS record updated: $dns_name → $cloud_run_hostname"
-    log_info "Stable internal URL: http://inference-$GE_ENVIRONMENT.ge.internal"
-}
-
 main() {
     log_info "Starting engagement prediction inference service deployment..."
     log_info "Project:         $GE_GCP_PROJECT_ID"
     log_info "Region:          $GE_GCP_REGION"
     log_info "Environment:     $GE_ENVIRONMENT"
-    log_info "DNS zone:        $GE_DNS_ZONE_NAME"
     log_info "Models:          $GE_INFERENCE_MODELS"
     log_info "Max history len: $GE_INFERENCE_MAX_HISTORY_LEN"
 
     validate_config
     verify_vpc_connector
     deploy_inference_service
-    update_dns_record
 
     log_info "Deployment complete!"
 }
@@ -238,10 +205,6 @@ while [[ $# -gt 0 ]]; do
             GE_INFERENCE_MAX_HISTORY_LEN="$2"
             shift 2
             ;;
-        --dns-zone)
-            GE_DNS_ZONE_NAME="$2"
-            shift 2
-            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -249,7 +212,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --project-id ID          GCP project ID (default: greenearth-471522)"
             echo "  --region REGION          GCP region (default: us-east1)"
             echo "  --environment ENV        Environment name (default: stage)"
-            echo "  --dns-zone ZONE          Cloud DNS zone name (default: ge-internal)"
             echo "  --models TYPES                   Comma-separated model types to deploy (required)"
             echo "                                   Supported: user-tower, post-tower"
             echo "  --user-tower-model-uri URI        GCS URI for the user-tower model"
@@ -261,7 +223,6 @@ while [[ $# -gt 0 ]]; do
             echo "  GE_GCP_PROJECT_ID        Same as --project-id"
             echo "  GE_GCP_REGION            Same as --region"
             echo "  GE_ENVIRONMENT           Same as --environment"
-            echo "  GE_DNS_ZONE_NAME         Same as --dns-zone"
             echo "  GE_INFERENCE_MODELS                      Same as --models (required)"
             echo "  GE_INFERENCE_MAX_HISTORY_LEN             Same as --max-history-len (required)"
             echo "  GE_INFERENCE_USER_TOWER_MODEL_URI        GCS URI for user-tower model"
