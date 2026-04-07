@@ -17,6 +17,13 @@ finally:
         os.environ["GE_INFERENCE_MAX_HISTORY_LEN"] = _prev_max_history_len
 
 
+@pytest.fixture(autouse=False)
+def bypass_auth():
+    app_module.app.dependency_overrides[app_module._require_api_key] = lambda: None
+    yield
+    app_module.app.dependency_overrides.clear()
+
+
 def _install_dummy_models(monkeypatch: pytest.MonkeyPatch) -> None:
     def user_model(history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         # history_embeddings: [B, T, D] (float)
@@ -133,7 +140,7 @@ def test_post_tower_request_enforces_embed_dim(monkeypatch: pytest.MonkeyPatch):
         app_module.PostTowerPredictRequest(post_embeddings=[1.0, 2.0, 3.0])
 
 
-def test_predict_user_tower_endpoint_coerces_unbatched_and_returns_outputs(monkeypatch: pytest.MonkeyPatch):
+def test_predict_user_tower_endpoint_coerces_unbatched_and_returns_outputs(monkeypatch: pytest.MonkeyPatch, bypass_auth):
     _install_dummy_models(monkeypatch)
     with TestClient(app_module.app) as client:
         r = client.post(
@@ -146,7 +153,7 @@ def test_predict_user_tower_endpoint_coerces_unbatched_and_returns_outputs(monke
         assert payload["outputs"] == [[[10.0]]]
 
 
-def test_predict_post_tower_endpoint_coerces_unbatched_and_returns_outputs(monkeypatch: pytest.MonkeyPatch):
+def test_predict_post_tower_endpoint_coerces_unbatched_and_returns_outputs(monkeypatch: pytest.MonkeyPatch, bypass_auth):
     _install_dummy_models(monkeypatch)
     with TestClient(app_module.app) as client:
         r = client.post("/models/post-tower/predict", json={"post_embeddings": [1, 2, 3]})
@@ -156,7 +163,7 @@ def test_predict_post_tower_endpoint_coerces_unbatched_and_returns_outputs(monke
         assert payload["outputs"] == [[2.0]]
 
 
-def test_predict_returns_404_for_unknown_model(monkeypatch: pytest.MonkeyPatch):
+def test_predict_returns_404_for_unknown_model(monkeypatch: pytest.MonkeyPatch, bypass_auth):
     monkeypatch.setattr(app_module, "_models_initialized", True)
     monkeypatch.setattr(app_module, "_models_init_error", None)
     monkeypatch.setattr(app_module, "_models", {})
@@ -165,7 +172,7 @@ def test_predict_returns_404_for_unknown_model(monkeypatch: pytest.MonkeyPatch):
         assert r.status_code == 404
 
 
-def test_predict_rejects_request_type_mismatch(monkeypatch: pytest.MonkeyPatch):
+def test_predict_rejects_request_type_mismatch(monkeypatch: pytest.MonkeyPatch, bypass_auth):
     _install_dummy_models(monkeypatch)
     with TestClient(app_module.app) as client:
         # Body is discriminated as post-tower but the URL targets the user-tower model.
@@ -173,7 +180,7 @@ def test_predict_rejects_request_type_mismatch(monkeypatch: pytest.MonkeyPatch):
         assert r.status_code == 422
 
 
-def test_predict_returns_500_when_registry_init_failed(monkeypatch: pytest.MonkeyPatch):
+def test_predict_returns_500_when_registry_init_failed(monkeypatch: pytest.MonkeyPatch, bypass_auth):
     monkeypatch.delenv("GE_INFERENCE_MODELS", raising=False)
     monkeypatch.setattr(app_module, "_models_initialized", False)
     monkeypatch.setattr(app_module, "_models_init_error", None)
@@ -188,7 +195,7 @@ def test_predict_returns_500_when_registry_init_failed(monkeypatch: pytest.Monke
         assert "Model registry init failed" in r.text
 
 
-def test_ready_returns_503_and_registry_error_when_unconfigured(monkeypatch: pytest.MonkeyPatch):
+def test_ready_returns_503_and_registry_error_when_unconfigured(monkeypatch: pytest.MonkeyPatch, bypass_auth):
     monkeypatch.delenv("GE_INFERENCE_MODELS", raising=False)
     monkeypatch.setattr(app_module, "_models_initialized", False)
     monkeypatch.setattr(app_module, "_models_init_error", None)

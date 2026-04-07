@@ -11,8 +11,9 @@ import logging
 
 import torch
 from clearml import Model
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Discriminator, Tag, model_validator
 
 
@@ -22,16 +23,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 app = FastAPI(lifespan=lifespan)
 
 
-@app.middleware("http")
-async def api_key_middleware(request: Request, call_next):
-    if _API_KEY is None or request.url.path in ("/health", "/docs", "/redoc", "/openapi.json"):
-        return await call_next(request)
-    if request.headers.get("X-API-Key") != _API_KEY:
-        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
-    return await call_next(request)
+def _require_api_key(api_key: str = Security(_api_key_header)) -> None:
+    if api_key != _API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 # -------------------------
 # Logging
@@ -567,7 +565,7 @@ def health() -> dict:
     return {"ok": True}
 
 
-@app.get("/ready")
+@app.get("/ready", dependencies=[Security(_require_api_key)])
 def ready():
     _init_registry()
     ensure_models_loaded()
@@ -602,7 +600,7 @@ def ready():
     status = 200 if all_ready else 503
     return JSONResponse(content=payload, status_code=status)
 
-@app.get("/models")
+@app.get("/models", dependencies=[Security(_require_api_key)])
 def list_models() -> dict:
     _init_registry()
     ensure_models_loaded()
@@ -624,7 +622,7 @@ def list_models() -> dict:
     return {"models": models_payload, "registry_error": _models_init_error}
 
 
-@app.post("/models/{model_name}/predict")
+@app.post("/models/{model_name}/predict", dependencies=[Security(_require_api_key)])
 def predict_model(model_name: str, req: PredictRequest) -> dict:
     entry = _get_entry_or_404(model_name)
     try:
