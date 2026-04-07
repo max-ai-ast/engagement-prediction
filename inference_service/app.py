@@ -11,7 +11,7 @@ import logging
 
 import torch
 from clearml import Model
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Discriminator, Tag, model_validator
 
@@ -23,6 +23,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    if _API_KEY is None or request.url.path == "/health":
+        return await call_next(request)
+    if request.headers.get("X-API-Key") != _API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
 
 # -------------------------
 # Logging
@@ -36,6 +45,7 @@ logger = logging.getLogger(__name__)
 GE_INFERENCE_MAX_BATCH = int(os.getenv("GE_INFERENCE_MAX_BATCH", "1024"))
 GE_INFERENCE_PREFER_CUDA = os.getenv("GE_INFERENCE_PREFER_CUDA", "1") == "1"
 GE_INFERENCE_WARMUP = os.getenv("GE_INFERENCE_WARMUP", "1") == "1"
+_API_KEY: str | None = os.environ.get("GE_INFERENCE_API_KEY") or None
 
 # If you know these shapes, set them to validate and to create dummy warmup.
 GE_INFERENCE_EMBED_DIM = int(os.getenv("GE_INFERENCE_EMBED_DIM", "0")) # 0 means unknown/skip dim validation

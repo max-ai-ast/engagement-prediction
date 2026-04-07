@@ -71,7 +71,8 @@ setup_gcp_project() {
         run.googleapis.com \
         artifactregistry.googleapis.com \
         vpcaccess.googleapis.com \
-        compute.googleapis.com
+        compute.googleapis.com \
+        secretmanager.googleapis.com
 
     log_info "GCP project setup complete."
 }
@@ -111,6 +112,33 @@ create_engagement_prediction_model_storage() {
     log_info "Granted objectAdmin to engagement prediction service account for bucket: $BUCKET_NAME"
 }
 
+create_api_key_secret() {
+    log_info "Setting up API key secret in Secret Manager..."
+
+    local secret_name="inference-api-key-$GE_ENVIRONMENT"
+    local sa_email="engagement-prediction-sa-$GE_ENVIRONMENT@$GE_GCP_PROJECT_ID.iam.gserviceaccount.com"
+
+    if gcloud secrets describe "$secret_name" > /dev/null 2>&1; then
+        log_info "Secret '$secret_name' already exists — skipping creation"
+    else
+        gcloud secrets create "$secret_name" --replication-policy=automatic
+        local api_key
+        api_key=$(openssl rand -hex 32)
+        echo -n "$api_key" | gcloud secrets versions add "$secret_name" --data-file=-
+        log_info "Secret '$secret_name' created"
+        log_info "API key (save this now — it will not be shown again):"
+        echo ""
+        echo "  $api_key"
+        echo ""
+    fi
+
+    gcloud secrets add-iam-policy-binding "$secret_name" \
+        --member="serviceAccount:$sa_email" \
+        --role="roles/secretmanager.secretAccessor" \
+        > /dev/null
+    log_info "Granted secretAccessor to $sa_email on '$secret_name'"
+}
+
 check_vpc_connector() {
     log_info "Checking for VPC connector..."
 
@@ -142,20 +170,21 @@ main() {
     setup_gcp_project
     create_service_account
     create_engagement_prediction_model_storage
+    create_api_key_secret
     check_vpc_connector
 
     log_info "Environment setup complete!"
     echo
     echo "Next steps:"
-    echo "1. Set GE_INFERENCE_MODEL_URI to the GCS path of your model"
-    echo "2. Run 'inference_service/deploy.sh' to deploy the inference service to Cloud Run"
-    echo "3. Check Cloud Run console to verify the service is running"
-    echo "4. Confirm the service is only accessible from within the VPC (--ingress=internal)"
+    echo "1. Run 'inference_service/deploy.sh' to deploy the inference service to Cloud Run"
+    echo "2. Check Cloud Run console to verify the service is running"
+    echo "3. Set up your custom domain mapping and public DNS record"
     echo
     echo "Important notes:"
     echo "- Model files are stored in: gs://$GE_GCP_PROJECT_ID-engagement-prediction-model-$GE_ENVIRONMENT"
     echo "- Service account: engagement-prediction-sa-$GE_ENVIRONMENT@$GE_GCP_PROJECT_ID.iam.gserviceaccount.com"
     echo "- Service name: engagement-prediction-inference-$GE_ENVIRONMENT"
+    echo "- API key secret: inference-api-key-$GE_ENVIRONMENT (in Secret Manager)"
     echo
 }
 

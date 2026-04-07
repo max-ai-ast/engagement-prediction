@@ -138,8 +138,9 @@ EOF
         deploy_cmd="$deploy_cmd --vpc-egress=private-ranges-only"
     fi
 
-    deploy_cmd="$deploy_cmd --ingress=internal"
+    deploy_cmd="$deploy_cmd --ingress=all"
     deploy_cmd="$deploy_cmd --allow-unauthenticated"
+    deploy_cmd="$deploy_cmd --set-secrets=GE_INFERENCE_API_KEY=inference-api-key-$GE_ENVIRONMENT:latest"
     deploy_cmd="$deploy_cmd --env-vars-file=$temp_var_dir/env-vars.yaml"
 
     deploy_cmd="$deploy_cmd --cpu=2"
@@ -156,7 +157,6 @@ EOF
     local service_url
     service_url=$(gcloud run services describe "$service_name" --region="$GE_GCP_REGION" --format="value(status.url)")
     log_info "Service URL: $service_url"
-    log_info "(Note: --ingress=internal — only reachable from within the VPC)"
 }
 
 main() {
