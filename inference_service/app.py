@@ -11,7 +11,7 @@ import logging
 
 import torch
 from clearml import Model
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Security, Body
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Discriminator, Tag, model_validator
@@ -623,7 +623,7 @@ def list_models() -> dict:
 
 
 @app.post("/models/{model_name}/predict", dependencies=[Security(_require_api_key)])
-def predict_model(model_name: str, req: PredictRequest) -> dict:
+def predict_model(model_name: str, req: PredictRequest = Body(...)) -> dict:
     entry = _get_entry_or_404(model_name)
     try:
         y = _predict_with_entry(entry, req)
