@@ -817,6 +817,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'subject_uri': str,
         'record_created_at': 'datetime',
         'emb_idx': int,  # NEW: index for memmap lookup
+        'author_did': str,
     }
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
@@ -1317,7 +1318,14 @@ def _run_greenearth_pipeline(
     # PHASE 6: Join emb_idx to likes
     # ========================================================================
     log_operation_start('Join emb_idx to likes', '01_GET_DATA', logger)
-    posts_uri_to_idx = posts_core_df.select(["at_uri", "emb_idx"])
+    posts_uri_to_idx = (
+        posts_core_df
+        .select([
+            pl.col("at_uri"),
+            pl.col("emb_idx"),
+            pl.col("did").alias("author_did"),
+        ])
+    )
     likes_core_df = (
         likes_core_df
         .join(
