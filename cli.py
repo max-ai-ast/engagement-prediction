@@ -74,9 +74,9 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_start": None,
     "holdout_end": None,
     # Stage 4 (train) - Model architecture
-    "use_embedding_table": False,
-    "num_rows_for_embedding_table": None,
-    "num_hashes_for_embedding_table": None,
+    "use_author_emb_table": False,
+    "n_rows_author_emb_table": None,
+    "n_hashes_author_emb_table": None,
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
     "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
@@ -740,12 +740,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     # Stage 4 (train) user summarization + model selection
-    _add_arg_with_default(p_all, "--use-embedding-table", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Use a learned embedding table for collaborative features in two tower model.")
-    _add_arg_with_default(p_all, "--num-rows-for-embedding-table", type=int, default=argparse.SUPPRESS,
-                          help_text="Number of rows in the learned embedding table (only used if --use-embedding-table is enabled)")
-    _add_arg_with_default(p_all, "--num-hashes-for-embedding-table", type=int, default=argparse.SUPPRESS,
-                          help_text="Number of hashes of the post id to use to look up embeddings from the learned embedding table (only used if --use-embedding-table is enabled)")
+    _add_arg_with_default(p_all, "--use-author-emb-table", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Use a learned embedding table for the author DID in two tower model.")
+    _add_arg_with_default(p_all, "--n-rows-author-emb-table", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of rows in the learned author embedding table (only used if --use-author-emb-table is enabled)")
+    _add_arg_with_default(p_all, "--n-hashes-author-emb-table", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of hashes of the author DID to use to look up embeddings from the learned embedding table (only used if --use-author-emb-table is enabled)")
     _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
                           default=argparse.SUPPRESS,
                           help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")

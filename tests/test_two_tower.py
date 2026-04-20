@@ -143,7 +143,7 @@ def test_shared_post_feature_encoder_zeroes_padding_row():
     encoder = SharedPostFeatureEncoder(
         post_embedding_dim=16,
         num_embedding_table_rows=32,
-        num_hashes_for_embedding_table=3,
+        n_hashes_author_emb_table=3,
     )
 
     assert torch.all(encoder.collab_table.weight[0] == 0)

@@ -237,22 +237,22 @@ class SharedPostFeatureEncoder(nn.Module):
     def __init__(
         self, 
         post_embedding_dim: int, 
-        num_embedding_table_rows: int,
-        num_hashes_for_embedding_table: int,
+        n_rows_author_emb_table: int,
+        n_hashes_author_emb_table: int,
     ):
         super().__init__()
-        self.collab_table = nn.Embedding(
-            num_embeddings=num_embedding_table_rows, 
+        self.author_emb_table = nn.Embedding(
+            num_embeddings=n_rows_author_emb_table, 
             embedding_dim=post_embedding_dim, 
             padding_idx=0
         )
-        nn.init.xavier_uniform_(self.collab_table.weight)
+        nn.init.xavier_uniform_(self.author_emb_table.weight)
         with torch.no_grad():
-            self.collab_table.weight[0].zero_()
+            self.author_emb_table.weight[0].zero_()
 
         # Project the embedding table vectors and the content embeddings back to the common dimension.
         # There are num_hashes+1 vectors total - the +1 is for the content embedding.
-        in_features = (num_hashes_for_embedding_table + 1) * post_embedding_dim
+        in_features = (n_hashes_author_emb_table + 1) * post_embedding_dim
         self.fusion_layer = nn.Linear(in_features=in_features, out_features=post_embedding_dim)
         nn.init.xavier_uniform_(self.fusion_layer.weight)
         if self.fusion_layer.bias is not None:
@@ -261,11 +261,11 @@ class SharedPostFeatureEncoder(nn.Module):
     def featurize_post(
         self,
         content_embeddings: torch.Tensor, 
-        post_hashes: torch.Tensor,
+        post_author_hashes: torch.Tensor,
     ) -> torch.Tensor:
-        collab_embeddings = self.collab_table(post_hashes) # [..., num_hashes, post_embedding_dim]
-        collab_embeddings_concat = collab_embeddings.flatten(start_dim=-2) # [..., num_hashes * post_embedding_dim]
-        fused_embeddings = self.fusion_layer(torch.cat([content_embeddings, collab_embeddings_concat], dim=-1)) # [..., post_embedding_dim]
+        author_embeddings = self.author_emb_table(post_author_hashes) # [..., num_hashes, post_embedding_dim]
+        author_embeddings_concat = author_embeddings.flatten(start_dim=-2) # [..., num_hashes * post_embedding_dim]
+        fused_embeddings = self.fusion_layer(torch.cat([content_embeddings, author_embeddings_concat], dim=-1)) # [..., post_embedding_dim]
         return fused_embeddings
 
 
@@ -333,9 +333,9 @@ class TwoTowerModel(nn.Module):
         similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
-        use_embedding_table: bool,
-        num_embedding_table_rows: Optional[int],
-        num_hashes_for_embedding_table: Optional[int],
+        use_author_emb_table: bool,
+        n_rows_author_emb_table: Optional[int],
+        n_hashes_author_emb_table: Optional[int],
     ):
         super().__init__()
         self.shared_dim = shared_dim
@@ -346,16 +346,16 @@ class TwoTowerModel(nn.Module):
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
-        self.use_embedding_table = bool(use_embedding_table)
+        self.use_author_emb_table = bool(use_author_emb_table)
 
         # Feature encoder: embedding table - for collaborative filtering-like features fused with content embeddings
         self.post_feature_encoder = None
-        if self.use_embedding_table:
-            if num_embedding_table_rows is None:
-                raise ValueError("num_embedding_table_rows must be specified when use_embedding_table is True")
-            if num_hashes_for_embedding_table is None:
-                raise ValueError("num_hashes_for_embedding_table must be specified when use_embedding_table is True")
-            self.post_feature_encoder = SharedPostFeatureEncoder(post_embedding_dim, num_embedding_table_rows, num_hashes_for_embedding_table)
+        if self.use_author_emb_table:
+            if n_rows_author_emb_table is None:
+                raise ValueError("num_embedding_table_rows must be specified when use_author_emb_table is True")
+            if n_hashes_author_emb_table is None:
+                raise ValueError("n_hashes_author_emb_table must be specified when use_author_emb_table is True")
+            self.post_feature_encoder = SharedPostFeatureEncoder(post_embedding_dim, n_rows_author_emb_table, n_hashes_author_emb_table)
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -422,7 +422,7 @@ class TwoTowerModel(nn.Module):
         self, 
         history_embeddings: torch.Tensor, 
         history_mask: torch.Tensor, 
-        history_post_hashes: Optional[torch.Tensor] = None,
+        history_post_author_hashes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
@@ -435,14 +435,14 @@ class TwoTowerModel(nn.Module):
             When `l2_normalize_embeddings=True`, these are unit-length.
         """
         fused_history_embeddings = history_embeddings
-        if self.use_embedding_table:
-            fused_history_embeddings = self.post_feature_encoder.featurize_post(history_embeddings, history_post_hashes) # type: ignore
+        if self.use_author_emb_table:
+            fused_history_embeddings = self.post_feature_encoder.featurize_post(history_embeddings, history_post_author_hashes) # type: ignore
         return self.user_tower(fused_history_embeddings, history_mask)
 
     def encode_post(
         self, 
         post_embeddings: torch.Tensor, 
-        post_hashes: Optional[torch.Tensor] = None,
+        post_author_hashes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode post embeddings into shared space representation.
         
@@ -456,8 +456,8 @@ class TwoTowerModel(nn.Module):
             When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
         fused_post_embeddings = post_embeddings
-        if self.use_embedding_table:
-            fused_post_embeddings = self.post_feature_encoder.featurize_post(post_embeddings, post_hashes) # type: ignore
+        if self.use_author_emb_table:
+            fused_post_embeddings = self.post_feature_encoder.featurize_post(post_embeddings, post_author_hashes) # type: ignore
 
         return self.post_tower(fused_post_embeddings)
 
@@ -466,8 +466,8 @@ class TwoTowerModel(nn.Module):
         history_embeddings: torch.Tensor,
         history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
-        history_post_hashes: Optional[torch.Tensor] = None,
-        post_hashes: Optional[torch.Tensor] = None,
+        history_post_author_hashes: Optional[torch.Tensor] = None,
+        post_author_hashes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
         
@@ -486,8 +486,8 @@ class TwoTowerModel(nn.Module):
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask, history_post_hashes)
-        post_emb = self.encode_post(post_embeddings, post_hashes)
+        user_emb = self.encode_user(history_embeddings, history_mask, history_post_author_hashes)
+        post_emb = self.encode_post(post_embeddings, post_author_hashes)
         
         similarity_score = (user_emb * post_emb).sum(dim=-1)
         return similarity_score / self.similarity_temperature
@@ -542,15 +542,15 @@ class TwoTowerModel(nn.Module):
             history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
             post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
             
-            history_post_hashes = None
-            post_hashes = None
-            if self.use_embedding_table:
-                history_post_hashes = batch["history_post_hashes"].to(device, dtype=torch.long, non_blocking=True) # [B, seq_len, num_hashes]
-                post_hashes = batch["post_hash"].to(device, dtype=torch.long, non_blocking=True) # [B, num_hashes]
+            history_post_author_hashes = None
+            post_author_hashes = None
+            if self.use_author_emb_table:
+                history_post_author_hashes = batch["history_post_author_hashes"].to(device, dtype=torch.long, non_blocking=True) # [B, seq_len, num_hashes]
+                post_author_hashes = batch["post_author_hash"].to(device, dtype=torch.long, non_blocking=True) # [B, num_hashes]
 
         labels = batch["label"].to(device, non_blocking=True)
 
-        scores = self.forward(history_embeddings, history_mask, post_embeddings, history_post_hashes, post_hashes)
+        scores = self.forward(history_embeddings, history_mask, post_embeddings, history_post_author_hashes, post_author_hashes)
         loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
@@ -852,9 +852,9 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     eval_holdout_type = str(args.eval_holdout_type)
-    use_embedding_table = bool(args.use_embedding_table)
-    num_rows_for_embedding_table = int(args.num_rows_for_embedding_table) if use_embedding_table else None
-    num_hashes_for_embedding_table = int(args.num_hashes_for_embedding_table) if use_embedding_table else None
+    use_author_emb_table = bool(args.use_author_emb_table)
+    n_rows_author_emb_table = int(args.n_rows_author_emb_table) if use_author_emb_table else None
+    n_hashes_author_emb_table = int(args.n_hashes_author_emb_table) if use_author_emb_table else None
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -881,15 +881,15 @@ def run(context: Context, args) -> Dict[str, Any]:
     else:
         train_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
-            max_history_len=max_history_len, embed_dim=embed_dim, use_embedding_table=use_embedding_table, 
-            num_hashes_for_embedding_table=num_hashes_for_embedding_table, 
-            num_rows_for_embedding_table=num_rows_for_embedding_table, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim, use_author_emb_table=use_author_emb_table, 
+            n_hashes_author_emb_table=n_hashes_author_emb_table, 
+            n_rows_author_emb_table=n_rows_author_emb_table, logger=logger,
         )
         val_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="val",
-            max_history_len=max_history_len, embed_dim=embed_dim, use_embedding_table=use_embedding_table,
-            num_hashes_for_embedding_table=num_hashes_for_embedding_table,
-            num_rows_for_embedding_table=num_rows_for_embedding_table, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim, use_author_emb_table=use_author_emb_table,
+            n_hashes_author_emb_table=n_hashes_author_emb_table,
+            n_rows_author_emb_table=n_rows_author_emb_table, logger=logger,
         )
 
     # Create data loaders using centralized helper
@@ -919,9 +919,9 @@ def run(context: Context, args) -> Dict[str, Any]:
         similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
-        use_embedding_table=use_embedding_table,
-        num_embedding_table_rows=num_rows_for_embedding_table,
-        num_hashes_for_embedding_table=num_hashes_for_embedding_table,
+        use_author_emb_table=use_author_emb_table,
+        n_rows_author_emb_table=n_rows_author_emb_table,
+        n_hashes_author_emb_table=n_hashes_author_emb_table,
     )
 
     if (not use_post_encoder) and (user_encoder_type == "summarized"):

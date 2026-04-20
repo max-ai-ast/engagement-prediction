@@ -123,6 +123,7 @@ from utils.helpers import (
 from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask, 
     generate_hash_indices,
+    get_hashed_value_from_string,
 )
 
 
@@ -1004,7 +1005,7 @@ def filter_split_and_join_history(
         (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
     )
     return filtered.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        history_df.select(["target_did", "like_uri", "prior_emb_indices", "prior_author_hashes"]),
         on=["target_did", "like_uri"],
         how="left",
         maintain_order="left",
@@ -1019,11 +1020,11 @@ def _prepare_split_data(
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
     split: str,
-    use_embedding_table: bool,
-    num_rows_for_embedding_table: Optional[int] = None,
-    num_hashes_for_embedding_table: Optional[int] = None,
+    use_author_emb_table: bool,
+    n_rows_author_emb_table: Optional[int] = None,
+    n_hashes_author_emb_table: Optional[int] = None,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str], Optional[List[np.ndarray]]]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str], List[str], List[str], Optional[List[np.ndarray]]]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -1075,34 +1076,48 @@ def _prepare_split_data(
     target_dids = joined["target_did"].to_list()
     like_uris = joined["like_uri"].to_list()
     neg_uris = joined["neg_uri"].to_list()
+    like_author_dids = joined["like_author_did"].to_list()
+    neg_author_dids = joined["neg_author_did"].to_list()
 
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
     # while still supporting fast numpy indexing into the embeddings memmap
-    prior_col = joined["prior_emb_indices"]
-    prior_emb_indices_list: List[np.ndarray] = []
-    prior_hashes_list = [] if use_embedding_table else None
-    for row_val in prior_col.to_list():
-        if row_val is None or len(row_val) == 0:
+    prior_emb_indices_input_list = joined["prior_emb_indices"].to_list()
+    prior_emb_indices_output_list: List[np.ndarray] = []    
+    prior_author_hashes_input_list = joined["prior_author_hashes"].to_list()
+    prior_author_hashes_output_list = [] if use_author_emb_table else None
+
+    for i in range(len(joined)):
+        this_prior_emb_indices = prior_emb_indices_input_list[i]
+        if this_prior_emb_indices is None or len(this_prior_emb_indices) == 0:
             # Users with no history get an empty array (will become zero vector
             # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
-            prior_emb_indices_list.append(np.array([], dtype=np.uint32))
-            if use_embedding_table:
-                prior_hashes_list.append(np.array([], dtype=np.uint32))
+            prior_emb_indices_output_list.append(np.array([], dtype=np.uint32))
+            if use_author_emb_table:
+                prior_author_hashes_output_list.append(np.array([], dtype=np.uint32)) # type: ignore
         else:
-            prior_emb_indices_np = np.array(row_val, dtype=np.uint32)
-            prior_emb_indices_list.append(prior_emb_indices_np)
+            prior_emb_indices_output_list.append(np.array(this_prior_emb_indices, dtype=np.uint32))
 
-            if use_embedding_table:
-                if num_rows_for_embedding_table is None or num_hashes_for_embedding_table is None:
-                    raise ValueError("num_rows_for_embedding_table and num_hashes_for_embedding_table must be provided when use_embedding_table is True")
-                this_prior_hashes_list = [
-                    generate_hash_indices(idx, num_hashes_for_embedding_table, num_rows_for_embedding_table) 
-                    for idx in prior_emb_indices_np
+            if use_author_emb_table:
+                if n_rows_author_emb_table is None or n_hashes_author_emb_table is None:
+                    raise ValueError("n_rows_author_emb_table and n_hashes_author_emb_table must be provided when use_author_emb_table is True")
+                this_prior_author_hashes_list = [
+                    generate_hash_indices(author_hash, n_hashes_author_emb_table, n_rows_author_emb_table) 
+                    for author_hash in prior_author_hashes_input_list[i]
                 ]
-                prior_hashes_list.append(np.array(this_prior_hashes_list, dtype=np.uint32))
+                prior_author_hashes_output_list.append(np.array(this_prior_author_hashes_list, dtype=np.uint32)) # type: ignore
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris, prior_hashes_list
+    return (
+        like_emb_idx,
+        neg_emb_idx,
+        prior_emb_indices_output_list,
+        target_dids,
+        like_uris,
+        neg_uris,
+        like_author_dids,
+        neg_author_dids,
+        prior_author_hashes_output_list,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1351,18 +1366,18 @@ class SequenceEngagementDataset(Dataset):
         split: str,
         max_history_len: int,
         embed_dim: int,
-        use_embedding_table: bool,
-        num_rows_for_embedding_table: Optional[int] = None,
-        num_hashes_for_embedding_table: Optional[int] = None,
+        use_author_emb_table: bool,
+        n_rows_author_emb_table: Optional[int] = None,
+        n_hashes_author_emb_table: Optional[int] = None,
         logger: Optional[logging.Logger] = None,
     ):
         # Store memmap reference for on-the-fly sequence loading
         self.content_embeddings = embeddings_mmap
         self.max_history_len = max_history_len
         self.embed_dim = embed_dim
-        self.use_embedding_table = use_embedding_table
-        self.num_rows_for_embedding_table = num_rows_for_embedding_table
-        self.num_hashes_for_embedding_table = num_hashes_for_embedding_table
+        self.use_author_emb_table = use_author_emb_table
+        self.n_rows_author_emb_table = n_rows_author_emb_table
+        self.n_hashes_author_emb_table = n_hashes_author_emb_table
 
         # Prepare aligned arrays for the requested split
         (
@@ -1372,14 +1387,16 @@ class SequenceEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
-            self.prior_hashes
+            like_author_dids,
+            neg_author_dids,
+            self.prior_author_hashes,
         ) = _prepare_split_data(
             target_posts_df, 
             history_df, 
             split, 
-            use_embedding_table,
-            num_rows_for_embedding_table,
-            num_hashes_for_embedding_table,
+            use_author_emb_table,
+            n_rows_author_emb_table,
+            n_hashes_author_emb_table,
             logger,
         )
 
@@ -1393,11 +1410,17 @@ class SequenceEngagementDataset(Dataset):
         self.pos_post_embs = torch.from_numpy(pos_embs)
         self.neg_post_embs = torch.from_numpy(neg_embs)
 
-        if use_embedding_table:
-            if num_hashes_for_embedding_table is None or num_rows_for_embedding_table is None:
-                raise ValueError("num_rows_for_embedding_table and num_hashes_for_embedding_table must be provided when use_embedding_table is True")
-            self.pos_hash = torch.tensor([generate_hash_indices(idx, num_hashes_for_embedding_table, num_rows_for_embedding_table) for idx in like_emb_idx])
-            self.neg_hash = torch.tensor([generate_hash_indices(idx, num_hashes_for_embedding_table, num_rows_for_embedding_table) for idx in neg_emb_idx])
+        if use_author_emb_table:
+            if n_hashes_author_emb_table is None or n_rows_author_emb_table is None:
+                raise ValueError("n_rows_author_emb_table and n_hashes_author_emb_table must be provided when use_author_emb_table is True")
+            self.pos_author_hash = torch.tensor([
+                generate_hash_indices(get_hashed_value_from_string(like_author_hash, variant=0), n_hashes_author_emb_table, n_rows_author_emb_table)
+                for like_author_hash in like_author_dids
+            ])
+            self.neg_author_hash = torch.tensor([
+                generate_hash_indices(get_hashed_value_from_string(neg_author_hash, variant=0), n_hashes_author_emb_table, n_rows_author_emb_table)
+                for neg_author_hash in neg_author_dids
+            ])
 
         if logger:
             mem_mb = (pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
@@ -1447,35 +1470,35 @@ class SequenceEngagementDataset(Dataset):
         hist_embeddings = self.content_embeddings[hist_indices]
         hist_embeddings_padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
 
-        if self.use_embedding_table:
-            if self.prior_hashes is None:
-                raise ValueError("prior_hashes must be provided when use_embedding_table is True")
-            if self.max_history_len is None or self.num_hashes_for_embedding_table is None:
-                raise ValueError("max_history_len and num_hashes_for_embedding_table must be provided when use_embedding_table is True")
-            hist_post_hashes = torch.from_numpy(self.prior_hashes[row_idx])
-            hist_post_hashes_padded = torch.zeros((self.max_history_len, self.num_hashes_for_embedding_table), dtype=hist_post_hashes.dtype)
-            if hist_post_hashes.shape[0] > 0:
-                hist_post_hashes_padded[:hist_post_hashes.shape[0]] = hist_post_hashes
+        if self.use_author_emb_table:
+            if self.prior_author_hashes is None:
+                raise ValueError("prior_hashes must be provided when use_author_emb_table is True")
+            if self.max_history_len is None or self.n_hashes_author_emb_table is None:
+                raise ValueError("max_history_len and n_hashes_author_emb_table must be provided when use_author_emb_table is True")
+            hist_post_author_hashes = torch.from_numpy(self.prior_author_hashes[row_idx])
+            hist_post_author_hashes_padded = torch.zeros((self.max_history_len, self.n_hashes_author_emb_table), dtype=hist_post_author_hashes.dtype)
+            if hist_post_author_hashes.shape[0] > 0:
+                hist_post_author_hashes_padded[:hist_post_author_hashes.shape[0]] = hist_post_author_hashes
         else:
-            hist_post_hashes_padded = torch.zeros((self.max_history_len, 1))
+            hist_post_author_hashes_padded = torch.zeros((self.max_history_len, 1))
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:
             post_vec = self.pos_post_embs[row_idx]  # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
-            if self.use_embedding_table: 
-                post_hash = self.pos_hash[row_idx]
+            if self.use_author_emb_table: 
+                post_author_hash = self.pos_author_hash[row_idx]
             else:
-                post_hash = 0
+                post_author_hash = 0
         else:
             post_vec = self.neg_post_embs[row_idx]  # [D]
             label = 0.0
             post_id = self.neg_uris[row_idx]
-            if self.use_embedding_table: 
-                post_hash = self.neg_hash[row_idx]
+            if self.use_author_emb_table: 
+                post_author_hash = self.neg_author_hash[row_idx]
             else:
-                post_hash = 0
+                post_author_hash = 0
 
         return {
             "history_embeddings": torch.from_numpy(hist_embeddings_padded),  # [max_seq, D]
@@ -1484,8 +1507,8 @@ class SequenceEngagementDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
-            "post_hash": post_hash,
-            "history_post_hashes": hist_post_hashes_padded,
+            "post_author_hash": post_author_hash,
+            "history_post_author_hashes": hist_post_author_hashes_padded,
         }
 
 

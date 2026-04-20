@@ -39,21 +39,6 @@ def _splitmix64_after_mask(z: int) -> int:
     z = (z ^ (z >> 31)) & MASK64
     return z
 
-def _splitmix64(x: int) -> int:
-    z = _golden_gamma_and_mask(x)
-    z = _splitmix64_after_mask(z)
-    return z
-
-def _generate_hashes(x: int, n: int) -> list[int]:
-    state = int(x) & MASK64
-    out = []
-    for _ in range(n):
-        state = _golden_gamma_and_mask(state)
-        z = state
-        z = _splitmix64_after_mask(z)
-        out.append(z)
-    return out
-
 def generate_hash_indices(x: int, n: int, num_buckets: int) -> list[int]:
     # Bucket 0 is reserved for padding in the embedding table, so real hashes
     # must land in [1, num_buckets - 1].
