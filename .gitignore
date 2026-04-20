@@ -58,3 +58,6 @@ pytest-of-*/
 
 # memory sweep results csv
 sweep_results_*.csv
+
+# packaging metadata
+*.egg-info/
