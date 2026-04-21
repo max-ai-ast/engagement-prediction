@@ -47,6 +47,34 @@ log_build() {
     echo -e "${BLUE}[BUILD]${NC} $1"
 }
 
+get_domain_mapping_condition_status() {
+    local domain="$1"
+    local condition_type="$2"
+
+    gcloud beta run domain-mappings describe --domain="$domain" \
+        --region="$GE_GCP_REGION" \
+        --project="$GE_GCP_PROJECT_ID" \
+        --format=json 2>/dev/null | python3 -c '
+import json
+import sys
+
+condition_type = sys.argv[1]
+
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+
+for condition in payload.get("status", {}).get("conditions", []):
+    if condition.get("type") == condition_type:
+        print(condition.get("status", ""))
+        break
+else:
+    print("")
+' "$condition_type"
+}
+
 default_inference_domain() {
     if [ "$GE_ENVIRONMENT" = "prod" ]; then
         echo "inference.greenearth.social"
@@ -109,11 +137,37 @@ reconcile_domain_mapping() {
     local service_name="engagement-prediction-inference-$GE_ENVIRONMENT"
     local domain
     domain="$(resolve_inference_domain)"
+    local mapped_route_name
 
     log_info "Reconciling domain mapping for $domain"
 
     if gcloud beta run domain-mappings describe --domain="$domain" --region="$GE_GCP_REGION" --project="$GE_GCP_PROJECT_ID" > /dev/null 2>&1; then
-        log_info "Domain mapping already exists: $domain"
+        mapped_route_name=$(gcloud beta run domain-mappings describe \
+            --domain="$domain" \
+            --region="$GE_GCP_REGION" \
+            --project="$GE_GCP_PROJECT_ID" \
+            --format="value(status.mappedRouteName)" 2>/dev/null || echo "")
+
+        if [ -z "$mapped_route_name" ]; then
+            mapped_route_name=$(gcloud beta run domain-mappings describe \
+                --domain="$domain" \
+                --region="$GE_GCP_REGION" \
+                --project="$GE_GCP_PROJECT_ID" \
+                --format="value(spec.routeName)" 2>/dev/null || echo "")
+        fi
+
+        if [ "$mapped_route_name" = "$service_name" ]; then
+            log_info "Domain mapping already targets expected service: $service_name"
+        else
+            log_warn "Domain mapping exists but points to '$mapped_route_name'; overriding to '$service_name'"
+            gcloud beta run domain-mappings create \
+                --service="$service_name" \
+                --domain="$domain" \
+                --force-override \
+                --region="$GE_GCP_REGION" \
+                --project="$GE_GCP_PROJECT_ID"
+            log_info "Updated domain mapping: $domain -> $service_name"
+        fi
     else
         gcloud beta run domain-mappings create \
             --service="$service_name" \
@@ -124,10 +178,7 @@ reconcile_domain_mapping() {
     fi
 
     local mapping_ready
-    mapping_ready=$(gcloud beta run domain-mappings describe --domain="$domain" \
-        --region="$GE_GCP_REGION" \
-        --project="$GE_GCP_PROJECT_ID" \
-        --format="value(status.conditions[?type='Ready'].status)" 2>/dev/null || echo "")
+    mapping_ready=$(get_domain_mapping_condition_status "$domain" "Ready")
     if [ "$mapping_ready" = "True" ]; then
         log_info "Mapped URL: https://$domain (Ready)"
     else

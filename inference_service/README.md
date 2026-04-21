@@ -39,6 +39,7 @@ Optional flags:
 Deploy as usual:
 
 ```bash
+GE_INFERENCE_USER_TOWER_MODEL_URI=gs://your-bucket/path/to/engagement_user_tower.pt
 GE_ENVIRONMENT=stage ./deploy.sh --models user-tower,post-tower --max-history-len 128
 GE_ENVIRONMENT=prod ./deploy.sh --models user-tower,post-tower --max-history-len 128
 ```

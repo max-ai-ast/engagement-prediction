@@ -57,6 +57,11 @@ check_prerequisites() {
         exit 1
     fi
 
+    if ! command -v python3 &> /dev/null; then
+        log_error "python3 is required for domain mapping status checks. Please install it first."
+        exit 1
+    fi
+
     # Check if user is logged in
     if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1 > /dev/null; then
         log_error "Please log in to gcloud first: gcloud auth login"
@@ -98,6 +103,43 @@ setup_gcp_project() {
     log_info "GCP project setup complete."
 }
 
+cloud_run_service_exists() {
+    local service_name="engagement-prediction-inference-$GE_ENVIRONMENT"
+
+    gcloud run services describe "$service_name" \
+        --region="$GE_GCP_REGION" \
+        --project="$GE_GCP_PROJECT_ID" \
+        > /dev/null 2>&1
+}
+
+get_domain_mapping_condition_status() {
+    local domain="$1"
+    local condition_type="$2"
+
+    gcloud beta run domain-mappings describe --domain="$domain" \
+        --region="$GE_GCP_REGION" \
+        --project="$GE_GCP_PROJECT_ID" \
+        --format=json 2>/dev/null | python3 -c '
+import json
+import sys
+
+condition_type = sys.argv[1]
+
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+
+for condition in payload.get("status", {}).get("conditions", []):
+    if condition.get("type") == condition_type:
+        print(condition.get("status", ""))
+        break
+else:
+    print("")
+' "$condition_type"
+}
+
 ensure_domain_mapping() {
     if [ "$GE_ENABLE_INFERENCE_DOMAIN_MAPPING" != "true" ]; then
         log_info "Skipping domain mapping setup (GE_ENABLE_INFERENCE_DOMAIN_MAPPING=$GE_ENABLE_INFERENCE_DOMAIN_MAPPING)"
@@ -107,6 +149,12 @@ ensure_domain_mapping() {
     local domain
     domain="$(resolve_inference_domain)"
     local service_name="engagement-prediction-inference-$GE_ENVIRONMENT"
+
+    if ! cloud_run_service_exists; then
+        log_warn "Cloud Run service '$service_name' does not exist yet"
+        log_warn "Skipping domain mapping creation for now; deploy.sh will reconcile it after first deploy"
+        return
+    fi
 
     log_info "Ensuring Cloud Run domain mapping exists for $domain -> $service_name"
 
@@ -158,6 +206,13 @@ wait_for_domain_mapping_ready() {
     local domain
     domain="$(resolve_inference_domain)"
 
+    if ! gcloud beta run domain-mappings describe --domain="$domain" \
+        --region="$GE_GCP_REGION" \
+        --project="$GE_GCP_PROJECT_ID" > /dev/null 2>&1; then
+        log_info "Domain mapping does not exist yet for $domain; skipping readiness check"
+        return
+    fi
+
     log_info "Checking domain mapping readiness for $domain"
     log_info "Certificate provisioning can take several minutes after DNS is in place"
 
@@ -165,10 +220,7 @@ wait_for_domain_mapping_ready() {
     local attempt=1
     while [ "$attempt" -le "$max_attempts" ]; do
         local ready
-        ready=$(gcloud beta run domain-mappings describe --domain="$domain" \
-            --region="$GE_GCP_REGION" \
-            --project="$GE_GCP_PROJECT_ID" \
-            --format="value(status.conditions[?type='Ready'].status)" 2>/dev/null || echo "")
+        ready=$(get_domain_mapping_condition_status "$domain" "Ready")
 
         if [ "$ready" = "True" ]; then
             log_info "Domain mapping is Ready: https://$domain"
@@ -287,8 +339,9 @@ main() {
     echo
     echo "Next steps:"
     echo "1. Run 'inference_service/deploy.sh' to deploy the inference service to Cloud Run"
-    echo "2. Check Cloud Run console to verify the service is running"
-    echo "3. Verify domain mapping status and certificate provisioning"
+    echo "2. Re-run this script or let deploy.sh reconcile domain mapping after the first deploy"
+    echo "3. Check Cloud Run console to verify the service is running"
+    echo "4. Verify domain mapping status and certificate provisioning"
     echo
     echo "Important notes:"
     echo "- Model files are stored in: gs://$GE_GCP_PROJECT_ID-engagement-prediction-model-$GE_ENVIRONMENT"
