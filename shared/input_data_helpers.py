@@ -173,6 +173,59 @@ def get_padded_embedding_history_and_mask(
     return padded, mask
 
 
+def get_padded_embedding_history_and_mask_batched(
+    history_embeddings: Any,
+    max_history_len: int, 
+    embed_dim: int,
+) -> Tuple[List[List[List[float]]], List[List[float]]]:
+    
+    if not isinstance(history_embeddings, list) or len(history_embeddings) == 0:
+        raise ValueError("Invalid input: history_embeddings must be a non-empty list")
+
+    batch_padded_history_embeddings = []
+    batch_history_mask = []
+
+    first_non_none = next((x for x in history_embeddings if x is not None), None)
+    if first_non_none is None or _is_embedding_struct(first_non_none):
+        # Single input: raw_history_embeddings is a list of embeddings structs (or all Nones).
+        padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
+            history_embeddings=history_embeddings,
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+        )
+        batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
+        batch_history_mask.append(history_mask.tolist())
+    else:
+        # Batched input: raw_history_embeddings is a list of single-user histories.
+        for single_history_embeddings in history_embeddings:  # type: ignore[assignment]
+            if single_history_embeddings is None:
+                padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
+                    history_embeddings=[],
+                    max_history_len=max_history_len,
+                    embed_dim=embed_dim,
+                )
+            else:
+                if not isinstance(single_history_embeddings, list):
+                    raise ValueError("Invalid batched input: each batch element must be a list")
+
+                inner_first_non_none = next((x for x in single_history_embeddings if x is not None), None)
+                if inner_first_non_none is not None and not _is_embedding_struct(inner_first_non_none):
+                    raise ValueError(
+                        "Invalid batched input: expected each batch element to be a list of embeddings-structs"
+                    )
+
+                padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
+                    history_embeddings=single_history_embeddings,
+                    max_history_len=max_history_len,
+                    embed_dim=embed_dim,
+                )
+
+            batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
+            batch_history_mask.append(history_mask.tolist())
+    
+    return batch_padded_history_embeddings, batch_history_mask
+
+
 # ----------------------------------------
 # Inference helpers
 # ----------------------------------------

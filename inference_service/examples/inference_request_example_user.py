@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-
+import requests
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,45 +48,42 @@ def main() -> None:
       - The inference service must be configured with `GE_INFERENCE_MODELS` including "user-tower".
       - Defaults assume MiniLM-style embeddings (D=384).
     """
-    inference_url = "http://127.0.0.1:8000/models/user-tower/predict"
+    inference_url = "http://127.0.0.1:8080/models/user-tower/predict"
 
     batch_size = 3
     max_history_len = 128
     embed_dim = 384
-    embedding_model = "all-MiniLM-L12-v2"
+    # embedding_model = "all-MiniLM-L12-v2"
 
     rng = np.random.default_rng()
 
-    batch_raw_history_embeddings: list[list[object]] = []
+    batch_history_embeddings: list[list[list[float]]] = []
     for _ in range(batch_size):
         hist_len = int(rng.integers(low=1, high=max_history_len + 1))
-        single_raw_history: list[object] = []
+        single_history_embedding: list[list[float]] = []
         for _ in range(hist_len):
-            vec = (rng.random((embed_dim,)) - 0.5).astype(np.float32).tolist()
-            single_raw_history.append(
-                [
-                    {"key": embedding_model, "value": _encode_embedding(vec)},
-                    # Optional extra embedding entry to mirror real multi-model structs.
-                    {"key": "other_model", "value": _encode_embedding([1.0, 2.0, 3.0])},
-                ]
-            )
-        batch_raw_history_embeddings.append(single_raw_history)
+            single_history_embedding.append((rng.random((embed_dim,)) - 0.5).astype(np.float32).tolist())
 
-    print(f"Batch dimension: {len(batch_raw_history_embeddings)}")
-    print(f"History dimension: {len(batch_raw_history_embeddings[0])}")
-    print(f"Input example: {batch_raw_history_embeddings[0][0]}")
+        batch_history_embeddings.append(single_history_embedding)
 
-    batch_padded_history_embeddings, batch_history_mask = get_user_tower_input_from_raw_history_embeddings(
-        raw_history_embeddings=batch_raw_history_embeddings,
-        embedding_model=embedding_model,
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-    )
-    outputs = query_user_tower_with_processed_history_embeddings(
-        batch_padded_history_embeddings,
-        batch_history_mask,
-        inference_url
-    )
+    print(f"Batch dimension: {len(batch_history_embeddings)}")
+    print(f"History dimension: {len(batch_history_embeddings[0])}")
+    print(f"Input example: {batch_history_embeddings[0][0]}")
+    
+    payload = {
+        "history_embeddings": batch_history_embeddings, 
+    }
+
+    # hit api
+    resp = requests.post(inference_url, json=payload, timeout=30, headers={"X-API-Key": "dave-dev-key"})
+    if resp.status_code != 200:
+        raise ValueError(f"Request failed with status code {resp.status_code}: {resp.text}")
+
+    try:
+        outputs = resp.json()['outputs']
+    except ValueError:
+        raise ValueError(f"Response was not valid JSON (status code {resp.status_code}): {resp.text}")
+
     print(f"Batch size: {len(outputs)}")
     print(f"Output dim: {len(outputs[0])}")
     print(f"Example output first 5: {outputs[0][:5]}")

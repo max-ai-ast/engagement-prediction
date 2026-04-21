@@ -33,7 +33,7 @@ RUN python -m venv /opt/venv \
     && pip install --no-cache-dir --upgrade pip
 
 # Install Python deps (FastAPI/ClearML/etc.)
-COPY requirements.txt .
+COPY inference_service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 ARG TORCH_VERSION=2.5.1
@@ -42,7 +42,8 @@ RUN pip install --no-cache-dir \
     --index-url "https://download.pytorch.org/whl/cpu" \
     "torch==${TORCH_VERSION}+cpu"
 
-COPY app.py .
+COPY inference_service/app.py .
+COPY shared ./shared
 
 EXPOSE 8080
 USER appuser

@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Discriminator, Tag, model_validator
 
+from shared.input_data_helpers import get_padded_embedding_history_and_mask_batched
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -90,8 +92,6 @@ _models: Dict[str, LoadedModel] = {}
 class UserTowerPredictRequest(BaseModel):
     # history_embeddings: [T, D] or [B, T, D]
     history_embeddings: Union[List[List[float]], List[List[List[float]]]]
-    # history_mask: [T] or [B, T]
-    history_mask: Union[List[Union[int, bool, float]], List[List[Union[int, bool, float]]]]
 
     @model_validator(mode="after")
     def _validate_history(self) -> "UserTowerPredictRequest":
@@ -102,12 +102,12 @@ class UserTowerPredictRequest(BaseModel):
         # Determine shape: [T, D] vs [B, T, D]
         if isinstance(he[0], list) and len(he[0]) > 0 and not isinstance(he[0][0], list):
             # [T, D]
-            seq_len = len(he)
+            # Confirm all rows have the same embedding dim
             d0 = len(he[0])
             if d0 == 0:
-                raise ValueError("history_embeddings must have shape [T, D] with D>0")
+                raise ValueError("history_embeddings must have non-zero embedding dimension")
             if not all(isinstance(row, list) and len(row) == d0 for row in he):
-                raise ValueError("history_embeddings must be rectangular with shape [T, D]")
+                raise ValueError("history_embeddings must all have the same embedding dimension")
             batch = 1
         else:
             # [B, T, D]
@@ -115,42 +115,13 @@ class UserTowerPredictRequest(BaseModel):
             if batch > GE_INFERENCE_MAX_BATCH:
                 raise ValueError(f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
             if not (isinstance(he[0], list) and len(he[0]) > 0 and isinstance(he[0][0], list)):
-                raise ValueError("history_embeddings must have shape [T, D] or [B, T, D]")
-            seq_len = len(he[0])
+                raise ValueError("history_embeddings must have 2 (non-batched) or 3 (batched) dimensions")
             d0 = len(he[0][0])
-            if seq_len == 0 or d0 == 0:
-                raise ValueError("history_embeddings must have shape [B, T, D] with T>0 and D>0")
-            for b in he:
-                if not (isinstance(b, list) and len(b) == seq_len):
-                    raise ValueError("history_embeddings must be rectangular with shape [B, T, D]")
-                for row in b:
-                    if not (isinstance(row, list) and len(row) == d0):
-                        raise ValueError("history_embeddings must be rectangular with shape [B, T, D]")
-
-        if seq_len != GE_INFERENCE_MAX_HISTORY_LEN:
-            raise ValueError(f"expected T == {GE_INFERENCE_MAX_HISTORY_LEN}, got T={seq_len}")
+            if d0 == 0:
+                raise ValueError("history_embeddings must have non-zero embedding dimension")
+            
         if GE_INFERENCE_EMBED_DIM and d0 != GE_INFERENCE_EMBED_DIM:
             raise ValueError(f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d0}")
-
-        mask = self.history_mask
-
-        if not isinstance(mask, list) or len(mask) == 0:
-            raise ValueError("'history_mask' must be a non-empty list")
-
-        is_mask_batched = isinstance(mask[0], list)
-        if is_mask_batched:
-            mb = mask  # type: ignore[assignment]
-            if len(mb) != batch:
-                raise ValueError(f"history_mask must have shape [B, T] = [{batch}, {seq_len}]. got B={len(mb)}")
-            for row in mb:
-                if not (isinstance(row, list) and len(row) == seq_len):
-                    raise ValueError(f"history_mask must have shape [B, T] = [{batch}, {seq_len}]")
-        else:
-            mv = mask  # type: ignore[assignment]
-            if batch != 1:
-                raise ValueError(f"history_mask must have shape [B, T] = [{batch}, {seq_len}]")
-            if len(mv) != seq_len:
-                raise ValueError(f"history_mask must have shape [T] = [{seq_len}]")
 
         return self
 
@@ -170,7 +141,7 @@ class PostTowerPredictRequest(BaseModel):
             batch = pe  # type: ignore[assignment]
             if len(batch) > GE_INFERENCE_MAX_BATCH:
                 raise ValueError(f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
-            d0 = len(batch[0]) if len(batch) > 0 else 0
+            d0 = len(batch[0]) if len(batch) > 0 else 0 # type: ignore
             if d0 == 0:
                 raise ValueError("each post_embeddings vector must be non-empty")
             if not all(isinstance(v, list) and len(v) == d0 for v in batch):
@@ -190,9 +161,9 @@ def _predict_request_discriminator(value: Any) -> str:
     if isinstance(value, dict):
         if "post_embeddings" in value:
             return "post-tower"
-        if "history_embeddings" in value and "history_mask" in value:
+        if "history_embeddings" in value:
             return "user-tower"
-    raise ValueError("Request must contain one of: 'post_embeddings' or 'history_embeddings'+'history_mask'.")
+    raise ValueError("Request must contain one of: 'post_embeddings' or 'history_embeddings'.")
 
 
 PredictRequest = Annotated[
@@ -504,54 +475,56 @@ def _predict_with_entry(entry: LoadedModel, req: PredictRequest) -> Any:
     _require_ready(entry)
     assert entry.module is not None and entry.device is not None
 
-    # Enforce schema against registered model type.
-    match entry.model_type:
-        case "user-tower":
-            if not isinstance(req, UserTowerPredictRequest):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Model type '{entry.model_type}' expects a user-tower request body with 'history_embeddings'",
-                )
-        case "post-tower":
-            if not isinstance(req, PostTowerPredictRequest):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Model type '{entry.model_type}' expects a post-tower request body with 'post_embeddings'",
-                )
-        case _:
-            assert_never(entry.model_type)
-
     with torch.inference_mode():
-        if entry.model_type == "user-tower":
-            assert isinstance(req, UserTowerPredictRequest)
-            history_embeddings = _coerce_input(
-                value=req.history_embeddings,
-                name="history_embeddings",
-                dtype=DTYPE,
-                device=entry.device,
-                non_batched_dim=2,
-            )
-            history_mask = _coerce_input(
-                value=req.history_mask,
-                name="history_mask",
-                dtype=torch.int64,
-                device=entry.device,
-                non_batched_dim=1,
-            )
-            y = entry.module(history_embeddings, history_mask)
-            return y
+        match entry.model_type:
+            case "user-tower":
+                # Enforce schema against registered model type.
+                if not isinstance(req, UserTowerPredictRequest):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Model type '{entry.model_type}' expects a user-tower request body with 'history_embeddings'",
+                    )
+                # take raw list inputs and pad/truncate:
+                history_embeddings_list, history_mask_list = get_padded_embedding_history_and_mask_batched(
+                    history_embeddings=req.history_embeddings,
+                    max_history_len=GE_INFERENCE_MAX_HISTORY_LEN,
+                    embed_dim=GE_INFERENCE_EMBED_DIM
+                ) 
 
-        if entry.model_type == "post-tower":
-            assert isinstance(req, PostTowerPredictRequest)
-            post_embeddings = _coerce_input(
-                value=req.post_embeddings,
-                name="post_embeddings",
-                dtype=DTYPE,
-                device=entry.device,
-                non_batched_dim=1,
-            )
-            y = entry.module(post_embeddings)
-            return y
+                history_embeddings = _coerce_input(
+                    value=history_embeddings_list,
+                    name="history_embeddings",
+                    dtype=DTYPE,
+                    device=entry.device,
+                    non_batched_dim=2,
+                )
+                history_mask = _coerce_input(
+                    value=history_mask_list,
+                    name="history_mask",
+                    dtype=torch.int64,
+                    device=entry.device,
+                    non_batched_dim=1,
+                )
+                y = entry.module(history_embeddings, history_mask)
+                return y
+            case "post-tower":
+                # Enforce schema against registered model type.
+                if not isinstance(req, PostTowerPredictRequest):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Model type '{entry.model_type}' expects a post-tower request body with 'post_embeddings'",
+                    )
+                post_embeddings = _coerce_input(
+                    value=req.post_embeddings,
+                    name="post_embeddings",
+                    dtype=DTYPE,
+                    device=entry.device,
+                    non_batched_dim=1,
+                )
+                y = entry.module(post_embeddings)
+                return y
+            case _:
+                assert_never(entry.model_type)
 
     raise HTTPException(status_code=500, detail=f"Unsupported model type: {entry.model_type}")
 
