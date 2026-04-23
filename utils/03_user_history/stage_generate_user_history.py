@@ -154,7 +154,7 @@ def _build_user_history_directory(
     # though (target_did, like_uri) is the official join key.  Downstream
     # consumers should join on the key columns, but positional alignment can be
     # relied upon as an optimization if needed.
-    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at"])
+    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at", "split"])
     directory_lf = all_target_keys.join(
         directory_lf,
         on="target_idx",
@@ -165,7 +165,7 @@ def _build_user_history_directory(
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices"),
         pl.col("raw_prior_count").fill_null(0),
-    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"])
+    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count", "split"])
 
     return directory_lf
 
@@ -299,6 +299,35 @@ def _log_and_plot_history_distribution(
     logger.info(f"✓ Saved history distribution plot to {plot_path.name}")
 
 
+def _generate_author_idx_mapping(
+    directory_df: pl.DataFrame, 
+    likes_lf: pl.LazyFrame, 
+    logger: logging.Logger
+) -> pl.DataFrame:
+    
+    unique_emb_indices_df = directory_df.filter(
+        pl.col("split") == "train"
+    ).select(
+        pl.col("prior_emb_indices").explode().drop_nulls().unique().alias("emb_idx")
+    )
+    
+    logger.info(f"Unique embedding indices in training history: {len(unique_emb_indices_df):,}")
+    
+    author_idx_df = unique_emb_indices_df.join(
+        likes_lf.select("emb_idx", "author_did").unique().collect(),
+        on="emb_idx",
+    ).with_columns(
+        pl.col("author_did").rank("dense").cast(pl.UInt32).alias("author_idx")
+    )
+    # ).with_columns(
+    #     pl.col("author_did").count().over("author_did").alias("author_like_count")
+    # )
+
+    logger.info(f"Unique embedding indices after joining to likes_core: {len(author_idx_df):,}")
+
+    return author_idx_df
+
+
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
     Stage 3: Generate user history directory.
@@ -388,7 +417,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # === Write output ===
     log_operation_start('Write user history directory', 'STAGE_03_USER_HISTORY', logger)
-    output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
 
     # Collect using the streaming engine so that the intermediate fan-out join
     # is processed in batches rather than fully materialised in memory.
@@ -398,10 +426,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
-    # Select only the required output columns (drop analysis columns)
-    directory_df = directory_df.select(["target_did", "like_uri", "prior_emb_indices"])
+    author_idx_df = _generate_author_idx_mapping(directory_df, likes_lf, logger)
+    author_output_path = out_dir / f"author_idx_mapping_{out_dir.name}.parquet"
+    author_idx_df.write_parquet(author_output_path, compression="zstd")
 
-    directory_df.write_parquet(output_path, compression="zstd")
+    # user_history_df = _add_author_indices_to_history(directory_df, author_idx_df, logger)
+    user_history_df = directory_df
+
+    # Select only the required output columns (drop analysis columns)
+    user_history_df = user_history_df.select(["target_did", "like_uri", "prior_emb_indices"]) # "prior_author_indices"
+    user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
+    user_history_df.write_parquet(user_history_output_path, compression="zstd")
 
     n_output = len(directory_df)
 
@@ -427,7 +462,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     mem_tracker.checkpoint("after_write_output", quiet=True)
 
-    logger.info(f"✓ Wrote {n_output:,} directory entries to {output_path.name}")
+    logger.info(f"✓ Wrote {n_output:,} directory entries to {user_history_output_path.name}")
     logger.info(f"  With history: {n_with_history:,} ({100*n_with_history/n_output:.1f}%)")
     logger.info(f"  Empty history: {n_empty_history:,} ({100*n_empty_history/n_output:.1f}%)")
     logger.info(f"  Prior likes per target: mean={mean_prior:.1f}, min={min_prior}, max={max_prior}")
@@ -454,6 +489,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     return {
         'output_dir': out_dir,
         'artifacts': {
-            'user_history_directory_path': str(output_path),
+            'user_history_directory_path': str(user_history_output_path),
         }
     }
