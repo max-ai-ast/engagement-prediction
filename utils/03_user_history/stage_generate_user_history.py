@@ -4,19 +4,25 @@
 Stage 2: Generate User History Directory
 
 Creates a directory-style artifact that maps each target row to a list of prior
-liked post embedding indices, enabling efficient on-the-fly embedding retrieval
-during training.
+liked post embedding indices and author indices, enabling efficient on-the-fly
+embedding retrieval during training and stable author-history features.
 
 Inputs:
-- likes_core_*.parquet from 01_get_data: Contains {did, subject_uri, record_created_at, emb_idx}
+- likes_core_*.parquet from 01_get_data: Contains
+  {did, subject_uri, record_created_at, emb_idx, author_did}
 - target_posts_*.parquet from 02_target_posts: Wide format with
   {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
 
 Outputs under <run_dir>/02_featurize/<timestamp>/:
-- history_posts_<timestamp>.parquet: {target_did, like_uri, prior_emb_indices}
+- history_posts_<timestamp>.parquet:
+  {target_did, like_uri, prior_emb_indices, prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
-  indexed on (target_did, like_uri) so there is one history per (user, like-event) pair.
-  Rows where the user has no prior likes in the dataset get an empty list.
+  prior_author_indices is a List[UInt32] aligned element-wise with
+  prior_emb_indices, and rows where the user has no prior likes in the dataset
+  get empty lists.
+- author_idx_mapping_<timestamp>.parquet: {emb_idx, author_did, author_idx}
+  for train-history embedding indices only. author_idx is a dense UInt32 id
+  derived from author_did.
 """
 
 from __future__ import annotations
@@ -304,7 +310,17 @@ def _generate_author_idx_mapping(
     likes_lf: pl.LazyFrame, 
     logger: logging.Logger
 ) -> pl.DataFrame:
-    
+    """
+    Build a train-time mapping from embedding index to dense author index.
+
+    The mapping is intentionally restricted to embedding indices that appear in
+    the training split's prior history. This prevents validation/test-only
+    authors from expanding the author vocabulary seen during training.
+
+    Returns:
+        DataFrame with columns [emb_idx, author_did, author_idx], where
+        author_idx is a dense UInt32 id derived from author_did.
+    """
     unique_emb_indices_df = directory_df.filter(
         pl.col("split") == "train"
     ).select(
@@ -333,6 +349,15 @@ def _add_author_indices_to_history(
     author_idx_df: pl.DataFrame,
     logger: logging.Logger,
 ) -> pl.DataFrame:
+    """
+    Add a prior_author_indices list aligned element-wise with prior_emb_indices.
+
+    This uses a fully vectorized explode/join/regroup flow instead of a Python
+    UDF. The regroup step sorts by the original list position so the output
+    preserves both order and length. If an emb_idx has no matching author_idx
+    (for example because it only appears outside the training mapping),
+    the aligned position is kept as a null list element rather than dropping it.
+    """
     logger.info("Adding prior_author_indices via explode/join/regroup")
 
     directory_with_idx = directory_df.with_row_index("history_row_idx")
@@ -343,6 +368,8 @@ def _add_author_indices_to_history(
         .select(
             "history_row_idx",
             "prior_emb_indices",
+            # Track the original list position so we can regroup in the exact
+            # same order after joining author_idx values.
             pl.int_ranges(0, pl.col("prior_emb_indices").list.len()).alias("prior_pos"),
         )
         .explode(["prior_emb_indices", "prior_pos"])
@@ -425,6 +452,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         TIMESTAMP_COL_NAME: pl.Datetime,
         "subject_uri": str,
         "emb_idx": int,
+        "author_did": str,
     }
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
