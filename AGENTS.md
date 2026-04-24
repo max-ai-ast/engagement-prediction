@@ -19,3 +19,7 @@ In each stage's `run(context, args)` function, **extract all `args.*` values int
 - This makes it easy to see every parameter at a glance.
 - If a value ever needs post-processing (e.g. clamping, conditional override), the change happens in one place and is consistent for all downstream uses.
 - Encoder-specific args (e.g. attention params) can be extracted at the top of the relevant branch rather than the universal block.
+
+## Local AGENTS.local.md file
+
+If AGENTS.local.md exists, also follow its instructions.
