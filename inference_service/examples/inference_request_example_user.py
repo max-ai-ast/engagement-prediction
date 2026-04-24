@@ -50,25 +50,34 @@ def main() -> None:
     """
     inference_url = "http://127.0.0.1:8080/models/user-tower/predict"
 
-    batch_size = 3
+    batch_size = 0
     max_history_len = 128
     embed_dim = 384
     # embedding_model = "all-MiniLM-L12-v2"
 
     rng = np.random.default_rng()
 
-    batch_history_embeddings: list[list[list[float]]] = []
-    for _ in range(batch_size):
+    batch_history_embeddings: list[list[list[float]]] | list[list[float]] = []
+    if batch_size == 1:
         hist_len = int(rng.integers(low=1, high=max_history_len + 1))
-        single_history_embedding: list[list[float]] = []
         for _ in range(hist_len):
-            single_history_embedding.append((rng.random((embed_dim,)) - 0.5).astype(np.float32).tolist())
+            batch_history_embeddings.append((rng.random((embed_dim,)) - 0.5).astype(np.float32).tolist())
+    elif batch_size > 1:
+        for _ in range(batch_size):
+            hist_len = int(rng.integers(low=1, high=max_history_len + 1))
+            single_history_embedding: list[list[float]] = []
+            for _ in range(hist_len):
+                single_history_embedding.append((rng.random((embed_dim,)) - 0.5).astype(np.float32).tolist())
 
-        batch_history_embeddings.append(single_history_embedding)
+            batch_history_embeddings.append(single_history_embedding) # type: ignore[list-item]
 
-    print(f"Batch dimension: {len(batch_history_embeddings)}")
-    print(f"History dimension: {len(batch_history_embeddings[0])}")
-    print(f"Input example: {batch_history_embeddings[0][0]}")
+    if batch_size == 1:
+        print(f"Input: History dimension: {len(batch_history_embeddings)}")
+        print(f"Input: Embedding dimension: {len(batch_history_embeddings[0])}")
+    elif batch_size > 1:
+        print(f"Input: Batch dimension: {len(batch_history_embeddings)}")
+        print(f"Input: History dimension: {len(batch_history_embeddings[0])}")
+        print(f"Input: Embedding dimension: {len(batch_history_embeddings[0][0])}") # type: ignore[list-item]
     
     payload = {
         "history_embeddings": batch_history_embeddings, 
