@@ -40,6 +40,7 @@ from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger, 
     log_operation_start, 
+    log_prior_stage_inputs,
     validate_dataframe_schema, 
     load_parquet_from_prior, 
     parse_one_ts,
@@ -473,6 +474,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     t0 = time.time()
 
     prior_stage_path = context.resolve_prior_output('01_get_data', prior_path=context.prior_outputs.get('01_get_data'))
+    log_prior_stage_inputs(context, logger)
     
     posts_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_stage_path, "posts_core_")
     validate_dataframe_schema(posts_core_lf, {

@@ -88,6 +88,28 @@ def test_stage_metadata_json_includes_nulls(tmp_path):
     assert resolved["foo"] is None
 
 
+def test_finalize_stage_appends_prior_inputs_to_stage_info(tmp_path):
+    run_dir = Path(tmp_path) / "runs" / "run1"
+    artifacts_dir = Path(tmp_path) / "artifacts"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    prior_dir = artifacts_dir / "01_get_data" / "20260101_000000_abcd1234"
+    prior_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", pipeline_run_id="run1")
+    ctx.begin_stage("target_posts", "02_target_posts")
+    ctx.record_prior_input("01_get_data", prior_dir)
+    out_dir = ctx.new_stage_dir(tag="test")
+    (out_dir / "stage_info.txt").write_text("stage: target_posts\n")
+
+    args = argparse.Namespace()
+    ctx.finalize_stage(stage_key="target_posts", stage_folder="02_target_posts", output_dir=out_dir, args=args, argv=None)
+
+    stage_info = (out_dir / "stage_info.txt").read_text()
+    assert "prior_inputs: 1" in stage_info
+    assert f"prior_input_01_get_data: {prior_dir.resolve()}" in stage_info
+
+
 def test_new_stage_dir_rejects_mismatched_stage_folder_when_active(tmp_path):
     run_dir = Path(tmp_path) / "runs" / "run1"
     artifacts_dir = Path(tmp_path) / "artifacts"

@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover
     import numpy as np  # type: ignore
     import pandas as pd  # type: ignore
     import polars as pl  # type: ignore
+    from utils.pipeline.core import Context
 
 
 # Avoid HF tokenizers fork warnings/deadlocks in multiprocessing contexts
@@ -603,6 +604,23 @@ def log_operation_start(operation_name: str, stage_name: str, logger: Optional[l
     logger.info("=" * 60)
     logger.info(f"Starting: {operation_name}")
     return logger
+
+
+def log_prior_stage_inputs(
+    context: "Context",
+    logger: logging.Logger,
+    *,
+    header: str = "Resolved prior inputs used",
+) -> None:
+    """Log the concrete prior stage artifact directories used by the active stage."""
+    prior_inputs = context.get_active_stage_inputs()
+    if not prior_inputs:
+        logger.info(f"{header}: none")
+        return
+
+    logger.info(f"{header}:")
+    for folder, path in sorted(prior_inputs.items()):
+        logger.info(f"  {folder}: {path}")
 
 
 def get_device(arg_device: Optional[str]) -> str:

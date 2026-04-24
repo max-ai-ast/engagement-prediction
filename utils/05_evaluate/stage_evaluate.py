@@ -35,7 +35,7 @@ import pandas as pd
 import polars as pl
 
 from utils.pipeline.core import Context
-from utils.helpers import get_stage_logger, log_operation_start
+from utils.helpers import get_stage_logger, log_operation_start, log_prior_stage_inputs
 from utils.dataloaders import filter_split_and_join_history, load_training_data
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ def resolve_train_output(
     for stage_key in ("train_mlp", "train_two_tower"):
         art_dir = context.get_artifact_dir(stage_key)
         if art_dir is not None and Path(art_dir).exists():
-            return Path(art_dir)
+            return context.record_prior_input("04_train", art_dir)
 
     return context.resolve_prior_output("04_train", prior_path=context.prior_outputs.get("04_train"))
 
@@ -303,6 +303,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     _, target_posts_df, history_df, embed_dim = load_training_data(
         context, logger=logger,
     )
+    log_prior_stage_inputs(context, logger)
 
     holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
     holdout_users = holdout_target_rows["target_did"].unique().to_list()

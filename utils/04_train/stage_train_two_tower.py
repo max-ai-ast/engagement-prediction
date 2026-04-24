@@ -110,6 +110,7 @@ from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
+    log_prior_stage_inputs,
     get_device,
     plot_model_performance,
     plot_training_history,
@@ -746,6 +747,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
         context, logger=logger,
     )
+    log_prior_stage_inputs(context, logger)
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---
     max_history_len = int(args.max_history_len)

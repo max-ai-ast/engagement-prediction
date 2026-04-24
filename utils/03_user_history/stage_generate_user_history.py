@@ -28,7 +28,14 @@ import polars as pl
 import time
 
 from utils.pipeline.core import Context
-from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
+from utils.helpers import (
+    get_stage_logger,
+    log_operation_start,
+    log_prior_stage_inputs,
+    validate_dataframe_schema,
+    load_parquet_from_prior,
+    TIMESTAMP_COL_NAME,
+)
 from utils.memory_helpers import MemoryTracker
 
 
@@ -320,6 +327,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         '02_target_posts',
         prior_path=context.prior_outputs.get('02_target_posts'),
     )
+    log_prior_stage_inputs(context, logger)
     logger.info(f"Using likes from: {prior_get_data}")
     logger.info(f"Using target posts from: {prior_target_posts_dir}")
 

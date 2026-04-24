@@ -972,7 +972,7 @@ def _resolve_prior(
     # Try context artifacts first (same-session run)
     art_dir = context.get_artifact_dir(stage_key)
     if art_dir is not None and Path(art_dir).exists():
-        return Path(art_dir)
+        return context.record_prior_input(folder, art_dir)
     # Filesystem scan (also records lineage for the active stage)
     return context.resolve_prior_output(folder, prior_path=context.prior_outputs.get(folder))
 

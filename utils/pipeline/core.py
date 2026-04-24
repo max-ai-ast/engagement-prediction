@@ -182,6 +182,17 @@ class Context:
         self._active_stage_folder = stage_folder
         self._active_stage_inputs = {}
 
+    def record_prior_input(self, stage_folder: str, chosen_path: Path) -> Path:
+        chosen_path = Path(chosen_path).resolve()
+        self._active_stage_inputs[stage_folder] = str(chosen_path)
+        return chosen_path
+
+    def get_active_stage_inputs(self) -> Dict[str, Path]:
+        return {
+            folder: Path(path).resolve()
+            for folder, path in self._active_stage_inputs.items()
+        }
+
     def resolve_prior_output(self, stage_folder: str, *, prior_path: Optional[Path] = None) -> Path:
         chosen = select_prior_output(
             artifacts_dir=Path(self.artifacts_dir).resolve(),
@@ -191,8 +202,7 @@ class Context:
         )
         if chosen is None:
             raise FileNotFoundError(f"Could not find prior outputs for stage folder '{stage_folder}' under {self.artifacts_dir}")
-        self._active_stage_inputs[stage_folder] = str(Path(chosen).resolve())
-        return chosen
+        return self.record_prior_input(stage_folder, chosen)
 
     def finalize_stage(
         self,
@@ -226,6 +236,7 @@ class Context:
             "inputs": self._active_stage_inputs.copy(),
         }
         _write_json(manifest_path, manifest)
+        self._append_stage_info_inputs(output_dir)
 
         self._update_lineage(
             stage_key=stage_key,
@@ -245,6 +256,22 @@ class Context:
     def get_artifact_dir(self, stage: str) -> Optional[Path]:
         info = self.artifacts.get(stage)
         return Path(info['output_dir']) if info and info.get('output_dir') else None
+
+    def _append_stage_info_inputs(self, output_dir: Path) -> None:
+        stage_info_path = Path(output_dir) / "stage_info.txt"
+        prior_inputs = self.get_active_stage_inputs()
+        lines = [f"prior_inputs: {len(prior_inputs)}"]
+        if prior_inputs:
+            for folder, path in sorted(prior_inputs.items()):
+                lines.append(f"prior_input_{folder}: {path}")
+        else:
+            lines.append("prior_input_none: true")
+
+        prefix = ""
+        if stage_info_path.exists():
+            existing = stage_info_path.read_text()
+            prefix = existing if existing.endswith("\n") else existing + "\n"
+        stage_info_path.write_text(prefix + "\n".join(lines) + "\n")
 
     def _update_lineage(
         self,
