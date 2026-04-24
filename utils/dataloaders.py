@@ -123,6 +123,69 @@ from utils.helpers import (
 from shared.input_data_helpers import get_padded_embedding_history_and_mask
 
 
+AUTHOR_PAD_IDX = 0
+AUTHOR_UNK_IDX = 1
+
+
+def build_author_table_lookup(
+    author_idx_mapping_df: pl.DataFrame,
+    min_author_support: int,
+) -> Tuple[np.ndarray, int]:
+    """Map Stage 3 author indices to final embedding-table rows.
+
+    Returns a pair ``(author_idx_to_table_row, author_table_num_rows)``.
+
+    These represent two different index spaces:
+
+    - ``author_idx_to_table_row`` is a lookup array keyed by raw Stage 3
+      ``author_idx`` values. It only needs entries for raw author ids that may
+      appear in the history artifact. Missing or out-of-range lookups are
+      handled downstream as ``AUTHOR_UNK_IDX``.
+    - ``author_table_num_rows`` is the size of the actual embedding table used
+      at training time. That table always reserves row ``0`` for padding and
+      row ``1`` for unknown authors, so it must be at least ``2`` even when no
+      supported authors survive filtering.
+    """
+    if min_author_support < 1:
+        raise ValueError("min_author_support must be >= 1")
+    required_cols = {"author_idx", "author_occurrence_count"}
+    missing_cols = required_cols.difference(author_idx_mapping_df.columns)
+    if missing_cols:
+        missing = ", ".join(sorted(missing_cols))
+        raise ValueError(f"author_idx_mapping_df is missing required columns: {missing}")
+
+    if len(author_idx_mapping_df) == 0:
+        # Empty Stage 3 mapping means there are no known raw author_idx values
+        # to translate. The lookup therefore only needs a dummy slot, while the
+        # embedding table still needs PAD=0 and UNK=1 rows.
+        author_idx_to_table_row = np.full(1, AUTHOR_UNK_IDX, dtype=np.uint32)
+        author_table_num_rows = 2
+        return author_idx_to_table_row, author_table_num_rows
+
+    max_author_idx = int(author_idx_mapping_df["author_idx"].max())
+    if max_author_idx < 1:
+        raise ValueError("author_idx values must start at 1")
+
+    author_idx_to_table_row = np.full(max_author_idx + 1, AUTHOR_UNK_IDX, dtype=np.uint32)
+    supported_df = author_idx_mapping_df.filter(
+        pl.col("author_occurrence_count") >= int(min_author_support)
+    )
+    if len(supported_df) == 0:
+        # Keep the full raw-author lookup shape so in-range Stage 3 author_idx
+        # values still resolve deterministically to UNK after support filtering.
+        author_table_num_rows = 2
+        return author_idx_to_table_row, author_table_num_rows
+
+    supported_author_indices = supported_df["author_idx"].to_numpy().astype(np.int64)
+    author_idx_to_table_row[supported_author_indices] = (supported_author_indices + 1).astype(np.uint32)
+    # Table row layout:
+    #   0 -> PAD
+    #   1 -> UNK
+    #   raw author_idx N -> row N + 1 when that author survives filtering
+    author_table_num_rows = int(supported_author_indices.max()) + 2
+    return author_idx_to_table_row, author_table_num_rows
+
+
 # ---------------------------------------------------------------------------
 # User Summarizer strategies
 # ---------------------------------------------------------------------------
@@ -891,7 +954,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
 def load_training_data(
     context: Context,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
+) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, Optional[pl.DataFrame], int]:
     """Locate and load the three upstream pipeline artifacts needed for training.
     
     This function abstracts away the complexity of finding prior stage outputs,
@@ -912,17 +975,19 @@ def load_training_data(
         logger: Optional logger for progress reporting
     
     Returns:
-        Tuple of (embeddings_mmap, target_posts_df, history_df, embed_dim):
+        Tuple of (embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim):
             - embeddings_mmap: Read-only numpy memmap [n_posts, D]
             - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
             - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
+            - author_idx_mapping_df: Optional Polars DataFrame with Stage 3
+              author_idx / author_occurrence_count metadata
             - embed_dim: Integer embedding dimensionality D
     
     Raises:
         FileNotFoundError: If any required artifact cannot be located
         
     Example:
-        >>> embeddings, targets, history, dim = load_training_data(
+        >>> embeddings, targets, history, author_idx_mapping, dim = load_training_data(
         ...     context=context,
         ...     logger=logger
         ... )
@@ -958,7 +1023,14 @@ def load_training_data(
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
-    return embeddings_mmap, target_posts_df, history_df, embed_dim
+    try:
+        author_idx_mapping_df = load_parquet_from_prior(history_dir, "author_idx_mapping_").collect()
+        logger.info(f"Loaded author_idx_mapping: {len(author_idx_mapping_df):,} rows")
+    except FileNotFoundError:
+        author_idx_mapping_df = None
+        logger.info("No author_idx_mapping artifact found in user_history stage output")
+
+    return embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim
 
 
 def _resolve_prior(
@@ -985,6 +1057,7 @@ def filter_split_and_join_history(
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
     split: str,
+    include_prior_author_indices: bool = False,
 ) -> pl.DataFrame:
     """Filter target posts to a split and left-join with user history.
 
@@ -1000,8 +1073,13 @@ def filter_split_and_join_history(
     filtered = target_posts_df.filter(
         (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
     )
+    history_columns = ["target_did", "like_uri", "prior_emb_indices"]
+    if include_prior_author_indices:
+        if "prior_author_indices" not in history_df.columns:
+            raise ValueError("history_df must contain prior_author_indices when author embeddings are enabled")
+        history_columns.append("prior_author_indices")
     return filtered.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        history_df.select(history_columns),
         on=["target_did", "like_uri"],
         how="left",
         maintain_order="left",
@@ -1016,8 +1094,10 @@ def _prepare_split_data(
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
     split: str,
+    use_author_embedding_table: bool = False,
+    author_idx_to_table_row: Optional[np.ndarray] = None,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str], Optional[List[np.ndarray]]]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -1060,7 +1140,12 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    joined = filter_split_and_join_history(target_posts_df, history_df, split)
+    joined = filter_split_and_join_history(
+        target_posts_df,
+        history_df,
+        split,
+        include_prior_author_indices=use_author_embedding_table,
+    )
     logger.info(f"  Split '{split}': {len(joined):,} target rows (after dropping null neg_emb_idx)")
 
     # Extract embedding indices for positive and negative posts
@@ -1075,15 +1160,41 @@ def _prepare_split_data(
     # while still supporting fast numpy indexing into the embeddings memmap
     prior_col = joined["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
+    prior_author_indices_list: Optional[List[np.ndarray]] = [] if use_author_embedding_table else None
+    prior_author_col = joined["prior_author_indices"].to_list() if use_author_embedding_table else None
+
+    if use_author_embedding_table and author_idx_to_table_row is None:
+        raise ValueError("author_idx_to_table_row must be provided when author embeddings are enabled")
+
     for row_val in prior_col.to_list():
+        idx = len(prior_emb_indices_list)
         if row_val is None or len(row_val) == 0:
             # Users with no history get an empty array (will become zero vector
             # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
             prior_emb_indices_list.append(np.array([], dtype=np.uint32))
+            if use_author_embedding_table and prior_author_indices_list is not None:
+                prior_author_indices_list.append(np.array([], dtype=np.uint32))
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
+            if use_author_embedding_table and prior_author_indices_list is not None and prior_author_col is not None:
+                raw_author_indices = prior_author_col[idx]
+                if raw_author_indices is None:
+                    raw_author_indices = [None] * len(row_val)
+                if len(raw_author_indices) != len(row_val):
+                    raise ValueError("prior_author_indices must be position-aligned with prior_emb_indices")
+                mapped_author_indices = []
+                for raw_author_idx in raw_author_indices:
+                    if raw_author_idx is None:
+                        mapped_author_indices.append(AUTHOR_UNK_IDX)
+                        continue
+                    raw_author_idx_int = int(raw_author_idx)
+                    if author_idx_to_table_row is not None and 0 <= raw_author_idx_int < len(author_idx_to_table_row):
+                        mapped_author_indices.append(int(author_idx_to_table_row[raw_author_idx_int]))
+                    else:
+                        mapped_author_indices.append(AUTHOR_UNK_IDX)
+                prior_author_indices_list.append(np.array(mapped_author_indices, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
+    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris, prior_author_indices_list
 
 
 # ---------------------------------------------------------------------------
@@ -1171,7 +1282,8 @@ class SummarizedEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
+            _,
+        ) = _prepare_split_data(target_posts_df, history_df, split, logger=logger)
 
         self._n_rows = len(like_emb_idx)
 
@@ -1332,12 +1444,15 @@ class SequenceEngagementDataset(Dataset):
         split: str,
         max_history_len: int,
         embed_dim: int,
+        use_author_embedding_table: bool = False,
+        author_idx_to_table_row: Optional[np.ndarray] = None,
         logger: Optional[logging.Logger] = None,
     ):
         # Store memmap reference for on-the-fly sequence loading
         self.embeddings = embeddings_mmap
         self.max_history_len = max_history_len
         self.embed_dim = embed_dim
+        self.use_author_embedding_table = bool(use_author_embedding_table)
 
         # Prepare aligned arrays for the requested split
         (
@@ -1347,7 +1462,15 @@ class SequenceEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
+            self.prior_author_indices,
+        ) = _prepare_split_data(
+            target_posts_df,
+            history_df,
+            split,
+            use_author_embedding_table=self.use_author_embedding_table,
+            author_idx_to_table_row=author_idx_to_table_row,
+            logger=logger,
+        )
 
         self._n_rows = len(like_emb_idx)
 
@@ -1406,6 +1529,16 @@ class SequenceEngagementDataset(Dataset):
         hist_indices = self.prior_emb_indices[row_idx]
         hist_embeddings = self.embeddings[hist_indices]
         padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
+        history_author_indices = None
+        if self.use_author_embedding_table:
+            if self.prior_author_indices is None:
+                raise ValueError("prior_author_indices must be available when author embeddings are enabled")
+            mapped_author_indices = self.prior_author_indices[row_idx]
+            padded_author_indices = np.full(self.max_history_len, AUTHOR_PAD_IDX, dtype=np.int64)
+            if len(mapped_author_indices) > 0:
+                truncated_len = min(len(mapped_author_indices), self.max_history_len)
+                padded_author_indices[:truncated_len] = mapped_author_indices[:truncated_len]
+            history_author_indices = torch.from_numpy(padded_author_indices)
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:
@@ -1417,7 +1550,7 @@ class SequenceEngagementDataset(Dataset):
             label = 0.0
             post_id = self.neg_uris[row_idx]
 
-        return {
+        output = {
             "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
             "history_mask": torch.from_numpy(mask),  # [max_seq]
             "target_post_embedding": post_vec,
@@ -1425,6 +1558,9 @@ class SequenceEngagementDataset(Dataset):
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
         }
+        if history_author_indices is not None:
+            output["history_author_indices"] = history_author_indices
+        return output
 
 
 # ---------------------------------------------------------------------------

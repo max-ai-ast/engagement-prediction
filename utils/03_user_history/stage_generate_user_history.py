@@ -310,15 +310,21 @@ def _generate_author_idx_mapping(
     the training split's prior history. This prevents validation/test-only
     authors from expanding the author vocabulary seen during training.
 
+    ``author_occurrence_count`` counts how many total prior-history positions in
+    the training split resolve to a given author. This is not the number of
+    unique emb_idx values; repeated appearances of the same emb_idx in train
+    history contribute multiple counts.
+
     Returns:
-        DataFrame with columns [emb_idx, author_did, author_idx], where
+        DataFrame with columns
+        [emb_idx, author_did, author_idx, author_occurrence_count], where
         author_idx is a dense UInt32 id derived from author_did.
     """
     unique_emb_indices_df = directory_df.filter(
         pl.col("split") == "train"
     ).select(
-        pl.col("prior_emb_indices").explode().drop_nulls().unique().alias("emb_idx")
-    )
+        pl.col("prior_emb_indices").explode().drop_nulls().alias("emb_idx")
+    ).group_by("emb_idx").agg(pl.len().alias("emb_idx_count"))
     
     logger.info(f"Unique embedding indices in training history: {len(unique_emb_indices_df):,}")
     
@@ -326,11 +332,9 @@ def _generate_author_idx_mapping(
         likes_lf.select("emb_idx", "author_did").unique().collect(),
         on="emb_idx",
     ).with_columns(
-        pl.col("author_did").rank("dense").cast(pl.UInt32).alias("author_idx")
-    )
-    # ).with_columns(
-    #     pl.col("author_did").count().over("author_did").alias("author_like_count")
-    # )
+        pl.col("author_did").rank("dense").cast(pl.UInt32).alias("author_idx"),
+        pl.col("emb_idx_count").sum().over("author_did").alias("author_occurrence_count")
+    ).drop("emb_idx_count")
 
     logger.info(f"Unique embedding indices after joining to likes_core: {len(author_idx_df):,}")
 

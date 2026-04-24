@@ -91,6 +91,10 @@ DEFAULTS: Dict[str, Any] = {
     "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
     "l2_normalize_embeddings": False,
     "similarity_temperature": 1.0,
+    "use_author_embedding_table": False,
+    "author_embedding_dim": 32,
+    "min_author_support": 5,
+    "author_unknown_dropout_rate": 0.1,
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
@@ -592,7 +596,20 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
             + f"Allowed values: {allowed}"
         )
-    
+
+    use_author_embedding_table = bool(args.use_author_embedding_table)
+    if use_author_embedding_table:
+        if model_type != "two-tower":
+            raise ValueError("--use-author-embedding-table is only supported for --model-type 'two-tower'.")
+        if user_encoder == "summarized":
+            raise ValueError("--use-author-embedding-table is not supported with --user-encoder 'summarized'.")
+        if int(args.author_embedding_dim) <= 0:
+            raise ValueError("--author-embedding-dim must be positive.")
+        if int(args.min_author_support) < 1:
+            raise ValueError("--min-author-support must be >= 1.")
+        if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
+            raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
+
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
     stage_order = _get_stage_order_for_model_type(train_key)
@@ -774,6 +791,15 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable L2 normalization on two-tower user/post embeddings before similarity scoring")
     _add_arg_with_default(p_all, "--similarity-temperature", type=float, default=argparse.SUPPRESS,
                           help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
+    _add_arg_with_default(p_all, "--use-author-embedding-table",
+                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable a trainable author embedding table for history posts in the two-tower model")
+    _add_arg_with_default(p_all, "--author-embedding-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Embedding dimension for the two-tower history author embedding table")
+    _add_arg_with_default(p_all, "--min-author-support", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum train-history author occurrence count required for a dedicated embedding row")
+    _add_arg_with_default(p_all, "--author-unknown-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing a supported history author with the UNK row")
     # Stage 5 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")

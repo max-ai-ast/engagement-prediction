@@ -8,6 +8,7 @@ import torch.nn as nn
 stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
+HistoryAuthorFeatureEncoder = stage_train_two_tower.HistoryAuthorFeatureEncoder
 
 
 # =============================================================================
@@ -1009,3 +1010,108 @@ def test_two_tower_different_num_heads():
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
         assert scores.shape == (batch_size,)
+
+
+def test_history_author_feature_encoder_zeroes_padding_row():
+    encoder = HistoryAuthorFeatureEncoder(
+        post_embedding_dim=16,
+        author_table_num_rows=8,
+        author_embedding_dim=4,
+        author_unknown_dropout_rate=0.0,
+    )
+
+    assert torch.all(encoder.author_embedding.weight[0] == 0)
+    assert torch.any(encoder.author_embedding.weight[1] != 0)
+
+
+def test_two_tower_author_embeddings_only_affect_user_history_path():
+    model = TwoTowerModel(
+        post_embedding_dim=16,
+        shared_dim=8,
+        user_hidden_dim=32,
+        post_hidden_dim=12,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=3,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
+        use_author_embedding_table=True,
+        author_table_num_rows=6,
+        author_embedding_dim=4,
+        author_unknown_dropout_rate=0.0,
+    )
+    model.eval()
+
+    batch_size = 2
+    history_embeddings = torch.randn(batch_size, 3, 16)
+    history_mask = torch.tensor([[True, True, False], [True, True, True]])
+    history_author_indices = torch.tensor([[2, 3, 0], [4, 1, 5]], dtype=torch.long)
+    post_embeddings = torch.randn(batch_size, 16)
+
+    user_without_authors = model.user_tower(history_embeddings, history_mask)
+    user_with_authors = model.encode_user(history_embeddings, history_mask, history_author_indices)
+    post_direct = model.encode_post(post_embeddings)
+    post_forward = model.post_tower(post_embeddings)
+
+    assert not torch.allclose(user_without_authors, user_with_authors)
+    assert torch.allclose(post_direct, post_forward)
+
+
+def test_two_tower_author_dropout_only_remaps_supported_rows():
+    model = TwoTowerModel(
+        post_embedding_dim=8,
+        shared_dim=4,
+        user_hidden_dim=16,
+        post_hidden_dim=8,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=4,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
+        use_author_embedding_table=True,
+        author_table_num_rows=6,
+        author_embedding_dim=3,
+        author_unknown_dropout_rate=1.0,
+    )
+    model.train()
+
+    history_embeddings = torch.randn(1, 4, 8)
+    history_author_indices = torch.tensor([[0, 1, 2, 5]], dtype=torch.long)
+    fused = model.history_author_feature_encoder(history_embeddings, history_author_indices)
+
+    remapped = model.history_author_feature_encoder.author_embedding(
+        torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
+    )
+    expected = model.history_author_feature_encoder.fusion_layer(
+        torch.cat([history_embeddings, remapped], dim=-1)
+    )
+
+    assert torch.allclose(fused, expected)
+
+
+def test_two_tower_rejects_author_embeddings_for_summarized_encoder():
+    with pytest.raises(ValueError, match="summarized"):
+        TwoTowerModel(
+            post_embedding_dim=16,
+            shared_dim=16,
+            user_hidden_dim=16,
+            post_hidden_dim=16,
+            num_attention_heads=4,
+            num_attention_layers=1,
+            max_history_len=4,
+            dropout_rate=0.0,
+            similarity_temperature=1.0,
+            user_encoder_type="summarized",
+            use_post_encoder=True,
+            l2_normalize_embeddings=False,
+            use_author_embedding_table=True,
+            author_table_num_rows=4,
+            author_embedding_dim=2,
+            author_unknown_dropout_rate=0.1,
+        )

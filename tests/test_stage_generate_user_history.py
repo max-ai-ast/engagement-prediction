@@ -500,6 +500,58 @@ def test_generate_author_idx_mapping_uses_train_split_only(generate_author_idx_m
     assert result["author_did"].to_list() == ["author_a", "author_a"]
     assert result.schema["author_idx"] == pl.UInt32
     assert result["author_idx"].to_list() == [1, 1]
+    assert result["author_occurrence_count"].to_list() == [2, 2]
+
+
+def test_generate_author_idx_mapping_author_occurrence_count_counts_train_history_positions(
+    generate_author_idx_mapping,
+):
+    """author_occurrence_count should sum all train-history occurrences per author."""
+    logger = _make_test_logger()
+
+    directory_df = pl.DataFrame({
+        "target_did": ["u1", "u2", "u3"],
+        "like_uri": ["at://u1/like/1", "at://u2/like/1", "at://u3/like/1"],
+        "seen_at": [
+            datetime(2024, 1, 2, 0, 0),
+            datetime(2024, 1, 3, 0, 0),
+            datetime(2024, 1, 4, 0, 0),
+        ],
+        "prior_emb_indices": [
+            [101, 102, 101],
+            [102, 103],
+            [999],  # test split only; should not contribute
+        ],
+        "raw_prior_count": [3, 2, 1],
+        "split": ["train", "train", "test"],
+    })
+
+    likes_lf = pl.DataFrame({
+        "did": ["reader_1", "reader_1", "reader_2", "reader_3"],
+        "record_created_at": [
+            datetime(2024, 1, 1, 0, 0),
+            datetime(2024, 1, 1, 1, 0),
+            datetime(2024, 1, 1, 2, 0),
+            datetime(2024, 1, 1, 3, 0),
+        ],
+        "subject_uri": ["p101", "p102", "p103", "p999"],
+        "emb_idx": [101, 102, 103, 999],
+        "author_did": ["author_a", "author_a", "author_b", "author_z"],
+    }).lazy()
+
+    result = generate_author_idx_mapping(directory_df, likes_lf, logger).sort("emb_idx")
+
+    assert result["emb_idx"].to_list() == [101, 102, 103]
+    assert result["author_did"].to_list() == ["author_a", "author_a", "author_b"]
+    assert result["author_idx"].to_list() == [1, 1, 2]
+
+    # Train history occurrences:
+    # - emb_idx 101 appears twice
+    # - emb_idx 102 appears twice
+    # - emb_idx 103 appears once
+    # author_a owns 101 and 102 -> 4 total positions
+    # author_b owns 103 -> 1 total position
+    assert result["author_occurrence_count"].to_list() == [4, 4, 1]
 
 
 def test_add_author_indices_to_history_preserves_order_and_alignment(add_author_indices_to_history):

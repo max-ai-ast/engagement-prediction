@@ -392,7 +392,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, history_df, _, embed_dim = load_training_data(
         context, logger=logger,
     )
 
