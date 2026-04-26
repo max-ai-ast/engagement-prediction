@@ -1,3 +1,9 @@
+### Contributing
+
+Interested in contributing? We'd love to have you! 
+
+First, please join our discord and introduce yourself: https://discord.com/invite/8bWEyrkrJC. Unless you've joined the discord and engaged with the community there, all issues/PRs will be auto-closed.
+
 ### Engagement Prediction (Modular Workflow)
 
 This repository implements a six-stage modular pipeline to predict engagement on Bluesky posts with minimal duplication of work and fast iteration for releveling experiments.
