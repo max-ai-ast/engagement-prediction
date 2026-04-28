@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Tuple, Dict, List, Optional, Union
+from typing import Any, Tuple, Dict, List, Optional, Union, Literal
 import numpy as np
 import base64
 import struct
@@ -173,74 +173,66 @@ def get_padded_embedding_history_and_mask(
     return padded, mask
 
 
+HistoryEmbeddingsShape = Literal["single_empty", "single_history", "batched_history"]
+
+
+def classify_history_embeddings_shape(history_embeddings: Any) -> HistoryEmbeddingsShape:
+    if not isinstance(history_embeddings, list):
+        raise ValueError("history_embeddings must be a list")
+    if len(history_embeddings) == 0:
+        return "single_empty"
+    if not isinstance(history_embeddings[0], list):
+        raise ValueError("history_embeddings must be a list of lists")
+    if len(history_embeddings[0]) == 0:
+        if len(history_embeddings) == 1:
+            return "single_empty"
+        return "batched_history"
+    if isinstance(history_embeddings[0][0], list):
+        return "batched_history"
+    return "single_history"
+
+
+def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:
+    if len(user_history) == 0:
+        return []
+    if len(user_history) == 1 and isinstance(user_history[0], list) and len(user_history[0]) == 0:
+        return []
+    return user_history  # type: ignore[return-value]
+
+
+def _normalize_history_embeddings_to_batch(
+    history_embeddings: Any,
+) -> list[list[list[float]]]:
+    shape = classify_history_embeddings_shape(history_embeddings)
+
+    match shape:
+        case "single_empty":
+            return [[]]
+        case "single_history":
+            return [history_embeddings]
+        case "batched_history":
+            return [
+                _normalize_empty_user_history(user_history)
+                for user_history in history_embeddings
+            ]
+
+
 def get_padded_embedding_history_and_mask_batched(
     history_embeddings: Any,
     max_history_len: int, 
     embed_dim: int,
 ) -> Tuple[List[List[List[float]]], List[List[float]]]:
-    
-    if not isinstance(history_embeddings, list):
-        raise ValueError("Invalid input: history_embeddings must be a list")
-
+    batch_history_embeddings = _normalize_history_embeddings_to_batch(history_embeddings)
     batch_padded_history_embeddings = []
     batch_history_mask = []
 
-    if len(history_embeddings) == 0:
+    for single_history_embeddings in batch_history_embeddings:
         padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
-            history_embeddings=[],
-            max_history_len=max_history_len,
-            embed_dim=embed_dim,
-        )
-        return [padded_history_embeddings.tolist()], [history_mask.tolist()]
-
-    first_non_none = next((x for x in history_embeddings if x is not None), None)
-    if first_non_none is None:
-        padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
-            history_embeddings=[],
-            max_history_len=max_history_len,
-            embed_dim=embed_dim,
-        )
-        return [padded_history_embeddings.tolist()], [history_mask.tolist()]
-
-    if _is_numeric_vector(first_non_none):
-        # Single input: history_embeddings has shape [T, D].
-        padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
-            history_embeddings=history_embeddings,
+            history_embeddings=single_history_embeddings,
             max_history_len=max_history_len,
             embed_dim=embed_dim,
         )
         batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
         batch_history_mask.append(history_mask.tolist())
-    else:
-        # Batched input: history_embeddings has shape [B, T, D].
-        for single_history_embeddings in history_embeddings:  # type: ignore[assignment]
-            if single_history_embeddings is None:
-                single_history_embeddings = []
-            
-            if not isinstance(single_history_embeddings, list):
-                raise ValueError("Invalid batched input: each batch element must be a list")
 
-            inner_first_non_none = next((x for x in single_history_embeddings if x is not None), None)
-            if inner_first_non_none is not None and not _is_numeric_vector(inner_first_non_none):
-                raise ValueError(
-                    "Invalid batched input: expected each batch element to have shape [T, D]"
-                )
-
-            padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
-                history_embeddings=single_history_embeddings,
-                max_history_len=max_history_len,
-                embed_dim=embed_dim,
-            )
-
-            batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
-            batch_history_mask.append(history_mask.tolist())
-    
     return batch_padded_history_embeddings, batch_history_mask
-
-
-def _is_numeric_vector(x: Any) -> bool:
-    return (
-        isinstance(x, list)
-        and len(x) > 0
-        and all(isinstance(v, (int, float)) for v in x)
-    )

@@ -10,6 +10,7 @@ from .input_data_helpers import (
     get_padded_embedding_history_and_mask,
     get_padded_embedding_history_and_mask_batched,
     get_embedding_dim_for_known_model,
+    classify_history_embeddings_shape,
 )
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "get_padded_embedding_history_and_mask",
     "get_padded_embedding_history_and_mask_batched",
     "get_embedding_dim_for_known_model",
+    "classify_history_embeddings_shape",
 ]
 
