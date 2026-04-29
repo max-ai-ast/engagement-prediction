@@ -13,6 +13,8 @@ set -e
 GE_GCP_PROJECT_ID="${GE_GCP_PROJECT_ID:-greenearth-471522}"
 GE_GCP_REGION="${GE_GCP_REGION:-us-east1}"
 GE_ENVIRONMENT="${GE_ENVIRONMENT:-stage}"
+GE_ENABLE_INFERENCE_DOMAIN_MAPPING="${GE_ENABLE_INFERENCE_DOMAIN_MAPPING:-true}"
+GE_INFERENCE_DOMAIN="${GE_INFERENCE_DOMAIN:-}"
 
 # Multi-model config — required, no defaults
 GE_INFERENCE_MODELS="${GE_INFERENCE_MODELS:-}"
@@ -45,6 +47,50 @@ log_build() {
     echo -e "${BLUE}[BUILD]${NC} $1"
 }
 
+get_domain_mapping_condition_status() {
+    local domain="$1"
+    local condition_type="$2"
+
+    gcloud beta run domain-mappings describe --domain="$domain" \
+        --region="$GE_GCP_REGION" \
+        --project="$GE_GCP_PROJECT_ID" \
+        --format=json 2>/dev/null | python3 -c '
+import json
+import sys
+
+condition_type = sys.argv[1]
+
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+
+for condition in payload.get("status", {}).get("conditions", []):
+    if condition.get("type") == condition_type:
+        print(condition.get("status", ""))
+        break
+else:
+    print("")
+' "$condition_type"
+}
+
+default_inference_domain() {
+    if [ "$GE_ENVIRONMENT" = "prod" ]; then
+        echo "inference.greenearth.social"
+    else
+        echo "inference-stage.greenearth.social"
+    fi
+}
+
+resolve_inference_domain() {
+    if [ -n "$GE_INFERENCE_DOMAIN" ]; then
+        echo "$GE_INFERENCE_DOMAIN"
+        return
+    fi
+    echo "$(default_inference_domain)"
+}
+
 validate_config() {
     log_info "Validating configuration..."
 
@@ -72,9 +118,72 @@ validate_config() {
         fi
     done
 
+    if [ "$GE_ENABLE_INFERENCE_DOMAIN_MAPPING" = "true" ]; then
+        log_info "Inference domain mapping enabled for: $(resolve_inference_domain)"
+    else
+        log_info "Inference domain mapping disabled"
+    fi
+
     gcloud config set project "$GE_GCP_PROJECT_ID"
 
     log_info "Configuration validation complete."
+}
+
+reconcile_domain_mapping() {
+    if [ "$GE_ENABLE_INFERENCE_DOMAIN_MAPPING" != "true" ]; then
+        return
+    fi
+
+    local service_name="engagement-prediction-inference-$GE_ENVIRONMENT"
+    local domain
+    domain="$(resolve_inference_domain)"
+    local mapped_route_name
+
+    log_info "Reconciling domain mapping for $domain"
+
+    if gcloud beta run domain-mappings describe --domain="$domain" --region="$GE_GCP_REGION" --project="$GE_GCP_PROJECT_ID" > /dev/null 2>&1; then
+        mapped_route_name=$(gcloud beta run domain-mappings describe \
+            --domain="$domain" \
+            --region="$GE_GCP_REGION" \
+            --project="$GE_GCP_PROJECT_ID" \
+            --format="value(status.mappedRouteName)" 2>/dev/null || echo "")
+
+        if [ -z "$mapped_route_name" ]; then
+            mapped_route_name=$(gcloud beta run domain-mappings describe \
+                --domain="$domain" \
+                --region="$GE_GCP_REGION" \
+                --project="$GE_GCP_PROJECT_ID" \
+                --format="value(spec.routeName)" 2>/dev/null || echo "")
+        fi
+
+        if [ "$mapped_route_name" = "$service_name" ]; then
+            log_info "Domain mapping already targets expected service: $service_name"
+        else
+            log_warn "Domain mapping exists but points to '$mapped_route_name'; overriding to '$service_name'"
+            gcloud beta run domain-mappings create \
+                --service="$service_name" \
+                --domain="$domain" \
+                --force-override \
+                --region="$GE_GCP_REGION" \
+                --project="$GE_GCP_PROJECT_ID"
+            log_info "Updated domain mapping: $domain -> $service_name"
+        fi
+    else
+        gcloud beta run domain-mappings create \
+            --service="$service_name" \
+            --domain="$domain" \
+            --region="$GE_GCP_REGION" \
+            --project="$GE_GCP_PROJECT_ID"
+        log_info "Created domain mapping: $domain"
+    fi
+
+    local mapping_ready
+    mapping_ready=$(get_domain_mapping_condition_status "$domain" "Ready")
+    if [ "$mapping_ready" = "True" ]; then
+        log_info "Mapped URL: https://$domain (Ready)"
+    else
+        log_warn "Mapped URL: https://$domain (not Ready yet; check DNS/certificate provisioning)"
+    fi
 }
 
 verify_vpc_connector() {
@@ -170,6 +279,7 @@ main() {
     validate_config
     verify_vpc_connector
     deploy_inference_service
+    reconcile_domain_mapping
 
     log_info "Deployment complete!"
 }
@@ -205,6 +315,14 @@ while [[ $# -gt 0 ]]; do
             GE_INFERENCE_MAX_HISTORY_LEN="$2"
             shift 2
             ;;
+        --inference-domain)
+            GE_INFERENCE_DOMAIN="$2"
+            shift 2
+            ;;
+        --disable-domain-mapping)
+            GE_ENABLE_INFERENCE_DOMAIN_MAPPING="false"
+            shift
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -217,6 +335,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --user-tower-model-uri URI        GCS URI for the user-tower model"
             echo "  --post-tower-model-uri URI        GCS URI for the post-tower model"
             echo "  --max-history-len N              Maximum user history sequence length (required)"
+            echo "  --inference-domain DOMAIN         Custom mapped domain for inference service"
+            echo "  --disable-domain-mapping          Skip domain mapping reconciliation"
             echo "  --help                   Show this help message"
             echo ""
             echo "Environment variables:"
@@ -229,6 +349,8 @@ while [[ $# -gt 0 ]]; do
             echo "  GE_INFERENCE_POST_TOWER_MODEL_URI        GCS URI for post-tower model"
             echo "  GE_INFERENCE_USER_TOWER_CLEARML_MODEL_ID ClearML model ID for user-tower"
             echo "  GE_INFERENCE_POST_TOWER_CLEARML_MODEL_ID ClearML model ID for post-tower"
+            echo "  GE_ENABLE_INFERENCE_DOMAIN_MAPPING        true/false toggle (default: true)"
+            echo "  GE_INFERENCE_DOMAIN                       Custom mapped domain"
             echo ""
             echo "Each model listed in --models requires either a _MODEL_URI or _CLEARML_MODEL_ID."
             echo ""
