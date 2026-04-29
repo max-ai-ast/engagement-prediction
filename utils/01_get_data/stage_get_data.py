@@ -114,6 +114,7 @@ Using the outputs:
 
 from __future__ import annotations
 
+import gc
 import json
 import argparse
 import time
@@ -1404,7 +1405,16 @@ def _run_greenearth_pipeline(
     logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
     
     mem_tracker.checkpoint("after_parquet_save", quiet=True)
-    
+
+    # Free the large DataFrames now that their parquets are on disk.
+    # PHASE 8 (inference loading) only needs post URIs from posts_core_df,
+    # so we slim it to a single column.  likes_core_df is reloaded from the
+    # parquet below, just before returning, so the caller gets the full table.
+    posts_core_df = posts_core_df.select("at_uri")
+    del likes_core_df
+    gc.collect()
+    logger.debug("[MEMORY] freed likes_core_df and trimmed posts_core_df before inference load")
+
     # ========================================================================
     # PHASE 8: Load and save inferences (optional — gracefully skipped if none)
     # ========================================================================
@@ -1454,6 +1464,10 @@ def _run_greenearth_pipeline(
     max_liking_users_for_report = max_liking_users if max_liking_users is not None else 0
     _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_liking_users_for_report, logger)
     
+    # Reload from the saved parquets (freed above before inference load).
+    likes_core_df = pl.read_parquet(likes_core_path)
+    posts_core_df = pl.read_parquet(posts_core_path)
+
     return likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, inferences_core_path, all_stats
 
 
