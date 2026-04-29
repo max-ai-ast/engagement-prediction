@@ -1,5 +1,0 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.8.2
-clearml==1.16.5
-google-cloud-storage==3.9.0
