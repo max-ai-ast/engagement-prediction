@@ -44,6 +44,7 @@ ENV/
 CLAUDE.md
 .claude/
 .codex/
+AGENTS.local.md
 
 # OS
 .DS_Store
