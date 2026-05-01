@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Stage 2: Generate User History Directory
+Stage 3: Generate User History Directory
 
 Creates a directory-style artifact that maps each target row to a list of prior
 liked post embedding indices and author indices, enabling efficient on-the-fly
@@ -12,22 +12,21 @@ Inputs:
   {did, subject_uri, record_created_at, emb_idx, author_did}
 - target_posts_*.parquet from 02_target_posts: Wide format with
   {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
+- author_idx_*.parquet from 02_target_posts: Author index mapping with
+  {emb_idx, author_did, author_train_count, author_idx}
 
-Outputs under <run_dir>/02_featurize/<timestamp>/:
+Outputs under <run_dir>/03_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
   {target_did, like_uri, prior_emb_indices, prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
   prior_author_indices is a List[UInt32] aligned element-wise with
   prior_emb_indices, and rows where the user has no prior likes in the dataset
   get empty lists.
-- author_idx_mapping_<timestamp>.parquet: {emb_idx, author_did, author_idx}
-  for train-history embedding indices only. author_idx is a dense UInt32 id
-  derived from author_did.
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 import argparse
 import logging
 import polars as pl

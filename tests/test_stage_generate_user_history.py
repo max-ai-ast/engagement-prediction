@@ -47,12 +47,6 @@ def build_history(stage_module):
 
 
 @pytest.fixture
-def generate_author_idx_mapping(stage_module):
-    """Shortcut to the production _generate_author_idx_mapping function."""
-    return stage_module._generate_author_idx_mapping
-
-
-@pytest.fixture
 def add_author_indices_to_history(stage_module):
     """Shortcut to the production _add_author_indices_to_history function."""
     return stage_module._add_author_indices_to_history
@@ -465,93 +459,8 @@ def test_directory_raw_prior_count(build_history):
 
 
 # ---------------------------------------------------------------------------
-# author_idx / prior_author_indices tests
+# prior_author_indices tests
 # ---------------------------------------------------------------------------
-
-def test_generate_author_idx_mapping_uses_train_split_only(generate_author_idx_mapping):
-    """Only train-split history should contribute to the author index mapping."""
-    logger = _make_test_logger()
-
-    directory_df = pl.DataFrame({
-        "target_did": ["u1", "u2"],
-        "like_uri": ["at://u1/like/1", "at://u2/like/1"],
-        "seen_at": [datetime(2024, 1, 2, 0, 0), datetime(2024, 1, 3, 0, 0)],
-        "prior_emb_indices": [[101, 102], [201, 202]],
-        "raw_prior_count": [2, 2],
-        "split": ["train", "test"],
-    })
-
-    likes_lf = pl.DataFrame({
-        "did": ["reader_1", "reader_1", "reader_2", "reader_2"],
-        "record_created_at": [
-            datetime(2024, 1, 1, 0, 0),
-            datetime(2024, 1, 1, 1, 0),
-            datetime(2024, 1, 1, 2, 0),
-            datetime(2024, 1, 1, 3, 0),
-        ],
-        "subject_uri": ["p101", "p102", "p201", "p202"],
-        "emb_idx": [101, 102, 201, 202],
-        "author_did": ["author_a", "author_a", "author_b", "author_c"],
-    }).lazy()
-
-    result = generate_author_idx_mapping(directory_df, likes_lf, logger).sort("emb_idx")
-
-    assert result["emb_idx"].to_list() == [101, 102]
-    assert result["author_did"].to_list() == ["author_a", "author_a"]
-    assert result.schema["author_idx"] == pl.UInt32
-    assert result["author_idx"].to_list() == [1, 1]
-    assert result["author_occurrence_count"].to_list() == [2, 2]
-
-
-def test_generate_author_idx_mapping_author_occurrence_count_counts_train_history_positions(
-    generate_author_idx_mapping,
-):
-    """author_occurrence_count should sum all train-history occurrences per author."""
-    logger = _make_test_logger()
-
-    directory_df = pl.DataFrame({
-        "target_did": ["u1", "u2", "u3"],
-        "like_uri": ["at://u1/like/1", "at://u2/like/1", "at://u3/like/1"],
-        "seen_at": [
-            datetime(2024, 1, 2, 0, 0),
-            datetime(2024, 1, 3, 0, 0),
-            datetime(2024, 1, 4, 0, 0),
-        ],
-        "prior_emb_indices": [
-            [101, 102, 101],
-            [102, 103],
-            [999],  # test split only; should not contribute
-        ],
-        "raw_prior_count": [3, 2, 1],
-        "split": ["train", "train", "test"],
-    })
-
-    likes_lf = pl.DataFrame({
-        "did": ["reader_1", "reader_1", "reader_2", "reader_3"],
-        "record_created_at": [
-            datetime(2024, 1, 1, 0, 0),
-            datetime(2024, 1, 1, 1, 0),
-            datetime(2024, 1, 1, 2, 0),
-            datetime(2024, 1, 1, 3, 0),
-        ],
-        "subject_uri": ["p101", "p102", "p103", "p999"],
-        "emb_idx": [101, 102, 103, 999],
-        "author_did": ["author_a", "author_a", "author_b", "author_z"],
-    }).lazy()
-
-    result = generate_author_idx_mapping(directory_df, likes_lf, logger).sort("emb_idx")
-
-    assert result["emb_idx"].to_list() == [101, 102, 103]
-    assert result["author_did"].to_list() == ["author_a", "author_a", "author_b"]
-    assert result["author_idx"].to_list() == [1, 1, 2]
-
-    # Train history occurrences:
-    # - emb_idx 101 appears twice
-    # - emb_idx 102 appears twice
-    # - emb_idx 103 appears once
-    # author_a owns 101 and 102 -> 4 total positions
-    # author_b owns 103 -> 1 total position
-    assert result["author_occurrence_count"].to_list() == [4, 4, 1]
 
 
 def test_add_author_indices_to_history_preserves_order_and_alignment(add_author_indices_to_history):
@@ -618,6 +527,58 @@ def test_add_author_indices_to_history_preserves_length_when_mapping_is_missing(
     assert len(prior_emb) == len(prior_auth) == 3
     assert prior_auth == [None, 7, None]
     assert list(zip(prior_emb, prior_auth)) == [(999, None), (10, 7), (888, None)]
+
+
+def test_add_author_indices_to_history_deduplicates_mapping_rows(add_author_indices_to_history):
+    """Duplicate mapping rows should not duplicate exploded history positions."""
+    logger = _make_test_logger()
+
+    directory_df = pl.DataFrame({
+        "target_did": ["u1"],
+        "like_uri": ["at://u1/like/1"],
+        "seen_at": [datetime(2024, 1, 2, 0, 0)],
+        "prior_emb_indices": [[10, 20, 10]],
+        "raw_prior_count": [3],
+    }).with_columns(
+        pl.col("prior_emb_indices").cast(pl.List(pl.UInt32))
+    )
+
+    author_idx_df = pl.DataFrame({
+        "emb_idx": [10, 10, 20],
+        "author_did": ["author_a", "author_a", "author_b"],
+        "author_idx": pl.Series([1, 1, 2], dtype=pl.UInt32),
+    })
+
+    result = add_author_indices_to_history(directory_df, author_idx_df, logger)
+
+    assert result["prior_emb_indices"][0].to_list() == [10, 20, 10]
+    assert result["prior_author_indices"][0].to_list() == [1, 2, 1]
+
+
+def test_add_author_indices_to_history_handles_empty_mapping(add_author_indices_to_history):
+    """An empty author mapping should preserve history length with null author ids."""
+    logger = _make_test_logger()
+
+    directory_df = pl.DataFrame({
+        "target_did": ["u1"],
+        "like_uri": ["at://u1/like/1"],
+        "seen_at": [datetime(2024, 1, 2, 0, 0)],
+        "prior_emb_indices": [[10, 20]],
+        "raw_prior_count": [2],
+    }).with_columns(
+        pl.col("prior_emb_indices").cast(pl.List(pl.UInt32))
+    )
+
+    author_idx_df = pl.DataFrame({
+        "emb_idx": pl.Series([], dtype=pl.UInt32),
+        "author_did": pl.Series([], dtype=pl.String),
+        "author_idx": pl.Series([], dtype=pl.UInt32),
+    })
+
+    result = add_author_indices_to_history(directory_df, author_idx_df, logger)
+
+    assert result["prior_emb_indices"][0].to_list() == [10, 20]
+    assert result["prior_author_indices"][0].to_list() == [None, None]
 
 
 # ---------------------------------------------------------------------------
