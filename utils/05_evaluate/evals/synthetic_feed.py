@@ -7,6 +7,24 @@ Builds a synthetic feed for each holdout user by scoring a large random post
 pool with the trained model, then decomposes over-serving into user preference
 and model amplification using NLP trait comparisons.
 
+Supports both architectures used by the cap-sweep harness:
+
+- ``mlp``       : ``utils.04_train.stage_train_mlp.MLPModel``.  Per-user
+                  representation comes from the configured summarizer
+                  (mean / EMA / linear-recency) over the user's longest
+                  available history row, fed through a length-1 history slot.
+- ``two_tower`` : ``utils.04_train.stage_train_two_tower.TwoTowerModel``.
+                  For non-summarized encoders ('cross_attention',
+                  'full_transformer') the user's full padded history is
+                  encoded by ``user_tower`` and scored by dot product against
+                  ``post_tower`` outputs in the shared embedding space.
+                  For ``user_encoder_type='summarized'``, falls through to
+                  the same length-1 history path used by MLP.
+
+Adding a new architecture means registering its checkpoint glob in
+``_MODEL_TYPE_TO_CKPT_GLOB`` and extending ``_load_model`` /
+``_score_pool_for_users`` accordingly.
+
 For each holdout user *u* and trait *t*:
 
     pool_mean(t)   = mean trait across all random-pool posts
@@ -50,8 +68,9 @@ Outputs (under synthetic_feed/):
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import matplotlib
 matplotlib.use("Agg")
@@ -191,16 +210,58 @@ def _load_user_histories(run_dir: Path) -> pl.LazyFrame:
     return load_parquet_from_prior(history_dir, "history_posts_")
 
 
+# Map model_type (as recorded in training_config.json) -> checkpoint glob.
+# New architectures must register here AND extend `_load_model` /
+# `_score_pool_for_users` below.
+_MODEL_TYPE_TO_CKPT_GLOB: Dict[str, str] = {
+    "mlp": "engagement_model_*.pth",
+    "two_tower": "two_tower_*.pth",
+}
+
+
+def _read_training_model_type(train_dir: Path) -> str:
+    """Read the architecture from training_config.json (defaults to 'mlp').
+
+    Falls back to 'mlp' for backwards compatibility with older training
+    runs that may not have written the field.
+    """
+    cfg_path = train_dir / "training_config.json"
+    if not cfg_path.is_file():
+        return "mlp"
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return "mlp"
+    return str(cfg.get("model_type", "mlp"))
+
+
 def _find_checkpoint(ctx: EvalContext) -> Path:
     """Locate the model checkpoint .pth inside the training output.
 
     ctx.output_dir is ``<train_dir>/evals/<timestamp>``, so train_dir is
-    two levels up.
+    two levels up.  Architecture is read from ``training_config.json``
+    (``model_type`` field) and used to choose the right checkpoint glob:
+
+      - ``"mlp"``        -> ``engagement_model_*.pth``
+      - ``"two_tower"``  -> ``two_tower_*.pth``
+
+    Raises ``FileNotFoundError`` (which the caller treats as a skip) if
+    no matching checkpoint exists.
     """
     train_dir = ctx.output_dir.parent.parent
     ckpt_dir = train_dir / "checkpoints"
+
+    model_type = _read_training_model_type(train_dir)
+    glob_pattern = _MODEL_TYPE_TO_CKPT_GLOB.get(model_type)
+    if glob_pattern is None:
+        raise FileNotFoundError(
+            f"Unknown model_type {model_type!r} in {train_dir}/training_config.json; "
+            f"synthetic_feed only supports {sorted(_MODEL_TYPE_TO_CKPT_GLOB)}"
+        )
+
     candidates = sorted(
-        ckpt_dir.glob("engagement_model_*.pth"),
+        ckpt_dir.glob(glob_pattern),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -212,21 +273,96 @@ def _find_checkpoint(ctx: EvalContext) -> Path:
         return full_ckpts[0]
     if candidates:
         return candidates[0]
-    raise FileNotFoundError(f"No engagement_model_*.pth under {ckpt_dir}")
+    raise FileNotFoundError(
+        f"No checkpoint matching architecture {model_type!r} "
+        f"({glob_pattern}) under {ckpt_dir}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Model loading and scoring
 # ---------------------------------------------------------------------------
 
+def _detect_model_type(ckpt: dict) -> str:
+    """Infer architecture from a loaded checkpoint dict.
+
+    Two-tower checkpoints nest hyperparameters under ``"config"`` with
+    ``"model_type": "two_tower"``.  MLP checkpoints have a flat layout
+    with ``"model_type": "mlp"`` at the top level.  Returns the lowercase
+    model_type string ('mlp' or 'two_tower').  Defaults to 'mlp' for
+    older checkpoints that predate the field.
+    """
+    cfg = ckpt.get("config")
+    if isinstance(cfg, dict) and cfg.get("model_type") == "two_tower":
+        return "two_tower"
+    return str(ckpt.get("model_type", "mlp"))
+
+
 def _load_model(ckpt_path: Path, device: str):
-    """Reconstruct MLPModel from a saved checkpoint."""
+    """Reconstruct a trained model from a saved checkpoint.
+
+    Supports both architectures used by the cap-sweep harness:
+
+    - ``mlp``       : ``utils.04_train.stage_train_mlp.MLPModel``,
+                      flat checkpoint layout.
+    - ``two_tower`` : ``utils.04_train.stage_train_two_tower.TwoTowerModel``,
+                      nested ``config`` dict in the checkpoint.
+
+    Returns ``(model, ckpt_normalized)`` where ``ckpt_normalized`` lifts
+    nested config fields (for two_tower) up to the top level so downstream
+    callers can read ``model_type``, ``user_encoder_type``, ``max_history_len``
+    etc. without re-branching.
+    """
     import torch
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model_type = _detect_model_type(ckpt)
+
+    if model_type == "two_tower":
+        stage_mod = importlib.import_module("utils.04_train.stage_train_two_tower")
+        TwoTowerModel = stage_mod.TwoTowerModel
+        cfg = ckpt.get("config", {})
+        ctor_keys = {
+            "post_embedding_dim",
+            "shared_dim",
+            "user_hidden_dim",
+            "post_hidden_dim",
+            "num_attention_heads",
+            "num_attention_layers",
+            "max_history_len",
+            "dropout_rate",
+            "user_encoder_type",
+            "use_post_encoder",
+        }
+        kwargs = {k: cfg[k] for k in ctor_keys if k in cfg}
+        missing = ctor_keys - kwargs.keys()
+        if missing:
+            raise KeyError(
+                f"two_tower checkpoint {ckpt_path} is missing required "
+                f"config fields: {sorted(missing)}"
+            )
+        model = TwoTowerModel(**kwargs)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.to(device)
+        model.eval()
+
+        # Lift nested config fields to the top level so _compute_user_summaries
+        # / _score_pool_for_users can read max_history_len, user_encoder_type,
+        # etc. uniformly.
+        normalized = dict(ckpt)
+        for k, v in cfg.items():
+            normalized.setdefault(k, v)
+        normalized["model_type"] = "two_tower"
+        return model, normalized
+
+    if model_type != "mlp":
+        raise ValueError(
+            f"_load_model: unsupported model_type {model_type!r} in {ckpt_path}; "
+            f"synthetic_feed only supports {sorted(_MODEL_TYPE_TO_CKPT_GLOB)}"
+        )
 
     stage_mod = importlib.import_module("utils.04_train.stage_train_mlp")
     MLPModel = stage_mod.MLPModel
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     model = MLPModel(
         post_embedding_dim=ckpt["embed_dim"],
@@ -243,7 +379,30 @@ def _load_model(ckpt_path: Path, device: str):
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
+    ckpt = dict(ckpt)
+    ckpt.setdefault("model_type", "mlp")
     return model, ckpt
+
+
+def _user_encoder_name(ckpt: dict) -> str:
+    """Return the canonical user-encoder name for either architecture."""
+    if _detect_model_type(ckpt) == "two_tower":
+        return str(ckpt.get("user_encoder_type", ""))
+    return str(ckpt.get("user_encoder", "summarized"))
+
+
+def _uses_full_history(ckpt: dict) -> bool:
+    """True iff the model's user tower consumes the full padded history.
+
+    Currently only two-tower models with non-summarized encoders
+    ('cross_attention' or 'full_transformer') need padded history at
+    inference time.  MLP and TT-summarized both consume a single
+    pre-summarized user vector via the [B, 1, D] history convention.
+    """
+    return (
+        _detect_model_type(ckpt) == "two_tower"
+        and _user_encoder_name(ckpt) != "summarized"
+    )
 
 
 def _compute_user_summaries(
@@ -251,18 +410,27 @@ def _compute_user_summaries(
     history_lf: pl.LazyFrame,
     embeddings_mmap: np.ndarray,
     ckpt: dict,
-) -> Dict[str, np.ndarray]:
-    """Compute user summary embeddings using the checkpoint's summarizer.
+) -> Dict[str, Union[np.ndarray, Dict[str, np.ndarray]]]:
+    """Compute per-user representations needed by the trained model.
+
+    Two return shapes, chosen based on the checkpoint's architecture:
+
+    - **Pre-summarized** (MLP, or two-tower with ``user_encoder_type='summarized'``):
+      ``dict[did] -> np.ndarray [D]``.  The vector is produced by the
+      checkpoint's configured summarizer (mean / EMA / linear-recency / ...)
+      over the user's longest available history row.  The downstream scorer
+      feeds this through a length-1 history slot.
+
+    - **Full-history** (two-tower with non-summarized encoder, i.e.
+      ``cross_attention`` or ``full_transformer``):
+      ``dict[did] -> {"history": np.ndarray [max_history_len, D],
+                      "mask": np.ndarray [max_history_len]}``.
+      Sequence is padded/truncated with the same helper the training-time
+      ``SequenceEngagementDataset`` uses, so model inputs match exactly.
 
     Accepts a *LazyFrame* so the holdout-user filter is pushed into the scan
     and only the needed rows are materialised.
     """
-    from utils.dataloaders import get_summarizer
-
-    summarizer_name = ckpt.get("user_summarization", "mean")
-    ema_alpha = ckpt.get("ema_alpha", 0.1)
-    summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
-
     best_rows = (
         history_lf
         .filter(pl.col("target_did").is_in(holdout_dids))
@@ -272,6 +440,39 @@ def _compute_user_summaries(
         .first()
         .collect()
     )
+
+    if _uses_full_history(ckpt):
+        from shared.input_data_helpers import get_padded_embedding_history_and_mask
+
+        max_history_len = int(ckpt["max_history_len"])
+        embed_dim = int(
+            ckpt.get("post_embedding_dim")
+            or ckpt.get("embed_dim")
+            or embeddings_mmap.shape[1]
+        )
+        user_inputs: Dict[str, Dict[str, np.ndarray]] = {}
+        for row in best_rows.iter_rows(named=True):
+            indices = row["prior_emb_indices"]
+            if indices is None or len(indices) == 0:
+                continue
+            indices_arr = np.array(indices, dtype=np.int64)
+            # `prior_emb_indices` is most-recent-first per the ingestion
+            # contract; truncate from the tail to keep the most recent
+            # `max_history_len` entries — matching SequenceEngagementDataset.
+            if indices_arr.shape[0] > max_history_len:
+                indices_arr = indices_arr[:max_history_len]
+            embs = np.array(embeddings_mmap[indices_arr], dtype=np.float32)
+            padded, mask = get_padded_embedding_history_and_mask(
+                embs, max_history_len, embed_dim,
+            )
+            user_inputs[row["target_did"]] = {"history": padded, "mask": mask}
+        return user_inputs
+
+    from utils.dataloaders import get_summarizer
+
+    summarizer_name = ckpt.get("user_summarization", "mean")
+    ema_alpha = ckpt.get("ema_alpha", 0.1)
+    summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
 
     user_summaries: Dict[str, np.ndarray] = {}
     for row in best_rows.iter_rows(named=True):
@@ -286,11 +487,23 @@ def _compute_user_summaries(
 
 def _score_pool_for_users(
     model,
-    user_summaries: Dict[str, np.ndarray],
+    user_inputs: Dict[str, Union[np.ndarray, Dict[str, np.ndarray]]],
     pool_embeddings: np.ndarray,
+    ckpt: dict,
     device: str,
 ) -> Dict[str, np.ndarray]:
-    """Score all pool posts for every eligible user.  Returns {did: scores}."""
+    """Score all pool posts for every eligible user.  Returns ``{did: scores}``.
+
+    Branches on architecture:
+
+    - For two-tower with non-summarized encoder: pre-encode the pool once
+      via ``model.encode_post`` and each user's full padded history once
+      via ``model.encode_user``, then score by dot product in the shared
+      embedding space.  Quadratically faster than the per-batch loop.
+    - For MLP and two-tower-summarized: per-user, per-pool-batch
+      ``model(hist, mask, batch_posts)`` loop with the user vector replicated
+      across the batch — the existing path.
+    """
     import torch
 
     pool_t = torch.tensor(pool_embeddings, dtype=torch.float32, device=device)
@@ -298,8 +511,34 @@ def _score_pool_for_users(
 
     user_scores: Dict[str, np.ndarray] = {}
 
+    if _uses_full_history(ckpt):
+        with torch.no_grad():
+            # Pool encoding is identical for every user; compute it once.
+            pool_vecs = model.encode_post(pool_t)  # [N_POOL, shared_dim]
+            for did, payload in user_inputs.items():
+                if not isinstance(payload, dict):
+                    raise TypeError(
+                        f"_score_pool_for_users: full-history mode requires "
+                        f"dict payload per user, got {type(payload).__name__} for did={did!r}"
+                    )
+                hist_t = torch.from_numpy(
+                    np.ascontiguousarray(payload["history"], dtype=np.float32)
+                ).to(device).unsqueeze(0)  # [1, T, D]
+                mask_t = torch.from_numpy(
+                    np.ascontiguousarray(payload["mask"], dtype=np.bool_)
+                ).to(device).unsqueeze(0)  # [1, T]
+                user_vec = model.encode_user(hist_t, mask_t)  # [1, shared_dim]
+                scores = (user_vec @ pool_vecs.T).squeeze(0)  # [N_POOL]
+                user_scores[did] = scores.cpu().numpy()
+        return user_scores
+
     with torch.no_grad():
-        for did, summary in user_summaries.items():
+        for did, summary in user_inputs.items():
+            if isinstance(summary, dict):
+                raise TypeError(
+                    f"_score_pool_for_users: summarized mode requires ndarray "
+                    f"payload per user, got dict for did={did!r}"
+                )
             user_t = torch.tensor(
                 summary, dtype=torch.float32, device=device,
             )
@@ -1306,7 +1545,7 @@ class SyntheticFeedModule(EvalModule):
         pool_embeddings = embeddings_mmap[pool_emb_indices].copy()
         eligible_summaries = {d: user_summaries[d] for d in eligible_dids}
         user_scores = _score_pool_for_users(
-            model, eligible_summaries, pool_embeddings, device,
+            model, eligible_summaries, pool_embeddings, ckpt, device,
         )
 
         # ---- top-K selection ----
