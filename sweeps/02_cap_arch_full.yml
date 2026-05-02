@@ -1,4 +1,4 @@
-# Sweep 02 — full cap × architecture matrix (DRAFT, do not run until 01 passes)
+# Sweep 02 — full cap × architecture matrix
 #
 # Goal: ROADMAP Stage 1 + Stage 2 main matrix.  Sweep a wide range of
 # per-user caps to test whether aggressive downsampling reduces or removes
@@ -27,8 +27,7 @@
 
 sweep_name: 02_cap_arch_full
 
-# UPDATE THIS to the GPU machine's wide-cap ingestion run before launching.
-ingestion_run: outputs/20260316_164800
+ingestion_run: outputs/20260429_143355
 
 caps:
   - null   # no effective cap (uses Stage 1's --max-likes-per-user as-is)
@@ -48,5 +47,15 @@ epochs: 100
 batch_size: 4096
 patience: 20
 max_parallel_mlp: 2
+skip_holdout_pred_during_train: true   # Phase C.5 generates holdout parquets sequentially
 
-extra_cli_args: []
+# April 2026 data window split dates (same as sweep 01)
+extra_cli_args:
+  - --train-start
+  - "2026-04-01"
+  - --val-start
+  - "2026-04-16"
+  - --holdout-start
+  - "2026-04-21"
+  - --holdout-user-fraction
+  - "0.5"
