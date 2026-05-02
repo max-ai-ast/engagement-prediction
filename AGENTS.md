@@ -41,12 +41,40 @@ The effective cap is recorded in:
 
 ## Cap × architecture sweep harness
 
-`run_cap_arch_sweep.sh <sweep_config.yml>` orchestrates a full cap × arch × seed sweep:
+`run_cap_arch_sweep.sh <sweep_config.yml>` orchestrates a full cap × arch × seed sweep.
 
-- Outer loop: `--effective-likes-cap` levels.  Stage 2 + Stage 3 are re-run once per cap level under `<ingestion_run>/sweep_<sweep_name>/<cap_label>/`, with `01_get_data` symlinked from the shared ingestion to avoid re-downloading from GCS.
-- Inner loop: model_type × user_encoder × seed cells.  MLPs run in parallel up to `max_parallel_mlp`; two-tower runs sequentially (heavy GPU footprint).
-- YAML config schema: see `sweeps/01_cross_arch_validation.yml` for the canonical example.  `scripts/_emit_sweep_plan.py` parses it and emits a TSV plan + bash variables.
-- Each cell's training config records the effective cap, so the per-cell `training_config.json` is fully self-describing for cross-cell aggregation.
+### Sweep phases and parallelism rules
+
+| Phase | What runs | Parallelism |
+|-------|-----------|-------------|
+| **A — prep** | Stage 2 (target_posts) + Stage 3 (user_history) per cap level | **Sequential** — one cap at a time |
+| **B — MLP train** | Stage 4 training for all MLP × seed cells in this cap | **Parallel ≤ `max_parallel_mlp`** — but only safe when `skip_holdout_pred_during_train: true`; with holdout-pred enabled, each process materialises ~25 GB of holdout data, so parallelism risks OOM |
+| **C — TT train** | Stage 4 training for all two-tower × seed cells in this cap | **Sequential** — heavy GPU footprint |
+| **C.5 — holdout-pred** | `scripts/run_holdout_pred.py` on every trained checkpoint | **Sequential — never parallel** (high per-process memory footprint) |
+| **D — Stage 5 eval** | `cli.py --start-from evaluate` for every trained cell | **Parallel-safe** — lightweight; reads parquets only |
+
+Phase C.5 only runs when `skip_holdout_pred_during_train: true` is set in the sweep YAML (see below).  Stage 5 eval (Phase D) is currently launched by the user after the sweep completes — not wired into the harness yet.
+
+### `--skip-holdout-pred` + Phase C.5
+
+For sweeps with many cells (e.g. sweep 02: 36 cells), enable this pattern to allow parallel MLP training without OOM:
+
+```yaml
+max_parallel_mlp: 2
+skip_holdout_pred_during_train: true   # Phase C.5 generates holdout parquets sequentially
+```
+
+The harness passes `--skip-holdout-pred` to every `cli.py` train invocation.  Each training process exits after saving the model checkpoint and writing train/val predictions, *without* materialising the holdout dataset.  After all training cells finish, Phase C.5 iterates the plan sequentially and calls `scripts/run_holdout_pred.py <cell_dir>` for each cell.  Phase C.5 skips cells that already have `predictions/holdout_unseen_users.parquet` (idempotent — safe to re-run after a partial failure).
+
+### YAML config
+
+- Canonical schema: `sweeps/01_cross_arch_validation.yml`.
+- `scripts/_emit_sweep_plan.py` parses the YAML and emits a TSV plan + bash variables for the harness.
+- Each cell's `training_config.json` records the effective cap and `skip_holdout_pred` flag, making it fully self-describing for cross-cell aggregation.
+
+### Mid-pipeline launch requirement
+
+Any sweep that starts at `--start-from target_posts` (or later) **must** supply `--train-start`, `--val-start`, `--holdout-start`, and `--holdout-user-fraction` via `extra_cli_args` in the YAML.  These are not inferred automatically from Stage 1's `stage_info.txt`.  Missing any of them raises a `ValueError` from `_get_train_start()`.
 
 ## Eval-module ordering footgun
 
