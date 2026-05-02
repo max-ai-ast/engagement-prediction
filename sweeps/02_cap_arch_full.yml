@@ -13,8 +13,7 @@
 # unset / very large).  If it was 100, only the cap_inf cells will be valid;
 # the others will be no-ops because the data was already capped at 100.
 #
-# Pre-registration: see jobs/0001_cap_arch_sweep.md for the predicted shapes.
-# Predicted (from REPORT.md):
+# Predicted shapes (from REPORT.md; to be formalised on OSF when approaching submission):
 #   - sentiment / political / arbitrary-text traits: monotonic decline in
 #     model-amplification as cap tightens (high-volume likers had outsized
 #     influence).
