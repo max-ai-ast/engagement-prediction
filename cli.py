@@ -124,6 +124,10 @@ DEFAULTS: Dict[str, Any] = {
     "start_from": None,
     "stop_after": None,
     "pick_prior": False,
+    # Optional explicit prior train cell for Stage 5 (bypasses latest-by-mtime).
+    # Required when re-evaluating a sweep cell whose 04_train/<ts>_<run_tag>/ dir
+    # is not the most recently modified one under the cap-level output dir.
+    "prior_train_dir": None,
     # Execution behavior
     # Default is foreground execution (recommended for ClearML remote execution).
     "background": False,
@@ -368,6 +372,14 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     setattr(args, 'output_dir', str(run_dir))
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
     ctx = Context(run_dir=run_dir, run_timestamp=run_timestamp, use_latest=True, tracker=tracker)
+    # Optional explicit prior train cell (bypasses latest-by-mtime selection in Stage 5).
+    # The dict key is the stage *folder* name ("04_train"), not the stage key.
+    prior_train_dir = getattr(args, 'prior_train_dir', None)
+    if prior_train_dir:
+        prior_train_path = Path(prior_train_dir).resolve()
+        if not prior_train_path.is_dir():
+            raise ValueError(f"--prior-train-dir not found: {prior_train_path}")
+        ctx.prior_outputs['04_train'] = prior_train_path
     return cmd__run_all_exec(args, ctx)
 
 
@@ -618,6 +630,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Early stopping patience")
     _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
                           help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
+    _add_arg_with_default(p_all, "--prior-train-dir", type=str, default=argparse.SUPPRESS,
+                          help_text="Absolute path to a specific 04_train/<ts>_<run_tag>/ cell to use "
+                                    "as the Stage 5 input. Bypasses automatic latest-by-mtime selection. "
+                                    "Required when re-evaluating a sweep cell whose dir is not the most "
+                                    "recently modified under <output-dir>/04_train/.")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
