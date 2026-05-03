@@ -1,5 +1,5 @@
 """
-run_sweep_eval.py — run Stage 5 eval in parallel for all cells in a sweep.
+run_sweep_eval.py — run Stage 5 eval for all cells in a sweep.
 
 Usage:
     python3 scripts/run_sweep_eval.py <sweep_root> [--max-workers N]
@@ -7,8 +7,16 @@ Usage:
 Finds every 04_train/<ts>_<run_tag>/ cell under sweep_root, derives the
 cap-level output dir and run tag, and runs:
     cli.py --output-dir <cap_dir> --start-from evaluate --stop-after evaluate
-           --run-tag <run_tag>
-in parallel. Skips cells that already have a bias_by_trait_*.parquet artifact.
+           --run-tag <run_tag> --prior-train-dir <cell_dir>
+
+The explicit --prior-train-dir is required: cli.py otherwise selects the
+most-recently-modified 04_train/* subdir under <cap_dir>, which silently
+re-evaluates the same cell across every invocation in a multi-cell sweep.
+
+Default --max-workers is 1 because the synthetic_feed eval module loads
+~15-20 GB per worker; running >1 in parallel risks OOM kills on
+ge-ml-training (102 GB total). Skips cells that already have a
+bias_by_trait_*.parquet artifact.
 """
 
 import argparse
@@ -63,6 +71,7 @@ def run_eval(cap_dir: Path, run_tag: str, cell_dir: Path, log_dir: Path) -> bool
         "--start-from", "evaluate",
         "--stop-after", "evaluate",
         "--run-tag", run_tag,
+        "--prior-train-dir", str(cell_dir),
     ]
     log.info(f"[{label}] Starting eval")
     with open(log_file, "w") as f:
@@ -79,7 +88,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("sweep_root", help="Path to sweep root dir")
     p.add_argument("--max-workers", type=int, default=1,
-                   help="Max parallel eval workers (default 4)")
+                   help="Max parallel eval workers (default 1; >1 risks OOM "
+                        "from synthetic_feed module loading ~15-20 GB per worker)")
     args = p.parse_args()
 
     sweep_root = Path(args.sweep_root).resolve()
