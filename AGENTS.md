@@ -51,9 +51,11 @@ The effective cap is recorded in:
 | **B — MLP train** | Stage 4 training for all MLP × seed cells in this cap | **Parallel ≤ `max_parallel_mlp`** — but only safe when `skip_holdout_pred_during_train: true`; with holdout-pred enabled, each process materialises ~25 GB of holdout data, so parallelism risks OOM |
 | **C — TT train** | Stage 4 training for all two-tower × seed cells in this cap | **Sequential** — heavy GPU footprint |
 | **C.5 — holdout-pred** | `scripts/run_holdout_pred.py` on every trained checkpoint | **Sequential — never parallel** (high per-process memory footprint) |
-| **D — Stage 5 eval** | `cli.py --start-from evaluate` for every trained cell | **Parallel-safe** — lightweight; reads parquets only |
+| **D — Stage 5 eval** | `scripts/run_sweep_eval.py <sweep_root>` for every trained cell | **Sequential (`--max-workers 1`)** — the `synthetic_feed` eval module loads ~15-20 GB per worker; running >1 in parallel risks OOM kills (SIGKILL, exit=-9). |
 
-Phase C.5 only runs when `skip_holdout_pred_during_train: true` is set in the sweep YAML (see below).  Stage 5 eval (Phase D) is currently launched by the user after the sweep completes — not wired into the harness yet.
+Phase C.5 only runs when `skip_holdout_pred_during_train: true` is set in the sweep YAML (see below).  Stage 5 eval (Phase D) is currently launched by the user after the sweep completes via `scripts/run_sweep_eval.py` — not wired into the harness yet.
+
+**Critical:** `run_sweep_eval.py` passes `--prior-train-dir <cell_dir>` to every `cli.py` invocation. Without it, `cli.py --start-from evaluate` silently falls back to picking the most-recently-modified `04_train/*` subdir under `<cap_dir>`, re-evaluating the same cell for every invocation in the sweep. See `jobs/completed/0007_sweep02_eval_bug_fix.md` for the full post-mortem.
 
 ### `--skip-holdout-pred` + Phase C.5
 
