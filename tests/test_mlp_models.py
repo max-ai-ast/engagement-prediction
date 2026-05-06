@@ -7,6 +7,7 @@ import torch.nn as nn
 # Import from module with numeric prefix
 stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
 MLPModel = stage_train_mlp.MLPModel
+CrossAttentionPoolingEncoder = stage_train_mlp.CrossAttentionPoolingEncoder
 
 
 # =============================================================================
@@ -347,6 +348,116 @@ def test_full_transformer_mlp_torchscript_no_sdpa():
         max_history_len=seq_len,
         attention_dropout=0.1,
         user_encoder_type="full_transformer",
+    )
+
+    scripted = torch.jit.script(model)
+    assert "scaled_dot_product_attention" not in scripted.code
+
+    history_embeddings = torch.randn(2, seq_len, embed_dim)
+    history_mask = torch.ones(2, seq_len, dtype=torch.bool)
+    post_embedding = torch.randn(2, embed_dim)
+    out = scripted(history_embeddings, history_mask, post_embedding)
+    assert out.shape == (2, 1)
+
+
+def test_cross_attention_mlp_initialization():
+    """Test cross_attention MLPModel initializes with the efficient sequence encoder."""
+    model = MLPModel(
+        post_embedding_dim=384,
+        hidden_dims=[256, 128],
+        dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=128,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="cross_attention",
+    )
+
+    assert model.post_embedding_dim == 384
+    assert model.user_output_dim == 128
+    assert isinstance(model.user_encoder, CrossAttentionPoolingEncoder)
+    assert isinstance(model.mlp_head, nn.Sequential)
+
+
+def test_cross_attention_mlp_forward_shape():
+    """Test cross_attention MLPModel forward pass produces correct output shape."""
+    batch_size = 16
+    seq_len = 50
+    embed_dim = 384
+
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[256, 128],
+        dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=128,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=seq_len,
+        attention_dropout=0.1,
+        user_encoder_type="cross_attention",
+    )
+
+    history_embeddings = torch.randn(batch_size, seq_len, embed_dim)
+    history_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    post_embedding = torch.randn(batch_size, embed_dim)
+
+    output = model.forward(history_embeddings, history_mask, post_embedding)
+
+    assert output.shape == (batch_size, 1)
+    assert output.dtype == torch.float32
+    assert (output >= 0).all() and (output <= 1).all(), "Output should be in [0, 1]"
+
+
+def test_cross_attention_mlp_compute_loss_and_preds():
+    """Test cross_attention MLPModel compute_loss_and_preds uses sequence batches."""
+    model = MLPModel(
+        post_embedding_dim=384,
+        hidden_dims=[256, 128],
+        dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=128,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="cross_attention",
+    )
+
+    batch_size = 16
+    batch = {
+        "history_embeddings": torch.randn(batch_size, 50, 384),
+        "history_mask": torch.ones(batch_size, 50, dtype=torch.bool),
+        "target_post_embedding": torch.randn(batch_size, 384),
+        "label": torch.randint(0, 2, (batch_size,)).float(),
+    }
+
+    loss, preds = model.compute_loss_and_preds(batch, "cpu")
+
+    assert loss.shape == ()
+    assert loss.dtype == torch.float32
+    assert loss.item() >= 0
+    assert preds.shape == (batch_size,)
+    assert (preds >= 0).all() and (preds <= 1).all()
+
+
+def test_cross_attention_mlp_torchscript():
+    """Test cross_attention MLPModel can be TorchScript scripted for serving."""
+    embed_dim = 128
+    seq_len = 10
+    model = MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[64],
+        dropout_rate=0.1,
+        user_hidden_dim=64,
+        user_output_dim=32,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=seq_len,
+        attention_dropout=0.1,
+        user_encoder_type="cross_attention",
     )
 
     scripted = torch.jit.script(model)
@@ -709,6 +820,40 @@ def test_models_different_architectures():
     attention_params = sum(p.numel() for p in attention_mlp.parameters())
     
     assert attention_params > summarized_params, "full_transformer variant should have more parameters"
+
+
+def test_cross_attention_mlp_fewer_params_than_full_transformer():
+    """Test cross_attention MLP has fewer params than full_transformer."""
+    full_transformer_mlp = MLPModel(
+        post_embedding_dim=384,
+        hidden_dims=[256, 128],
+        dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=128,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="full_transformer",
+    )
+
+    cross_attention_mlp = MLPModel(
+        post_embedding_dim=384,
+        hidden_dims=[256, 128],
+        dropout_rate=0.3,
+        user_hidden_dim=256,
+        user_output_dim=128,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        attention_dropout=0.1,
+        user_encoder_type="cross_attention",
+    )
+
+    full_transformer_params = sum(p.numel() for p in full_transformer_mlp.parameters())
+    cross_attention_params = sum(p.numel() for p in cross_attention_mlp.parameters())
+
+    assert cross_attention_params < full_transformer_params
 
 
 def test_models_output_same_type():

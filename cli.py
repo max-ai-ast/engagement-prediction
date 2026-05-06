@@ -10,7 +10,7 @@ Note: The historical `run-all` subcommand is now optional (kept for backwards co
 
 Usage examples:
     python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml
+    python cli.py --user-encoder cross_attention --model-type mlp --config config.yml
 """
 
 import argparse
@@ -45,6 +45,10 @@ CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
 STAGE_ORDER = ['get_data', 'target_posts', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
+VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
+    "mlp": ("summarized", "full_transformer", "cross_attention"),
+    "two-tower": ("summarized", "full_transformer", "cross_attention"),
+}
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -585,11 +589,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
 
     # --- Validation for --user-encoder ---
     user_encoder = args.user_encoder
-    valid_encoders = {
-        "mlp": ("summarized", "full_transformer"),
-        "two-tower": ("summarized", "full_transformer", "cross_attention"),
-    }
-    allowed = valid_encoders.get(model_type, ())
+    allowed = VALID_USER_ENCODERS_BY_MODEL_TYPE.get(model_type, ())
     if user_encoder not in allowed:
         raise ValueError(
             f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
@@ -748,9 +748,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
     _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
-    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention", "attention"],
-                          default=argparse.SUPPRESS, help_text="User encoder type (must match model-type: summarized for mlp; full_transformer/cross_attention for two-tower). "
-                          "Note: 'attention' is a deprecated alias for 'full_transformer'.")
+    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
+                          default=argparse.SUPPRESS, help_text="User encoder type (summarized, full_transformer, or cross_attention).")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options

@@ -71,7 +71,8 @@ ARCHITECTURE PATTERNS
 The modular design supports multiple training approaches:
 
     MLP + Summarizer             : SummarizedEngagementDataset + MLPModel(user_encoder_type="summarized")
-    MLP + Attention Encoder      : SequenceEngagementDataset + MLPModel(user_encoder_type="full_transformer")
+    MLP + Full Transformer       : SequenceEngagementDataset + MLPModel(user_encoder_type="full_transformer")
+    MLP + Cross-Attention        : SequenceEngagementDataset + MLPModel(user_encoder_type="cross_attention")
     Two-Tower + Full Transformer : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="full_transformer")
     Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="cross_attention")
 
@@ -831,6 +832,10 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         - Parameters: ~150K (typical) - significantly fewer than TransformerDualPoolingEncoder, ALL TRAINABLE
         - Forward pass: O(seq_len * hidden_dim) - linear in sequence length
         - Memory: Scales linearly with sequence length
+
+    Used by:
+        - TwoTowerModel (user_encoder_type="cross_attention")
+        - MLPModel (user_encoder_type="cross_attention")
     
     Args:
         input_dim: Dimensionality of input post embeddings

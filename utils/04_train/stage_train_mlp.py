@@ -4,7 +4,7 @@
 Stage 4 (MLP): Train MLP engagement prediction models with flexible user-history representation.
 
 This stage trains Multi-Layer Perceptron (MLP) models for binary engagement prediction
-(will user engage with post?). It supports TWO modular approaches for representing
+(will user engage with post?). It supports THREE modular approaches for representing
 user engagement history:
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -20,7 +20,7 @@ Architecture:
     Output: Single sigmoid-activated probability
 
 ═══════════════════════════════════════════════════════════════════════════════
-APPROACH 2: MLP + LEARNED ATTENTION ENCODER (MLPModel, user_encoder="full_transformer")
+APPROACH 2: MLP + LEARNED FULL TRANSFORMER ENCODER (MLPModel, user_encoder="full_transformer")
 ═══════════════════════════════════════════════════════════════════════════════
 
 Uses SequenceEngagementDataset with TransformerDualPoolingEncoder (transformer self-attention)
@@ -32,8 +32,20 @@ Architecture:
     MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
 
 ═══════════════════════════════════════════════════════════════════════════════
+APPROACH 3: MLP + LEARNED CROSS-ATTENTION ENCODER (MLPModel, user_encoder="cross_attention")
+═══════════════════════════════════════════════════════════════════════════════
 
-Both models are trained with:
+Uses SequenceEngagementDataset with CrossAttentionPoolingEncoder (single-query
+cross-attention pooling) to learn efficient history aggregation end-to-end.
+
+Architecture:
+    User "tower": CrossAttentionPoolingEncoder(history_sequence) -> user_vector
+    Concat: [user_vector || post_embedding]
+    MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
+
+═══════════════════════════════════════════════════════════════════════════════
+
+All modes are trained with:
     - Binary cross-entropy loss
     - Balanced positive/negative sampling (1:1 ratio)
     - AdamW optimizer with learning rate scheduling
@@ -92,6 +104,7 @@ from utils.dataloaders import (
     SequenceEngagementDataset,
     SummarizedUserTower,
     TransformerDualPoolingEncoder,
+    CrossAttentionPoolingEncoder,
     create_data_loaders,
 )
 
@@ -112,7 +125,7 @@ class MLPModel(nn.Module):
     - user_encoder_type="summarized": consumes `SummarizedEngagementDataset`
       batches with {"features", "label"} where features is [B, 2*D]
       concatenated [user_summary || post_embedding].
-    - user_encoder_type="full_transformer": consumes `SequenceEngagementDataset`
+    - user_encoder_type="full_transformer" or "cross_attention": consumes `SequenceEngagementDataset`
       batches with {"history_embeddings", "history_mask", "target_post_embedding", "label"}.
 
     Forward signature is always:
@@ -137,7 +150,15 @@ class MLPModel(nn.Module):
         self.user_output_dim = user_output_dim
         self.user_encoder_type = user_encoder_type
 
-        if user_encoder_type == "full_transformer":
+        if user_encoder_type == "cross_attention":
+            self.user_encoder = CrossAttentionPoolingEncoder(
+                input_dim=post_embedding_dim,
+                hidden_dim=user_hidden_dim,
+                output_dim=user_output_dim,
+                max_seq_len=max_history_len,
+                dropout_rate=attention_dropout,
+            )
+        elif user_encoder_type == "full_transformer":
             self.user_encoder = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
@@ -156,7 +177,7 @@ class MLPModel(nn.Module):
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}' for MLPModel. "
-                "Choose 'summarized' or 'full_transformer'."
+                "Choose 'summarized', 'full_transformer' or 'cross_attention'."
             )
 
         mlp_input_dim = user_output_dim + post_embedding_dim
@@ -470,10 +491,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             prefetch_factor=prefetch_factor,
         )
 
-    elif user_encoder == "full_transformer":
+    elif user_encoder in ("full_transformer", "cross_attention"):
         # Sequence dataset + learned encoder + MLP head
-        logger.info("User encoder: full_transformer (TransformerDualPoolingEncoder + MLP)")
-        summarizer_name = "full_transformer"  # for config logging
+        encoder_class_name = (
+            "TransformerDualPoolingEncoder"
+            if user_encoder == "full_transformer"
+            else "CrossAttentionPoolingEncoder"
+        )
+        logger.info(f"User encoder: {user_encoder} ({encoder_class_name} + MLP)")
+        summarizer_name = user_encoder  # for config logging
         ema_alpha = 0.0
 
         log_operation_start("Create datasets (sequence)", STAGE_LOG_NAME, logger)
@@ -496,7 +522,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             num_attention_layers=num_attention_layers,
             max_history_len=max_history_len,
             attention_dropout=attention_dropout,
-            user_encoder_type="full_transformer",
+            user_encoder_type=user_encoder,
         )
 
         train_loader, val_loader, _ = create_data_loaders(
@@ -510,7 +536,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     else:
         raise ValueError(
             f"Unknown user_encoder '{user_encoder}' for MLP. "
-            "Choose 'summarized' or 'full_transformer'."
+            "Choose 'summarized', 'full_transformer' or 'cross_attention'."
         )
 
     # --- train ---
