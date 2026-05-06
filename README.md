@@ -209,6 +209,10 @@ python cli.py --user-encoder summarized \
   --epochs 300 --batch-size 256 --device cuda
 ```
 
+MLP supports `summarized`, `full_transformer`, and `cross_attention` user encoders.
+The learned encoder modes use the sequence dataset and feed the learned user vector
+into the MLP head.
+
 #### Two-Tower Model
 Run all six stages with the two-tower architecture:
 ```bash
@@ -220,7 +224,7 @@ python cli.py --model-type two-tower --user-encoder full_transformer \
 
 Two-tower specific options:
 - `--model-type two-tower`: Use the two-tower architecture instead of MLP
-- `--user-encoder full_transformer`: User encoder type (required; full_transformer or cross_attention for two-tower)
+- `--user-encoder full_transformer`: User encoder type (`summarized`, `full_transformer`, or `cross_attention`)
 - `--shared-dim 128`: Output embedding dimension for both towers
 - `--num-attention-heads 4`: Number of attention heads in user history encoder
 - `--num-attention-layers 2`: Number of transformer layers in user history encoder

@@ -81,6 +81,14 @@ def test_merge_args_with_config_defaults_l2_normalize_embeddings_to_false():
     assert merged.l2_normalize_embeddings is False
 
 
+def test_mlp_allows_cross_attention_user_encoder():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "mlp", "--user-encoder", "cross_attention"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.user_encoder in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE[merged.model_type]
+
+
 def test_background_effective_config_preserves_no_l2_normalize_embeddings(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--no-l2-normalize-embeddings"])
