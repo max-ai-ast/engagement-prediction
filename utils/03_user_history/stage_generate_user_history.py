@@ -105,23 +105,24 @@ def _build_user_history_directory(
 
     # Rename likes columns to avoid collision after join
     # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
-    likes_renamed = likes_lf.select([
+    likes_cols = [
         pl.col("did"),
         pl.col(TIMESTAMP_COL_NAME).alias("like_ts"),
         pl.col("emb_idx").alias("like_emb_idx"),
-        pl.col("author_did").alias("like_author_did"),
-    ])
+    ]
 
     if author_idx_lf is not None:
+        likes_renamed = likes_lf.select(likes_cols + [pl.col("author_did")])
         likes_renamed = (
             likes_renamed
-            .select("author_did", "author_idx")
             .join(
-                author_idx_lf,
-                left_on="like_author_did",
-                right_on="author_did"
+                author_idx_lf.select("author_did", "author_idx"),
+                on="author_did",
+                how="left",
             )
         )
+    else:
+        likes_renamed = likes_lf.select(likes_cols)
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
@@ -154,23 +155,18 @@ def _build_user_history_directory(
         )
         if max_prior_likes is not None and max_prior_likes > 0:
             agg_expr = agg_expr.head(max_prior_likes)
-            logger.info(f"  Capping prior likes to {max_prior_likes} per target")
-        else:
-            logger.info("  No cap on prior likes (using all available history)")
         return agg_expr
     
-    emb_idx_agg_expr = _get_agg_expr("like_emb_idx")
-    author_idx_agg_expr = pl.lit(None)
+    agg_exprs = [
+        _get_agg_expr("like_emb_idx").alias("prior_emb_indices"),
+        pl.len().alias("raw_prior_count"),
+    ]
     if author_idx_lf is not None:
-        author_idx_agg_expr = _get_agg_expr("author_idx")
+        agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
 
     # Group by integer target_idx (cheap) and collect prior emb_idx as list.
     # Also compute raw (uncapped) count for distribution analysis.
-    directory_lf = prior_likes.group_by("target_idx").agg(
-        emb_idx_agg_expr.alias("prior_emb_indices"),
-        author_idx_agg_expr.alias("prior_author_indices"),
-        pl.len().alias("raw_prior_count"),
-    )
+    directory_lf = prior_likes.group_by("target_idx").agg(agg_exprs)
 
     # Left-join back to ensure every target row appears, including those with
     # no prior likes (e.g. a user's first like in the dataset).
@@ -192,7 +188,17 @@ def _build_user_history_directory(
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices"),
         pl.col("raw_prior_count").fill_null(0),
-    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "prior_author_indices", "raw_prior_count"])
+    )
+    output_columns = ["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"]
+    if author_idx_lf is not None:
+        directory_lf = directory_lf.with_columns(
+            pl.when(pl.col("prior_author_indices").is_null())
+            .then(pl.lit([]).cast(pl.List(pl.UInt32)))
+            .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
+            .alias("prior_author_indices"),
+        )
+        output_columns.insert(4, "prior_author_indices")
+    directory_lf = directory_lf.select(output_columns)
 
     return directory_lf
 
@@ -326,80 +332,6 @@ def _log_and_plot_history_distribution(
     logger.info(f"✓ Saved history distribution plot to {plot_path.name}")
 
 
-# def _add_author_indices_to_history(
-#     directory_df: pl.DataFrame,
-#     author_idx_df: pl.DataFrame,
-#     logger: logging.Logger,
-# ) -> pl.DataFrame:
-#     """
-#     Add a prior_author_indices list aligned element-wise with prior_emb_indices.
-
-#     This uses a fully vectorized explode/join/regroup flow instead of a Python
-#     UDF. The regroup step sorts by the original list position so the output
-#     preserves both order and length. If an emb_idx has no matching author_idx
-#     (for example because it only appears outside the training mapping),
-#     the aligned position is kept as a null list element rather than dropping it.
-#     """
-#     logger.info("Adding prior_author_indices via explode/join/regroup")
-
-#     directory_with_idx = directory_df.with_row_index("history_row_idx")
-
-#     exploded_history = (
-#         directory_with_idx
-#         .filter(pl.col("prior_emb_indices").list.len() > 0)
-#         .select(
-#             "history_row_idx",
-#             "prior_emb_indices",
-#             # Track the original list position so we can regroup in the exact
-#             # same order after joining author_idx values.
-#             pl.int_ranges(0, pl.col("prior_emb_indices").list.len()).alias("prior_pos"),
-#         )
-#         .explode(["prior_emb_indices", "prior_pos"])
-#     )
-
-#     joined = exploded_history.join(
-#         author_idx_df.select(["emb_idx", "author_idx"]).unique(),
-#         left_on="prior_emb_indices",
-#         right_on="emb_idx",
-#         how="left",
-#     )
-
-#     prior_author_indices = joined.group_by("history_row_idx").agg(
-#         pl.col("author_idx").sort_by("prior_pos").alias("prior_author_indices")
-#     )
-
-#     user_history_df = (
-#         directory_with_idx
-#         .join(prior_author_indices, on="history_row_idx", how="left")
-#         .with_columns(
-#             pl.when(pl.col("prior_author_indices").is_null())
-#             .then(pl.lit([]).cast(pl.List(pl.UInt32)))
-#             .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
-#             .alias("prior_author_indices")
-#         )
-#         .drop("history_row_idx")
-#     )
-
-#     return user_history_df
-
-
-def _prepare_user_history_output(
-    directory_df: pl.DataFrame,
-    author_idx_df: Optional[pl.DataFrame],
-    logger: logging.Logger,
-) -> pl.DataFrame:
-    """Select the persisted history columns, adding author history when available."""
-    base_columns = ["target_did", "like_uri", "prior_emb_indices"]
-    if author_idx_df is None:
-        logger.info("No author_idx artifact found; writing legacy history output without prior_author_indices")
-        return directory_df.select(base_columns)
-
-    return (
-        _add_author_indices_to_history(directory_df, author_idx_df, logger)
-        .select([*base_columns, "prior_author_indices"])
-    )
-
-
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
     Stage 3: Generate user history directory.
@@ -516,11 +448,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
-    # Select only the required output columns (drop analysis columns). Author
-    # history is optional so older Stage 2 outputs can still feed Stage 3 when
-    # the Stage 4 author embedding feature is not being used.
-    author_idx_df = author_idx_lf.collect() if author_idx_lf is not None else None
-    user_history_df = _prepare_user_history_output(directory_df, author_idx_df, logger)
+    # Select only the required persisted output columns. Author history is
+    # optional so older Stage 2 outputs can still feed Stage 3 when the Stage 4
+    # author embedding feature is not being used.
+    output_columns = ["target_did", "like_uri", "prior_emb_indices"]
+    if author_idx_lf is not None:
+        output_columns.append("prior_author_indices")
+    user_history_df = directory_df.select(output_columns)
     user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
     user_history_df.write_parquet(user_history_output_path, compression="zstd")
 
