@@ -343,6 +343,44 @@ class PostAuthorPostTowerWrapper(nn.Module):
         return self.post_tower(fused_post_embeddings)
 
 
+def build_author_serving_mapping(
+    author_idx_mapping_df: pl.DataFrame,
+    author_idx_to_table_row: np.ndarray,
+) -> pl.DataFrame:
+    """Build the supported author DID -> embedding-table row artifact for serving."""
+    required_cols = {"author_did", "author_idx", "author_train_count"}
+    missing_cols = required_cols.difference(author_idx_mapping_df.columns)
+    if missing_cols:
+        missing = ", ".join(sorted(missing_cols))
+        raise ValueError(f"author_idx_mapping_df is missing required columns: {missing}")
+
+    mapping_df = (
+        author_idx_mapping_df
+        .select(["author_did", "author_idx", "author_train_count"])
+        .unique()
+        .sort("author_idx")
+    )
+    author_table_rows: List[int] = []
+    for raw_author_idx in mapping_df["author_idx"].to_list():
+        if raw_author_idx is None:
+            author_table_rows.append(AUTHOR_UNK_IDX)
+            continue
+        raw_author_idx_int = int(raw_author_idx)
+        if 0 <= raw_author_idx_int < len(author_idx_to_table_row):
+            author_table_rows.append(int(author_idx_to_table_row[raw_author_idx_int]))
+        else:
+            author_table_rows.append(AUTHOR_UNK_IDX)
+
+    return (
+        mapping_df
+        .with_columns(
+            pl.Series("author_table_row", author_table_rows, dtype=pl.UInt32),
+        )
+        .filter(pl.col("author_table_row") > AUTHOR_UNK_IDX)
+        .select(["author_did", "author_idx", "author_train_count", "author_table_row"])
+    )
+
+
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
@@ -968,6 +1006,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
     author_idx_to_table_row = None
     author_table_num_rows = 0
+    author_serving_mapping_df = None
     if use_author_embedding_table:
         if author_idx_mapping_df is None:
             raise FileNotFoundError("author_idx_mapping_df is required when use_author_embedding_table is True")
@@ -975,11 +1014,16 @@ def run(context: Context, args) -> Dict[str, Any]:
             author_idx_mapping_df=author_idx_mapping_df,
             min_author_support=min_author_support,
         )
+        author_serving_mapping_df = build_author_serving_mapping(
+            author_idx_mapping_df=author_idx_mapping_df,
+            author_idx_to_table_row=author_idx_to_table_row,
+        )
         logger.info(
             "Author embedding table enabled: "
             f"min_author_support={min_author_support}, "
             f"author_embedding_dim={author_embedding_dim}, "
-            f"author_table_num_rows={author_table_num_rows}"
+            f"author_table_num_rows={author_table_num_rows}, "
+            f"serving_mapping_rows={len(author_serving_mapping_df)}"
         )
 
     # Worker settings
@@ -1129,6 +1173,11 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- save model ---
     model_path = None
+    author_table_mapping_path = (
+        checkpoints_dir / "author_table_mapping.parquet"
+        if use_author_embedding_table and save_model
+        else None
+    )
     config = {
         "model_type": "two_tower",
         "user_encoder_type": user_encoder_type,
@@ -1150,6 +1199,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "author_table_num_rows": author_table_num_rows if use_author_embedding_table else None,
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
+        "author_table_mapping_path": str(author_table_mapping_path) if author_table_mapping_path else None,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -1164,6 +1214,16 @@ def run(context: Context, args) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
+
+        if use_author_embedding_table:
+            if author_serving_mapping_df is None or author_table_mapping_path is None:
+                raise RuntimeError("author_serving_mapping_df is required when author embeddings are enabled")
+            author_serving_mapping_df.write_parquet(author_table_mapping_path, compression="zstd")
+            author_mapping_id = context.tracker.log_artifact(
+                name="author_table_mapping",
+                path=author_table_mapping_path,
+            )
+            logger.info(f"Author table mapping artifact id: {author_mapping_id}")
 
         # Save TorchScript file, which is the format needed for ClearML serving
         # Save the post and user towers separately
@@ -1303,5 +1363,6 @@ def run(context: Context, args) -> Dict[str, Any]:
         "artifacts": {
             "model_path": str(model_path) if model_path else None,
             "training_config": str(out_dir / "training_config.json"),
+            "author_table_mapping_path": str(author_table_mapping_path) if author_table_mapping_path else None,
         },
     }

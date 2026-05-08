@@ -1,5 +1,6 @@
 """Comprehensive tests for Two Tower model architecture."""
 import importlib
+import polars as pl
 import pytest
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ TwoTowerModel = stage_train_two_tower.TwoTowerModel
 PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
 HistoryAuthorUserTowerWrapper = stage_train_two_tower.HistoryAuthorUserTowerWrapper
 PostAuthorPostTowerWrapper = stage_train_two_tower.PostAuthorPostTowerWrapper
+build_author_serving_mapping = stage_train_two_tower.build_author_serving_mapping
 
 
 # =============================================================================
@@ -1024,6 +1026,58 @@ def test_post_author_feature_encoder_zeroes_padding_row():
 
     assert torch.all(encoder.author_embedding.weight[0] == 0)
     assert torch.any(encoder.author_embedding.weight[1] != 0)
+
+
+def test_build_author_serving_mapping_exports_final_table_rows():
+    author_idx_mapping_df = pl.DataFrame({
+        "emb_idx": [10, 11, 20, 30],
+        "author_did": ["author_a", "author_a", "author_b", "author_c"],
+        "author_idx": pl.Series([1, 1, 2, 3], dtype=pl.UInt32),
+        "author_train_count": [5, 5, 2, 7],
+    })
+    author_idx_to_table_row = torch.tensor([1, 2, 1, 4], dtype=torch.int64).numpy()
+
+    result = build_author_serving_mapping(
+        author_idx_mapping_df=author_idx_mapping_df,
+        author_idx_to_table_row=author_idx_to_table_row,
+    )
+
+    assert result.columns == [
+        "author_did",
+        "author_idx",
+        "author_train_count",
+        "author_table_row",
+    ]
+    assert result.to_dicts() == [
+        {
+            "author_did": "author_a",
+            "author_idx": 1,
+            "author_train_count": 5,
+            "author_table_row": 2,
+        },
+        {
+            "author_did": "author_c",
+            "author_idx": 3,
+            "author_train_count": 7,
+            "author_table_row": 4,
+        },
+    ]
+
+
+def test_build_author_serving_mapping_omits_out_of_range_author():
+    author_idx_mapping_df = pl.DataFrame({
+        "author_did": ["author_missing"],
+        "author_idx": pl.Series([9], dtype=pl.UInt32),
+        "author_train_count": [10],
+    })
+    author_idx_to_table_row = torch.tensor([1, 2], dtype=torch.int64).numpy()
+
+    result = build_author_serving_mapping(
+        author_idx_mapping_df=author_idx_mapping_df,
+        author_idx_to_table_row=author_idx_to_table_row,
+    )
+
+    assert result.is_empty()
 
 
 def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
