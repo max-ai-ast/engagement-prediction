@@ -52,6 +52,7 @@ def _build_user_history_directory(
     max_prior_likes: Optional[int],
     logger: logging.Logger,
     history_buffer_hours: Optional[float] = None,
+    author_idx_lf: Optional[pl.LazyFrame] = None,
 ) -> pl.LazyFrame:
     """
     Build a directory mapping each target (user, like-event) to prior liked embedding indices.
@@ -108,7 +109,19 @@ def _build_user_history_directory(
         pl.col("did"),
         pl.col(TIMESTAMP_COL_NAME).alias("like_ts"),
         pl.col("emb_idx").alias("like_emb_idx"),
+        pl.col("author_did").alias("like_author_did"),
     ])
+
+    if author_idx_lf is not None:
+        likes_renamed = (
+            likes_renamed
+            .select("author_did", "author_idx")
+            .join(
+                author_idx_lf,
+                left_on="like_author_did",
+                right_on="author_did"
+            )
+        )
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
@@ -123,32 +136,39 @@ def _build_user_history_directory(
     # This ensures we only include prior history, not future likes.
     if history_buffer_hours is not None and history_buffer_hours > 0:
         buffer_us = int(history_buffer_hours * 3_600_000_000)  # hours → microseconds
-        cutoff = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
+        cutoff_expr = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
         logger.info(f"  Applying history buffer of {history_buffer_hours}h (like_ts < seen_at - {history_buffer_hours}h)")
     else:
-        cutoff = pl.col("seen_at")
+        cutoff_expr = pl.col("seen_at")
 
     prior_likes = joined.filter(
-        pl.col("like_ts") < cutoff
+        pl.col("like_ts") < cutoff_expr
     )
 
-    # Build aggregation expression: sort by recency (descending) and optionally cap
-    # The result is a list of emb_idx values, most recent first
-    agg_expr = (
-        pl.col("like_emb_idx")
-        .sort_by(pl.col("like_ts"), descending=True)
-    )
-
-    if max_prior_likes is not None and max_prior_likes > 0:
-        agg_expr = agg_expr.head(max_prior_likes)
-        logger.info(f"  Capping prior likes to {max_prior_likes} per target")
-    else:
-        logger.info("  No cap on prior likes (using all available history)")
+    def _get_agg_expr(col_name: str):
+        # Build aggregation expression: sort by recency (descending) and optionally cap
+        # The result is a list of emb_idx values, most recent first
+        agg_expr = (
+            pl.col(col_name)
+            .sort_by(pl.col("like_ts"), descending=True)
+        )
+        if max_prior_likes is not None and max_prior_likes > 0:
+            agg_expr = agg_expr.head(max_prior_likes)
+            logger.info(f"  Capping prior likes to {max_prior_likes} per target")
+        else:
+            logger.info("  No cap on prior likes (using all available history)")
+        return agg_expr
+    
+    emb_idx_agg_expr = _get_agg_expr("like_emb_idx")
+    author_idx_agg_expr = pl.lit(None)
+    if author_idx_lf is not None:
+        author_idx_agg_expr = _get_agg_expr("author_idx")
 
     # Group by integer target_idx (cheap) and collect prior emb_idx as list.
     # Also compute raw (uncapped) count for distribution analysis.
     directory_lf = prior_likes.group_by("target_idx").agg(
-        agg_expr.alias("prior_emb_indices"),
+        emb_idx_agg_expr.alias("prior_emb_indices"),
+        author_idx_agg_expr.alias("prior_author_indices"),
         pl.len().alias("raw_prior_count"),
     )
 
@@ -172,7 +192,7 @@ def _build_user_history_directory(
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices"),
         pl.col("raw_prior_count").fill_null(0),
-    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"])
+    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "prior_author_indices", "raw_prior_count"])
 
     return directory_lf
 
@@ -306,61 +326,61 @@ def _log_and_plot_history_distribution(
     logger.info(f"✓ Saved history distribution plot to {plot_path.name}")
 
 
-def _add_author_indices_to_history(
-    directory_df: pl.DataFrame,
-    author_idx_df: pl.DataFrame,
-    logger: logging.Logger,
-) -> pl.DataFrame:
-    """
-    Add a prior_author_indices list aligned element-wise with prior_emb_indices.
+# def _add_author_indices_to_history(
+#     directory_df: pl.DataFrame,
+#     author_idx_df: pl.DataFrame,
+#     logger: logging.Logger,
+# ) -> pl.DataFrame:
+#     """
+#     Add a prior_author_indices list aligned element-wise with prior_emb_indices.
 
-    This uses a fully vectorized explode/join/regroup flow instead of a Python
-    UDF. The regroup step sorts by the original list position so the output
-    preserves both order and length. If an emb_idx has no matching author_idx
-    (for example because it only appears outside the training mapping),
-    the aligned position is kept as a null list element rather than dropping it.
-    """
-    logger.info("Adding prior_author_indices via explode/join/regroup")
+#     This uses a fully vectorized explode/join/regroup flow instead of a Python
+#     UDF. The regroup step sorts by the original list position so the output
+#     preserves both order and length. If an emb_idx has no matching author_idx
+#     (for example because it only appears outside the training mapping),
+#     the aligned position is kept as a null list element rather than dropping it.
+#     """
+#     logger.info("Adding prior_author_indices via explode/join/regroup")
 
-    directory_with_idx = directory_df.with_row_index("history_row_idx")
+#     directory_with_idx = directory_df.with_row_index("history_row_idx")
 
-    exploded_history = (
-        directory_with_idx
-        .filter(pl.col("prior_emb_indices").list.len() > 0)
-        .select(
-            "history_row_idx",
-            "prior_emb_indices",
-            # Track the original list position so we can regroup in the exact
-            # same order after joining author_idx values.
-            pl.int_ranges(0, pl.col("prior_emb_indices").list.len()).alias("prior_pos"),
-        )
-        .explode(["prior_emb_indices", "prior_pos"])
-    )
+#     exploded_history = (
+#         directory_with_idx
+#         .filter(pl.col("prior_emb_indices").list.len() > 0)
+#         .select(
+#             "history_row_idx",
+#             "prior_emb_indices",
+#             # Track the original list position so we can regroup in the exact
+#             # same order after joining author_idx values.
+#             pl.int_ranges(0, pl.col("prior_emb_indices").list.len()).alias("prior_pos"),
+#         )
+#         .explode(["prior_emb_indices", "prior_pos"])
+#     )
 
-    joined = exploded_history.join(
-        author_idx_df.select(["emb_idx", "author_idx"]).unique(),
-        left_on="prior_emb_indices",
-        right_on="emb_idx",
-        how="left",
-    )
+#     joined = exploded_history.join(
+#         author_idx_df.select(["emb_idx", "author_idx"]).unique(),
+#         left_on="prior_emb_indices",
+#         right_on="emb_idx",
+#         how="left",
+#     )
 
-    prior_author_indices = joined.group_by("history_row_idx").agg(
-        pl.col("author_idx").sort_by("prior_pos").alias("prior_author_indices")
-    )
+#     prior_author_indices = joined.group_by("history_row_idx").agg(
+#         pl.col("author_idx").sort_by("prior_pos").alias("prior_author_indices")
+#     )
 
-    user_history_df = (
-        directory_with_idx
-        .join(prior_author_indices, on="history_row_idx", how="left")
-        .with_columns(
-            pl.when(pl.col("prior_author_indices").is_null())
-            .then(pl.lit([]).cast(pl.List(pl.UInt32)))
-            .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
-            .alias("prior_author_indices")
-        )
-        .drop("history_row_idx")
-    )
+#     user_history_df = (
+#         directory_with_idx
+#         .join(prior_author_indices, on="history_row_idx", how="left")
+#         .with_columns(
+#             pl.when(pl.col("prior_author_indices").is_null())
+#             .then(pl.lit([]).cast(pl.List(pl.UInt32)))
+#             .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
+#             .alias("prior_author_indices")
+#         )
+#         .drop("history_row_idx")
+#     )
 
-    return user_history_df
+#     return user_history_df
 
 
 def _prepare_user_history_output(
