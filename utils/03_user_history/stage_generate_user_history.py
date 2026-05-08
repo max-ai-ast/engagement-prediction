@@ -474,7 +474,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
         # Validate author idx schema
         author_idx_schema = {
-            "emb_idx": int,
             "author_did": str,
             "author_train_count": int,
             "author_idx": int,
@@ -501,6 +500,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_prior_likes=max_prior_likes,
         logger=logger,
         history_buffer_hours=history_buffer_hours,
+        author_idx_lf=author_idx_lf,
     )
 
     mem_tracker.checkpoint("after_build_history", quiet=True)
