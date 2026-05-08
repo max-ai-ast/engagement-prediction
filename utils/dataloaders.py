@@ -229,7 +229,7 @@ class SummarizedUserTower(nn.Module):
         # can still rank posts for cold-start users.
         self.empty_user_embedding = nn.Parameter(torch.randn(self.embed_dim) * 0.02)
 
-    def forward(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor], target_user_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if history_embeddings.dim() != 3:
             # Keep error message TorchScript-friendly (no dynamic shape formatting).
             raise RuntimeError("Expected history_embeddings with shape [B, T, D].")
@@ -511,6 +511,13 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # mean pool vector and cross attention vector
         output_projection_input_dim = hidden_dim * 2
 
+        # user embedding table. initialize values because otherwise torchscript saving won't work
+        self.target_user_embedding_dim = 1
+        self.target_user_unk_idx = UNK_IDX
+        self.target_user_pad_idx = PAD_IDX
+        self.target_user_unknown_dropout_rate = float(target_user_unknown_dropout_rate)
+        self.target_user_embedding_table = nn.Embedding(2, 1, padding_idx=self.target_user_pad_idx)
+
         if self.use_target_user_embedding_table:
             if target_user_table_num_rows is None or target_user_table_num_rows < 2:
                 raise ValueError("target_user_table_num_rows must be provided and >= 2 when use_target_user_embedding_table is True")
@@ -518,8 +525,6 @@ class BaseAttentionEncoder(nn.Module, ABC):
                 raise ValueError("target_user_embedding_dim must be provided and positive when use_target_user_embedding_table is True")
             
             self.target_user_embedding_dim = target_user_embedding_dim
-            self.target_user_unk_idx = UNK_IDX
-            self.target_user_pad_idx = PAD_IDX
             self.target_user_unknown_dropout_rate = target_user_unknown_dropout_rate            
             
             self.target_user_embedding_table = nn.Embedding(
@@ -738,7 +743,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
-        target_user_idx: torch.Tensor, # [B]
+        target_user_idx: Optional[torch.Tensor] = None, # [B]
     ) -> torch.Tensor:
         """Encode a padded history sequence into a fixed-size representation.
 
@@ -934,7 +939,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
-        target_user_idx: torch.Tensor, # [B]
+        target_user_idx: Optional[torch.Tensor] = None, # [B]
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
@@ -961,7 +966,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
 
         if self.use_target_user_embedding_table:
-            if target_user_idx is None or self.target_user_embedding_table is None:
+            if target_user_idx is None:
                 raise RuntimeError("target_user_idx is required when use_target_user_embedding_table is True")
             target_user_embedding = self._forward_target_user_embedding(target_user_idx)
             combined = torch.cat([attention_pooled, mean_pooled, target_user_embedding], dim=-1)
@@ -1068,7 +1073,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
 
         if self.use_target_user_embedding_table:
-            if target_user_idx is None or self.target_user_embedding_table is None:
+            if target_user_idx is None:
                 raise RuntimeError("target_user_idx is required when use_target_user_embedding_table is True")
             target_user_embedding = self._forward_target_user_embedding(target_user_idx)
             combined = torch.cat([attention_pooled, mean_pooled, target_user_embedding], dim=-1)

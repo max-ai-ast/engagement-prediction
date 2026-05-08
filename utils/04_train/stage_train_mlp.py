@@ -157,6 +157,7 @@ class MLPModel(nn.Module):
                 output_dim=user_output_dim,
                 max_seq_len=max_history_len,
                 dropout_rate=attention_dropout,
+                use_target_user_embedding_table=False,
             )
         elif user_encoder_type == "full_transformer":
             self.user_encoder = TransformerDualPoolingEncoder(
@@ -167,6 +168,7 @@ class MLPModel(nn.Module):
                 num_attention_layers=num_attention_layers,
                 max_seq_len=max_history_len,
                 dropout_rate=attention_dropout,
+                use_target_user_embedding_table=False,
             )
         elif user_encoder_type == "summarized":
             if user_output_dim != post_embedding_dim:
@@ -414,7 +416,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, history_df, _, embed_dim = load_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)

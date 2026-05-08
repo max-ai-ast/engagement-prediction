@@ -300,7 +300,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_df, history_df, embed_dim = load_training_data(
+    _, target_posts_df, history_df, _, embed_dim = load_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)

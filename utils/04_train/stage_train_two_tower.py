@@ -210,7 +210,7 @@ class L2NormalizedUserTower(nn.Module):
         self.enabled = bool(enabled)
         self.eps = float(eps)
 
-    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor, target_user_idx: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor, target_user_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         embeddings = self.tower(history_embeddings, history_mask, target_user_idx)
         if not self.enabled:
             return embeddings
