@@ -482,9 +482,7 @@ def _apply_splits(
         ])
         .group_by(['author_did'])
         .agg(pl.sum("author_train_count"))
-        .with_columns(
-            pl.col("author_did").rank("dense").cast(pl.UInt32).alias("author_idx")
-        )
+        .with_row_index(name="author_idx")
     )
 
     # join back to target posts 
