@@ -213,7 +213,7 @@ class ClearMLExperimentTracker:
             framework='pytorch',
             tags=['candidate'],
         )
-        om.update_weights(str(p))
+        om.update_weights(str(p), auto_delete_file=False)
 
         # also attach useful metadata
         script = self._task.data.script
