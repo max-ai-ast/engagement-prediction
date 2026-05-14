@@ -97,6 +97,8 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import nullcontext
+from tqdm import tqdm
 
 import numpy as np
 import polars as pl
@@ -702,6 +704,66 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
+def _run_one_epoch(
+    train: bool,
+    split_name: str,
+    model: TwoTowerModel,
+    device: str,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    disable_progress: bool,
+    embed_dim: int,
+    gradient_clip_max_norm: float,
+):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    loss_sum = torch.zeros((), device=device)
+    batches = 0
+    scores_chunks: List[torch.Tensor] = []
+    labels_chunks: List[torch.Tensor] = []
+    users_all: List[str] = []
+
+    with nullcontext() if train else torch.inference_mode():
+        for batch in tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress):
+            labels = batch["label"]
+
+            if train:
+                optimizer.zero_grad()
+
+            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
+
+            if train:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
+                optimizer.step()
+
+            loss_sum += loss.detach()
+            batches += 1
+            scores_chunks.append(scores.detach())
+            labels_chunks.append(labels.detach())
+            users_all.extend(batch["user_id"])
+
+    loss = (loss_sum / max(batches, 1)).item()
+
+    probs = (
+        torch.sigmoid(torch.cat(scores_chunks)).float().cpu().numpy()
+        if scores_chunks
+        else np.array([])
+    )
+    labels_np = (
+        torch.cat(labels_chunks).float().cpu().numpy()
+        if labels_chunks
+        else np.array([])
+    )
+
+    auc = roc_auc_score(labels_np, probs) if np.unique(labels_np).size > 1 else 0.5
+
+    return loss, probs, labels_np, auc
+
+
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -710,6 +772,7 @@ def train_two_tower_model(
     model: TwoTowerModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    val_unseen_loader: DataLoader,
     device: str,
     epochs: int,
     learning_rate: float,
@@ -722,9 +785,9 @@ def train_two_tower_model(
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
     embed_dim: int,
+    metrics_top_ks: list[int],
     experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    from tqdm import tqdm
 
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -740,72 +803,41 @@ def train_two_tower_model(
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        # --- Training ---
-        model.train()
-        train_loss_sum = torch.zeros((), device=device)
-        train_batches = 0
-        train_scores_chunks: List[torch.Tensor] = []
-        train_labels_chunks: List[torch.Tensor] = []
-
-        for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            labels = batch["label"]
-
-            optimizer.zero_grad()
-            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
-            optimizer.step()
-
-            train_loss_sum += loss.detach()
-            train_batches += 1
-            train_scores_chunks.append(scores.detach())
-            train_labels_chunks.append(labels.detach())
-
-        # --- Validation ---
-        model.eval()
-        val_loss_sum = torch.zeros((), device=device)
-        val_batches = 0
-        val_scores_chunks: List[torch.Tensor] = []
-        val_labels_chunks: List[torch.Tensor] = []
-
-        with torch.inference_mode():
-            for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                labels = batch["label"]
-
-                loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
-
-                val_loss_sum += loss.detach()
-                val_batches += 1
-                val_scores_chunks.append(scores.detach())
-                val_labels_chunks.append(labels.detach())
-
-        train_loss = (train_loss_sum / max(train_batches, 1)).item()
-        val_loss = (val_loss_sum / max(val_batches, 1)).item()
-
-        train_probs = (
-            torch.sigmoid(torch.cat(train_scores_chunks)).float().cpu().numpy()
-            if train_scores_chunks
-            else np.array([])
-        )
-        train_labels_np = (
-            torch.cat(train_labels_chunks).float().cpu().numpy()
-            if train_labels_chunks
-            else np.array([])
+        train_loss, train_probs, train_labels_np, train_auc = _run_one_epoch(
+            train=True,
+            split_name="Train",
+            model=model,
+            device=device,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            disable_progress=disable_progress,
+            embed_dim=embed_dim,
+            gradient_clip_max_norm=gradient_clip_max_norm,
         )
 
-        val_probs = (
-            torch.sigmoid(torch.cat(val_scores_chunks)).float().cpu().numpy()
-            if val_scores_chunks
-            else np.array([])
-        )
-        val_labels_np = (
-            torch.cat(val_labels_chunks).float().cpu().numpy()
-            if val_labels_chunks
-            else np.array([])
+        val_loss, _, _, val_auc = _run_one_epoch(
+            train=False,
+            split_name="Validation",
+            model=model,
+            device=device,
+            dataloader=val_loader,
+            optimizer=optimizer,
+            disable_progress=disable_progress,
+            embed_dim=embed_dim,
+            gradient_clip_max_norm=gradient_clip_max_norm,
         )
 
-        train_auc = roc_auc_score(train_labels_np, train_probs) if np.unique(train_labels_np).size > 1 else 0.5
-        val_auc = roc_auc_score(val_labels_np, val_probs) if np.unique(val_labels_np).size > 1 else 0.5
+        val_unseen_loss, val_unseen_probs, val_unseen_labels_np, val_unseen_auc = _run_one_epoch(
+            train=False,
+            split_name="Validation Unseen Users",
+            model=model,
+            device=device,
+            dataloader=val_unseen_loader,
+            optimizer=optimizer,
+            disable_progress=disable_progress,
+            embed_dim=embed_dim,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+        )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -1004,6 +1036,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     author_embedding_dim = int(args.author_embedding_dim)
     min_author_support = int(args.min_author_support)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
+    metrics_top_ks = list(args.metrics_top_ks)
 
     if use_author_embedding_table and user_encoder_type == "summarized":
         raise ValueError("use_author_embedding_table is not supported with user_encoder_type='summarized'")
@@ -1126,6 +1159,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
+            val_unseen_loader=val_unseen_loader,
             device=device,
             epochs=epochs,
             learning_rate=learning_rate,
@@ -1138,6 +1172,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             lr_scheduler_patience=lr_scheduler_patience,
             gradient_clip_max_norm=gradient_clip_max_norm,
             embed_dim=embed_dim,
+            metrics_top_ks=metrics_top_ks,
             experiment_tracker=context.tracker,
         )
         trained_model: TwoTowerModel = training_results["model"]
@@ -1298,8 +1333,8 @@ def run(context: Context, args) -> Dict[str, Any]:
                 logger.info(f"No rows for split '{split_name}', skipping.")
                 continue
             log_operation_start(f"Holdout evaluation ({holdout_type})", STAGE_LOG_NAME, logger)
-            _, _, holdout_loader = create_data_loaders(
-                train_dataset, train_dataset, batch_size,  # train/val loaders unused here
+            _, _, _, holdout_loader = create_data_loaders(
+                train_dataset, val_dataset, val_unseen_dataset, batch_size,  # train/val loaders unused here
                 holdout_dataset=holdout_dataset,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
