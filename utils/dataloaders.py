@@ -1668,6 +1668,7 @@ class SequenceEngagementDataset(Dataset):
 def create_data_loaders(
     train_dataset: Dataset,
     val_dataset: Dataset,
+    val_unseen_dataset: Dataset,
     batch_size: int,
     holdout_dataset: Optional[Dataset] = None,
     num_workers: int = 4,
@@ -1734,10 +1735,16 @@ def create_data_loaders(
         shuffle=False,  # No shuffle for validation (deterministic evaluation)
         **worker_kw
     )
+    val_unseen_loader = DataLoader(
+        val_unseen_dataset,
+        batch_size=batch_size, 
+        shuffle=False,  # No shuffle for validation (deterministic evaluation)
+        **worker_kw
+    )
     holdout_loader = DataLoader(
         holdout_dataset, 
         batch_size=batch_size, 
         shuffle=False,
         **worker_kw
     ) if holdout_dataset else None
-    return train_loader, val_loader, holdout_loader
+    return train_loader, val_loader, val_unseen_loader, holdout_loader

@@ -455,16 +455,9 @@ def _apply_splits(
         .then(pl.lit("train_unseen_users"))
         .when(is_holdout_user & (pl.col(ts_col) >= pl.lit(val_start)) & val_upper & before_end)
         .then(pl.lit("val_unseen_users"))
-        .when(
-            ~is_holdout_user
-            & train_window
-        )
+        .when(~is_holdout_user & train_window)
         .then(pl.lit("train"))
-        .when(
-            ~is_holdout_user
-            & (pl.col(ts_col) >= pl.lit(val_start))
-            & val_upper
-        )
+        .when(~is_holdout_user & (pl.col(ts_col) >= pl.lit(val_start)) & val_upper)
         .then(pl.lit("val"))
         .otherwise(None)
         .alias("split")

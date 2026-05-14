@@ -1055,6 +1055,10 @@ def run(context: Context, args) -> Dict[str, Any]:
             embeddings_mmap, target_posts_df, history_df, split="val", 
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
+        val_unseen_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val_unseen_users", 
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
     else:
         train_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
@@ -1070,10 +1074,17 @@ def run(context: Context, args) -> Dict[str, Any]:
             author_idx_to_table_row=author_idx_to_table_row,
             logger=logger,
         )
+        val_unseen_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val_unseen_users",
+            max_history_len=max_history_len, embed_dim=embed_dim,
+            use_author_embedding_table=use_author_embedding_table,
+            author_idx_to_table_row=author_idx_to_table_row,
+            logger=logger,
+        )
 
     # Create data loaders using centralized helper
-    train_loader, val_loader, _ = create_data_loaders(
-        train_dataset, val_dataset, batch_size,
+    train_loader, val_loader, val_unseen_loader, _ = create_data_loaders(
+        train_dataset, val_dataset, val_unseen_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
