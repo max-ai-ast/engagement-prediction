@@ -704,22 +704,35 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
-def calc_ndcg_at_k(
+def calc_rank_metrics_at_k(
     probs_df: pl.DataFrame,
     metrics_top_ks: list[int],
 ) -> dict[str, float]:
     """
-    Calculate the normalized discounted cumulative gain for each user in a dataframe,
-    and then take an average across users.
+    Calculate rank metrics for each user in a dataframe, and then take an
+    average across users with at least one relevant item.
     """
+    empty_metrics = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
+    empty_metrics.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
+    empty_metrics.update({f"recall@{k}": 0.0 for k in metrics_top_ks})
+
     if probs_df.is_empty():
-        ndcg_dict = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
-        ndcg_dict.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
-        return ndcg_dict
-    
+        return empty_metrics
+
+    per_user_metrics = (
+        probs_df
+        .group_by("target_did")
+        .agg(pl.col("label").sum().alias("total_relevant"))
+        .filter(pl.col("total_relevant") > 0)
+    )
+
+    if per_user_metrics.is_empty():
+        return empty_metrics
+
     ranked_df = (
         probs_df
         .sort(["target_did", "prob"], descending=[False, True])
+        .join(per_user_metrics.select("target_did"), on="target_did", how="inner")
         .with_columns(
             pl.col("prob").cum_count().over("target_did").alias("pred_rank")
         )
@@ -731,6 +744,7 @@ def calc_ndcg_at_k(
     ideal_ranked_df = (
         probs_df
         .sort(["target_did", "label"], descending=[False, True])
+        .join(per_user_metrics.select("target_did"), on="target_did", how="inner")
         .with_columns(
             pl.col("label").cum_count().over("target_did").alias("ideal_rank")
         )
@@ -738,8 +752,6 @@ def calc_ndcg_at_k(
             (pl.col("label") / (pl.col("ideal_rank") + 1).log(2)).alias("idcg_gain")
         )
     )
-
-    per_user_metrics = ranked_df.select("target_did").unique()
 
     for k in metrics_top_ks:
         dcg_at_k = (
@@ -756,31 +768,45 @@ def calc_ndcg_at_k(
             .agg(pl.col("idcg_gain").sum().alias(f"idcg@{k}"))
         )
 
+        relevant_at_k = (
+            ranked_df
+            .filter(pl.col("pred_rank") <= k)
+            .group_by("target_did")
+            .agg(pl.col("label").sum().alias(f"relevant@{k}"))
+        )
+
         per_user_metrics = (
             per_user_metrics
             .join(dcg_at_k, on="target_did", how="left")
             .join(idcg_at_k, on="target_did", how="left")
+            .join(relevant_at_k, on="target_did", how="left")
             .with_columns(
                 pl.col(f"dcg@{k}").fill_null(0.0),
                 pl.col(f"idcg@{k}").fill_null(0.0),
+                pl.col(f"relevant@{k}").fill_null(0.0),
             )
             .with_columns(
                 pl.when(pl.col(f"idcg@{k}") > 0)
                 .then(pl.col(f"dcg@{k}") / pl.col(f"idcg@{k}"))
                 .otherwise(0.0)
-                .alias(f"ndcg@{k}")
+                .alias(f"ndcg@{k}"),
+                (pl.col(f"relevant@{k}") / pl.col("total_relevant")).alias(f"recall@{k}"),
             )
         )
 
-    ndcg_dict = {
+    metrics_dict = {
         f"dcg@{k}": float(per_user_metrics.select(pl.col(f"dcg@{k}").mean()).item())
         for k in metrics_top_ks
     }
-    ndcg_dict.update({
+    metrics_dict.update({
         f"ndcg@{k}": float(per_user_metrics.select(pl.col(f"ndcg@{k}").mean()).item())
         for k in metrics_top_ks
     })
-    return ndcg_dict
+    metrics_dict.update({
+        f"recall@{k}": float(per_user_metrics.select(pl.col(f"recall@{k}").mean()).item())
+        for k in metrics_top_ks
+    })
+    return metrics_dict
 
 
 def _run_one_epoch(
@@ -841,15 +867,15 @@ def _run_one_epoch(
 
     auc = roc_auc_score(labels_np, probs) if np.unique(labels_np).size > 1 else 0.5
 
-    # ndcg@k
+    # Rank metrics at k
     probs_df = pl.DataFrame({
         "target_did": users_all,
         "prob": probs,
         "label": labels_np,
     })
-    ndcg_dict = calc_ndcg_at_k(probs_df, metrics_top_ks)
+    metrics_dict = calc_rank_metrics_at_k(probs_df, metrics_top_ks)
 
-    return loss, probs, labels_np, auc, ndcg_dict
+    return loss, probs, labels_np, auc, metrics_dict
 
 
 # =============================================================================
@@ -891,7 +917,7 @@ def train_two_tower_model(
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        train_loss, train_probs, train_labels_np, train_auc, train_ndcg_dict = _run_one_epoch(
+        train_loss, train_probs, train_labels_np, train_auc, train_metrics_dict = _run_one_epoch(
             train=True,
             split_name="Train",
             model=model,
@@ -904,7 +930,7 @@ def train_two_tower_model(
             metrics_top_ks=metrics_top_ks,
         )
 
-        val_loss, _, _, val_auc, val_ndcg_dict = _run_one_epoch(
+        val_loss, _, _, val_auc, val_metrics_dict = _run_one_epoch(
             train=False,
             split_name="Validation",
             model=model,
@@ -917,7 +943,7 @@ def train_two_tower_model(
             metrics_top_ks=metrics_top_ks,
         )
 
-        val_unseen_loss, val_unseen_probs, val_unseen_labels_np, val_unseen_auc, val_unseen_ndcg_dict = _run_one_epoch(
+        val_unseen_loss, val_unseen_probs, val_unseen_labels_np, val_unseen_auc, val_unseen_metrics_dict = _run_one_epoch(
             train=False,
             split_name="Validation Unseen Users",
             model=model,
@@ -977,19 +1003,37 @@ def train_two_tower_model(
                 experiment_tracker.log_scalar(
                     title=f"NDCG@{k}",
                     series=f"Train NDCG@{k}",
-                    value=float(train_ndcg_dict[f"ndcg@{k}"]),
+                    value=float(train_metrics_dict[f"ndcg@{k}"]),
                     iteration=iteration,
                 )
                 experiment_tracker.log_scalar(
                     title=f"NDCG@{k}",
                     series=f"Validation NDCG@{k}",
-                    value=float(val_ndcg_dict[f"ndcg@{k}"]),
+                    value=float(val_metrics_dict[f"ndcg@{k}"]),
                     iteration=iteration,
                 )
                 experiment_tracker.log_scalar(
                     title=f"NDCG@{k}",
                     series=f"Validation Unseen Users NDCG@{k}",
-                    value=float(val_unseen_ndcg_dict[f"ndcg@{k}"]),
+                    value=float(val_unseen_metrics_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"Recall@{k}",
+                    series=f"Train Recall@{k}",
+                    value=float(train_metrics_dict[f"recall@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"Recall@{k}",
+                    series=f"Validation Recall@{k}",
+                    value=float(val_metrics_dict[f"recall@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"Recall@{k}",
+                    series=f"Validation Unseen Users Recall@{k}",
+                    value=float(val_unseen_metrics_dict[f"recall@{k}"]),
                     iteration=iteration,
                 )
 
