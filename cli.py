@@ -117,6 +117,7 @@ DEFAULTS: Dict[str, Any] = {
     "no_plots": False,
     "no_save_model": False,
     "disable_progress": False,  # Disable progress bars during training
+    "metrics_top_ks": [10, 50, 100],
     # Stage 4 (train) - DataLoader settings
     "num_dataloader_workers": 4,
     "dataloader_pin_memory": True,
@@ -836,6 +837,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Skip saving model checkpoints")
     _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable progress bars during training")
+    _add_arg_with_default(p_all, "--metrics-top-ks", type=int, nargs="+", default=argparse.SUPPRESS,
+                          help_text="Values of K to use for training metrics: NDCG@K, Recall@K, etc")
     # Stage 4 (train) - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")

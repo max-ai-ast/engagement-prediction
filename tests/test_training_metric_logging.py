@@ -35,6 +35,7 @@ class _TinySummarizedDataset(Dataset):
             dtype=torch.float32,
         )
         self.labels = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.float32)
+        self.user_ids = ["user1", "user1", "user2", "user2"]
         assert self.features.shape[1] == 2 * embed_dim
 
     def __len__(self) -> int:
@@ -44,6 +45,7 @@ class _TinySummarizedDataset(Dataset):
         return {
             "features": self.features[idx],
             "label": self.labels[idx],
+            "user_id": self.user_ids[idx],
         }
 
 
@@ -105,6 +107,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
     dataset = _TinySummarizedDataset(embed_dim=embed_dim)
     train_loader = DataLoader(dataset, batch_size=2, shuffle=False)
     val_loader = DataLoader(dataset, batch_size=2, shuffle=False)
+    val_unseen_loader = DataLoader(dataset, batch_size=2, shuffle=False)
 
     model = stage_train_two_tower.TwoTowerModel(
         post_embedding_dim=embed_dim,
@@ -125,6 +128,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        val_unseen_loader=val_unseen_loader,
         device="cpu",
         epochs=2,
         learning_rate=1e-3,
@@ -137,6 +141,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
         lr_scheduler_patience=2,
         gradient_clip_max_norm=1.0,
         embed_dim=embed_dim,
+        metrics_top_ks=[1, 2],
         experiment_tracker=tracker,
     )
 

@@ -704,6 +704,81 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
+def calc_ndcg_at_k(
+    probs_df: pl.DataFrame,
+    metrics_top_ks: list[int],
+) -> dict[str, float]:
+    """
+    Calculate the normalized discounted cumulative gain for each user in a dataframe,
+    and then take an average across users.
+    """
+    
+    ranked_df = (
+        probs_df
+        .sort(["target_did", "prob"], descending=[False, True])
+        .with_columns(
+            pl.col("prob").cum_count().over("target_did").alias("pred_rank")
+        )
+        .with_columns(
+            (pl.col("label") / (pl.col("pred_rank") + 1).log(2)).alias("dcg_gain")
+        )
+    )
+
+    ideal_ranked_df = (
+        probs_df
+        .sort(["target_did", "label"], descending=[False, True])
+        .with_columns(
+            pl.col("label").cum_count().over("target_did").alias("ideal_rank")
+        )
+        .with_columns(
+            (pl.col("label") / (pl.col("ideal_rank") + 1).log(2)).alias("idcg_gain")
+        )
+    )
+
+    per_user_metrics = ranked_df.select("target_did").unique()
+
+    for k in metrics_top_ks:
+        dcg_at_k = (
+            ranked_df
+            .filter(pl.col("pred_rank") <= k)
+            .group_by("target_did")
+            .agg(pl.col("dcg_gain").sum().alias(f"dcg@{k}"))
+        )
+
+        idcg_at_k = (
+            ideal_ranked_df
+            .filter(pl.col("ideal_rank") <= k)
+            .group_by("target_did")
+            .agg(pl.col("idcg_gain").sum().alias(f"idcg@{k}"))
+        )
+
+        per_user_metrics = (
+            per_user_metrics
+            .join(dcg_at_k, on="target_did", how="left")
+            .join(idcg_at_k, on="target_did", how="left")
+            .with_columns(
+                pl.col(f"dcg@{k}").fill_null(0.0),
+                pl.col(f"idcg@{k}").fill_null(0.0),
+            )
+            .with_columns(
+                pl.when(pl.col(f"idcg@{k}") > 0)
+                .then(pl.col(f"dcg@{k}") / pl.col(f"idcg@{k}"))
+                .otherwise(0.0)
+                .alias(f"ndcg@{k}")
+            )
+        )
+
+    ndcg_dict = {
+        f"dcg@{k}": float(per_user_metrics.select(pl.col(f"dcg@{k}").mean()).item())
+        for k in metrics_top_ks
+    }
+    ndcg_dict.update({
+        f"ndcg@{k}": float(per_user_metrics.select(pl.col(f"ndcg@{k}").mean()).item())
+        for k in metrics_top_ks
+    })
+    return ndcg_dict
+
+
 def _run_one_epoch(
     train: bool,
     split_name: str,
@@ -714,6 +789,7 @@ def _run_one_epoch(
     disable_progress: bool,
     embed_dim: int,
     gradient_clip_max_norm: float,
+    metrics_top_ks: list[int],
 ):
     if train:
         model.train()
@@ -761,7 +837,15 @@ def _run_one_epoch(
 
     auc = roc_auc_score(labels_np, probs) if np.unique(labels_np).size > 1 else 0.5
 
-    return loss, probs, labels_np, auc
+    # ndcg@k
+    probs_df = pl.DataFrame({
+        "target_did": users_all,
+        "prob": probs,
+        "label": labels_np,
+    })
+    ndcg_dict = calc_ndcg_at_k(probs_df, metrics_top_ks)
+
+    return loss, probs, labels_np, auc, ndcg_dict
 
 
 # =============================================================================
@@ -803,7 +887,7 @@ def train_two_tower_model(
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        train_loss, train_probs, train_labels_np, train_auc = _run_one_epoch(
+        train_loss, train_probs, train_labels_np, train_auc, train_ndcg_dict = _run_one_epoch(
             train=True,
             split_name="Train",
             model=model,
@@ -813,9 +897,10 @@ def train_two_tower_model(
             disable_progress=disable_progress,
             embed_dim=embed_dim,
             gradient_clip_max_norm=gradient_clip_max_norm,
+            metrics_top_ks=metrics_top_ks,
         )
 
-        val_loss, _, _, val_auc = _run_one_epoch(
+        val_loss, _, _, val_auc, val_ndcg_dict = _run_one_epoch(
             train=False,
             split_name="Validation",
             model=model,
@@ -825,9 +910,10 @@ def train_two_tower_model(
             disable_progress=disable_progress,
             embed_dim=embed_dim,
             gradient_clip_max_norm=gradient_clip_max_norm,
+            metrics_top_ks=metrics_top_ks,
         )
 
-        val_unseen_loss, val_unseen_probs, val_unseen_labels_np, val_unseen_auc = _run_one_epoch(
+        val_unseen_loss, val_unseen_probs, val_unseen_labels_np, val_unseen_auc, val_unseen_ndcg_dict = _run_one_epoch(
             train=False,
             split_name="Validation Unseen Users",
             model=model,
@@ -837,6 +923,7 @@ def train_two_tower_model(
             disable_progress=disable_progress,
             embed_dim=embed_dim,
             gradient_clip_max_norm=gradient_clip_max_norm,
+            metrics_top_ks=metrics_top_ks,
         )
 
         history["train_loss"].append(train_loss)
@@ -859,6 +946,12 @@ def train_two_tower_model(
                 iteration=iteration,
             )
             experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Validation Unseen Users Loss",
+                value=float(val_unseen_loss),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
                 title="Training AUC History",
                 series="Train AUC",
                 value=float(train_auc),
@@ -870,6 +963,31 @@ def train_two_tower_model(
                 value=float(val_auc),
                 iteration=iteration,
             )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Validation Unseen Users AUC",
+                value=float(val_unseen_auc),
+                iteration=iteration,
+            )
+            for k in metrics_top_ks:
+                experiment_tracker.log_scalar(
+                    title=f"NDCG@{k}",
+                    series=f"Train NDCG@{k}",
+                    value=float(train_ndcg_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"NDCG@{k}",
+                    series=f"Validation NDCG@{k}",
+                    value=float(val_ndcg_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"NDCG@{k}",
+                    series=f"Validation Unseen Users NDCG@{k}",
+                    value=float(val_unseen_ndcg_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
 
         scheduler.step(val_auc)
 
