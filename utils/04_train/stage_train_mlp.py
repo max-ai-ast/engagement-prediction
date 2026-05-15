@@ -483,8 +483,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             user_encoder_type="summarized",
         )
         
-        train_loader, val_loader, _ = create_data_loaders(
-            train_dataset, val_dataset, batch_size,
+        train_loader, val_loader, _, _ = create_data_loaders(
+            train_dataset, val_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
@@ -525,8 +525,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             user_encoder_type=user_encoder,
         )
 
-        train_loader, val_loader, _ = create_data_loaders(
-            train_dataset, val_dataset, batch_size,
+        train_loader, val_loader, _, _ = create_data_loaders(
+            train_dataset, val_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,

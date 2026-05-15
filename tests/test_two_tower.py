@@ -51,6 +51,21 @@ def test_calc_ndcg_at_k_scores_users_without_relevant_items_as_zero():
     assert metrics["dcg@10"] == pytest.approx(0.5)
     assert metrics["ndcg@10"] == pytest.approx(0.5)
 
+
+def test_calc_ndcg_at_k_handles_empty_data():
+    metrics_df = pl.DataFrame({
+        "target_did": [],
+        "prob": [],
+        "label": [],
+    })
+
+    assert calc_ndcg_at_k(metrics_df, [1, 10]) == {
+        "dcg@1": 0.0,
+        "dcg@10": 0.0,
+        "ndcg@1": 0.0,
+        "ndcg@10": 0.0,
+    }
+
 def test_post_tower_initialization():
     """Test PostTower initializes correctly."""
     tower = PostTower(

@@ -712,6 +712,10 @@ def calc_ndcg_at_k(
     Calculate the normalized discounted cumulative gain for each user in a dataframe,
     and then take an average across users.
     """
+    if probs_df.is_empty():
+        ndcg_dict = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
+        ndcg_dict.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
+        return ndcg_dict
     
     ranked_df = (
         probs_df

@@ -514,9 +514,10 @@ def test_create_data_loaders_returns_correct_loaders(mock_embeddings_mmap, mock_
         embed_dim=64,
     )
     
-    train_loader, val_loader, holdout_loader = create_data_loaders(
+    train_loader, val_loader, val_unseen_loader, holdout_loader = create_data_loaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        val_unseen_dataset=val_dataset,
         batch_size=4,
         num_workers=0,  # No multiprocessing for tests
         pin_memory=False,
@@ -525,6 +526,7 @@ def test_create_data_loaders_returns_correct_loaders(mock_embeddings_mmap, mock_
     # Check loaders are DataLoader instances
     assert isinstance(train_loader, DataLoader)
     assert isinstance(val_loader, DataLoader)
+    assert isinstance(val_unseen_loader, DataLoader)
     assert holdout_loader is None  # No holdout dataset provided
     
     # Check batch sizes
@@ -552,9 +554,10 @@ def test_create_data_loaders_with_collate_fn(mock_embeddings_mmap, mock_target_p
         embed_dim=64,
     )
     
-    train_loader, val_loader, _ = create_data_loaders(
+    train_loader, val_loader, _, _ = create_data_loaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        val_unseen_dataset=val_dataset,
         batch_size=4,
         num_workers=0,
         pin_memory=False,
@@ -593,9 +596,10 @@ def test_create_data_loaders_with_holdout(mock_embeddings_mmap, mock_target_post
     
     holdout_dataset = val_dataset  # Reuse val for testing
     
-    train_loader, val_loader, holdout_loader = create_data_loaders(
+    train_loader, val_loader, _, holdout_loader = create_data_loaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        val_unseen_dataset=val_dataset,
         holdout_dataset=holdout_dataset,
         batch_size=4,
         num_workers=0,
@@ -629,9 +633,10 @@ def test_create_data_loaders_iteration(mock_embeddings_mmap, mock_target_posts_d
         embed_dim=64,
     )
     
-    train_loader, val_loader, _ = create_data_loaders(
+    train_loader, val_loader, _, _ = create_data_loaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        val_unseen_dataset=val_dataset,
         batch_size=4,
         num_workers=0,
         pin_memory=False,
