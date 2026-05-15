@@ -14,56 +14,79 @@ PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
 AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
 AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
 build_author_serving_mapping = stage_train_two_tower.build_author_serving_mapping
-calc_ndcg_at_k = stage_train_two_tower.calc_ndcg_at_k
+calc_rank_metrics_at_k = stage_train_two_tower.calc_rank_metrics_at_k
 
 
 # =============================================================================
 # PostTower Tests
 # =============================================================================
 
-def test_calc_ndcg_at_k_macro_averages_per_user_metrics():
+def test_calc_rank_metrics_at_k_macro_averages_per_user_metrics():
     metrics_df = pl.DataFrame({
         "target_did": ["u1", "u1", "u1", "u2", "u2", "u2"],
         "prob": [0.9, 0.8, 0.1, 0.9, 0.8, 0.7],
         "label": [1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
     })
 
-    metrics = calc_ndcg_at_k(metrics_df, [1, 2])
+    metrics = calc_rank_metrics_at_k(metrics_df, [1, 2])
 
     discount_2 = 1.0 / math.log2(3.0)
     assert metrics["dcg@1"] == pytest.approx(0.5)
     assert metrics["ndcg@1"] == pytest.approx(0.5)
+    assert metrics["recall@1"] == pytest.approx(0.25)
     assert metrics["dcg@2"] == pytest.approx((1.0 + discount_2 + discount_2) / 2.0)
     assert metrics["ndcg@2"] == pytest.approx((1.0 + discount_2) / 2.0)
+    assert metrics["recall@2"] == pytest.approx(1.0)
 
 
-def test_calc_ndcg_at_k_scores_users_without_relevant_items_as_zero():
+def test_calc_rank_metrics_at_k_excludes_users_without_relevant_items():
     metrics_df = pl.DataFrame({
         "target_did": ["u1", "u1", "u2", "u2"],
         "prob": [0.9, 0.1, 0.8, 0.2],
         "label": [0.0, 0.0, 1.0, 0.0],
     })
 
-    metrics = calc_ndcg_at_k(metrics_df, [1, 10])
+    metrics = calc_rank_metrics_at_k(metrics_df, [1, 10])
 
-    assert metrics["dcg@1"] == pytest.approx(0.5)
-    assert metrics["ndcg@1"] == pytest.approx(0.5)
-    assert metrics["dcg@10"] == pytest.approx(0.5)
-    assert metrics["ndcg@10"] == pytest.approx(0.5)
+    assert metrics["dcg@1"] == pytest.approx(1.0)
+    assert metrics["ndcg@1"] == pytest.approx(1.0)
+    assert metrics["recall@1"] == pytest.approx(1.0)
+    assert metrics["dcg@10"] == pytest.approx(1.0)
+    assert metrics["ndcg@10"] == pytest.approx(1.0)
+    assert metrics["recall@10"] == pytest.approx(1.0)
 
 
-def test_calc_ndcg_at_k_handles_empty_data():
+def test_calc_rank_metrics_at_k_handles_empty_data():
     metrics_df = pl.DataFrame({
         "target_did": [],
         "prob": [],
         "label": [],
     })
 
-    assert calc_ndcg_at_k(metrics_df, [1, 10]) == {
+    assert calc_rank_metrics_at_k(metrics_df, [1, 10]) == {
         "dcg@1": 0.0,
         "dcg@10": 0.0,
         "ndcg@1": 0.0,
         "ndcg@10": 0.0,
+        "recall@1": 0.0,
+        "recall@10": 0.0,
+    }
+
+
+def test_calc_rank_metrics_at_k_handles_no_eligible_users():
+    metrics_df = pl.DataFrame({
+        "target_did": ["u1", "u1", "u2", "u2"],
+        "prob": [0.9, 0.1, 0.8, 0.2],
+        "label": [0.0, 0.0, 0.0, 0.0],
+    })
+
+    assert calc_rank_metrics_at_k(metrics_df, [1, 10]) == {
+        "dcg@1": 0.0,
+        "dcg@10": 0.0,
+        "ndcg@1": 0.0,
+        "ndcg@10": 0.0,
+        "recall@1": 0.0,
+        "recall@10": 0.0,
     }
 
 def test_post_tower_initialization():
