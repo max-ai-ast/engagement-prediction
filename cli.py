@@ -61,7 +61,7 @@ DEFAULTS: Dict[str, Any] = {
     "max_liking_users": None,  # None = no limit; sample this many unique liking users
     "max_likes_per_user": 100,  # Stage 1: random cap on likes per user (NOT recency-based)
     "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
-    "negative_posts_sample": 100000,  # Stage 1: random posts for negative cases
+    "negative_samples_per_hour": 1000,  # Stage 1: random posts per hour for negative cases
     "cap_random_seed": 42,
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
@@ -716,8 +716,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Cap on total liking users to sample (None = no limit)")
     _add_arg_with_default(p_all, "--max-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
-    _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
-                          help_text="Number of random posts to sample for negative cases in Stage 1")
+    _add_arg_with_default(p_all, "--negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of random posts to sample per hour for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
     _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,

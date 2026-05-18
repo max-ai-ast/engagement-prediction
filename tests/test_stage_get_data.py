@@ -4,6 +4,7 @@ import struct
 import sys
 import zlib
 import base64
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -118,7 +119,14 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     assert likes_df.height == 2
     assert likes_df["did"].unique().to_list() == ["user_a"]
     assert likes_df.schema["record_created_at"] == pl.Datetime
+    assert likes_df.schema["like_hour_bucket"] == pl.Datetime
     assert likes_df['did'].n_unique() == 1
+    buckets_by_uri = {
+        row["subject_uri"]: row["like_hour_bucket"]
+        for row in likes_df.select(["subject_uri", "like_hour_bucket"]).iter_rows(named=True)
+    }
+    assert buckets_by_uri["post:1"].isoformat() == "2024-01-02T00:00:00+00:00"
+    assert buckets_by_uri["post:2"].isoformat() == "2024-01-03T00:00:00+00:00"
 
 
 def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
@@ -191,7 +199,7 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
         end_str="2024-01-03T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        negative_posts_sample=len(posts_rows),
+        negative_samples_per_hour=len(posts_rows),
         embedding_model=embedding_model,
         random_seed=11,
         logger=logger,
@@ -213,9 +221,14 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
     assert "at_uri" in posts_df.columns
     assert "is_liked" in posts_df.columns
     assert "in_random_sample" in posts_df.columns
+    assert "negative_hour_bucket" in posts_df.columns
+    assert posts_df.schema["negative_hour_bucket"] == pl.Datetime
+    assert posts_df.filter(pl.col("at_uri") == "post:1")["is_liked"].all()
+    assert posts_df.filter(pl.col("at_uri") == "post:1")["in_random_sample"].all()
+    assert posts_df.filter(pl.col("at_uri") == "post:1")["negative_hour_bucket"].null_count() == 0
 
 
-def test_load_posts_liked_always_included(tmp_path, stage_get_data_module):
+def test_load_posts_liked_always_included_with_null_negative_bucket(tmp_path, stage_get_data_module):
     """Test that liked posts are always included even with zero random sample."""
     embedding_model = "test-model"
     posts_rows = _make_posts_rows(embedding_model)
@@ -228,7 +241,7 @@ def test_load_posts_liked_always_included(tmp_path, stage_get_data_module):
         end_str="2024-01-03T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        negative_posts_sample=0,
+        negative_samples_per_hour=0,
         embedding_model=embedding_model,
         random_seed=21,
         logger=logger,
@@ -238,10 +251,77 @@ def test_load_posts_liked_always_included(tmp_path, stage_get_data_module):
     assert set(["post:2", "post:5"]).issubset(returned_uris)
     assert posts_df.filter(pl.col("at_uri") == "post:2")["is_liked"].all()
     assert posts_df.filter(pl.col("at_uri") == "post:5")["is_liked"].all()
+    assert posts_df["in_random_sample"].sum() == 0
+    assert posts_df["negative_hour_bucket"].null_count() == posts_df.height
     assert stats["n_liked_posts"] == 2
     
     # emb_idx should NOT be present (added later by memmap write)
     assert "emb_idx" not in posts_df.columns
+
+
+def test_load_posts_samples_approximately_per_hour(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = []
+    for hour in [0, 1]:
+        for idx in range(50):
+            posts_rows.append({
+                "at_uri": f"post:{hour}:{idx}",
+                "did": f"user_{hour}_{idx}",
+                "record_created_at": f"2024-01-02T{hour:02d}:15:00",
+                "record_text": f"text {hour} {idx}",
+                "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}],
+            })
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    liked_post_uris_df = pl.DataFrame({"subject_uri": ["missing:post"]})
+    logger = logging.getLogger("test_stage_get_data.posts_per_hour")
+
+    posts_df, stats, _ = stage_get_data_module._load_posts_core_polars(
+        start_str="2024-01-02T00:00:00",
+        end_str="2024-01-02T02:00:00",
+        liked_post_uris_df=liked_post_uris_df,
+        paths=[str(posts_path)],
+        negative_samples_per_hour=10,
+        embedding_model=embedding_model,
+        random_seed=33,
+        logger=logger,
+    )
+
+    random_counts = (
+        posts_df
+        .filter(pl.col("in_random_sample"))
+        .group_by("negative_hour_bucket")
+        .len()
+    )
+    assert 10 <= posts_df.height <= 30
+    assert stats["n_random_sample"] == posts_df.height
+    assert stats["n_random_sample_buckets"] == 2
+    assert random_counts["len"].min() > 0
+    assert random_counts["len"].max() <= 20
+
+
+def test_load_posts_rejects_non_string_record_created_at(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_path = _write_posts_parquet(tmp_path, [{
+        "at_uri": "post:1",
+        "did": "user_a",
+        "record_created_at": datetime(2024, 1, 2, 0, 15, 0),
+        "record_text": "one",
+        "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}],
+    }])
+    liked_post_uris_df = pl.DataFrame({"subject_uri": []}, schema={"subject_uri": pl.String})
+    logger = logging.getLogger("test_stage_get_data.posts_bad_ts")
+
+    with pytest.raises(ValueError, match="record_created_at"):
+        stage_get_data_module._load_posts_core_polars(
+            start_str=None,
+            end_str=None,
+            liked_post_uris_df=liked_post_uris_df,
+            paths=[str(posts_path)],
+            negative_samples_per_hour=1,
+            embedding_model=embedding_model,
+            random_seed=33,
+            logger=logger,
+        )
 
 
 def test_write_embeddings_memmap(tmp_path, stage_get_data_module):

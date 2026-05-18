@@ -55,6 +55,25 @@ def test_merge_args_with_config_rejects_unknown_keys(tmp_path, argv):
         cli._merge_args_with_config(args)
 
 
+def test_negative_samples_per_hour_replaces_old_negative_posts_sample(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--negative-samples-per-hour", "123"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.negative_samples_per_hour == 123
+    assert cli.DEFAULTS["negative_samples_per_hour"] == 1000
+    assert "negative_posts_sample" not in cli.DEFAULTS
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--negative-posts-sample", "123"])
+
+    config_path = Path(tmp_path) / "old.yml"
+    config_path.write_text("negative_posts_sample: 123\n")
+    raw = parser.parse_args(["--config", str(config_path)])
+    with pytest.raises(ValueError):
+        cli._merge_args_with_config(raw)
+
+
 def test_background_effective_config_preserves_no_post_encoder(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--no-post-encoder"])
