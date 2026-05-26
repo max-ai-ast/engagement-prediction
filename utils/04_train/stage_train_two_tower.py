@@ -90,6 +90,7 @@ Outputs under <run_dir>/04_train/<timestamp>/:
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -643,111 +644,6 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
-def calc_rank_metrics_at_k(
-    probs_df: pl.DataFrame,
-    metrics_top_ks: list[int],
-) -> dict[str, float]:
-    """
-    Calculate rank metrics for each user in a dataframe, and then take an
-    average across users with at least one relevant item.
-    """
-    empty_metrics = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
-    empty_metrics.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
-    empty_metrics.update({f"recall@{k}": 0.0 for k in metrics_top_ks})
-
-    if probs_df.is_empty():
-        return empty_metrics
-
-    per_user_metrics = (
-        probs_df
-        .group_by("target_did")
-        .agg(pl.col("label").sum().alias("total_relevant"))
-        .filter(pl.col("total_relevant") > 0)
-    )
-
-    if per_user_metrics.is_empty():
-        return empty_metrics
-
-    ranked_df = (
-        probs_df
-        .sort(["target_did", "prob"], descending=[False, True])
-        .join(per_user_metrics.select("target_did"), on="target_did", how="inner")
-        .with_columns(
-            pl.col("prob").cum_count().over("target_did").alias("pred_rank")
-        )
-        .with_columns(
-            (pl.col("label") / (pl.col("pred_rank") + 1).log(2)).alias("dcg_gain")
-        )
-    )
-
-    ideal_ranked_df = (
-        probs_df
-        .sort(["target_did", "label"], descending=[False, True])
-        .join(per_user_metrics.select("target_did"), on="target_did", how="inner")
-        .with_columns(
-            pl.col("label").cum_count().over("target_did").alias("ideal_rank")
-        )
-        .with_columns(
-            (pl.col("label") / (pl.col("ideal_rank") + 1).log(2)).alias("idcg_gain")
-        )
-    )
-
-    for k in metrics_top_ks:
-        dcg_at_k = (
-            ranked_df
-            .filter(pl.col("pred_rank") <= k)
-            .group_by("target_did")
-            .agg(pl.col("dcg_gain").sum().alias(f"dcg@{k}"))
-        )
-
-        idcg_at_k = (
-            ideal_ranked_df
-            .filter(pl.col("ideal_rank") <= k)
-            .group_by("target_did")
-            .agg(pl.col("idcg_gain").sum().alias(f"idcg@{k}"))
-        )
-
-        relevant_at_k = (
-            ranked_df
-            .filter(pl.col("pred_rank") <= k)
-            .group_by("target_did")
-            .agg(pl.col("label").sum().alias(f"relevant@{k}"))
-        )
-
-        per_user_metrics = (
-            per_user_metrics
-            .join(dcg_at_k, on="target_did", how="left")
-            .join(idcg_at_k, on="target_did", how="left")
-            .join(relevant_at_k, on="target_did", how="left")
-            .with_columns(
-                pl.col(f"dcg@{k}").fill_null(0.0),
-                pl.col(f"idcg@{k}").fill_null(0.0),
-                pl.col(f"relevant@{k}").fill_null(0.0),
-            )
-            .with_columns(
-                pl.when(pl.col(f"idcg@{k}") > 0)
-                .then(pl.col(f"dcg@{k}") / pl.col(f"idcg@{k}"))
-                .otherwise(0.0)
-                .alias(f"ndcg@{k}"),
-                (pl.col(f"relevant@{k}") / pl.col("total_relevant")).alias(f"recall@{k}"),
-            )
-        )
-
-    metrics_dict = {
-        f"dcg@{k}": float(per_user_metrics.select(pl.col(f"dcg@{k}").mean()).item())
-        for k in metrics_top_ks
-    }
-    metrics_dict.update({
-        f"ndcg@{k}": float(per_user_metrics.select(pl.col(f"ndcg@{k}").mean()).item())
-        for k in metrics_top_ks
-    })
-    metrics_dict.update({
-        f"recall@{k}": float(per_user_metrics.select(pl.col(f"recall@{k}").mean()).item())
-        for k in metrics_top_ks
-    })
-    return metrics_dict
-
-
 def _empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
     metric_sums = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
     metric_sums.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
@@ -779,18 +675,22 @@ def _rank_metric_sums_for_batch(
 
         ranked_indices = torch.argsort(scores, dim=1, descending=True)
         ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
-        ideal_labels = torch.sort(labels, dim=1, descending=True).values
         max_k = min(max(metrics_top_ks), labels.size(1))
         discounts = 1.0 / torch.log2(
             torch.arange(max_k, device=scores.device, dtype=torch.float32) + 2.0
         )
+        cumulative_discounts = discounts.cumsum(dim=0)
 
         for k in metrics_top_ks:
             k_eff = min(k, labels.size(1))
             top_labels = ranked_labels[:, :k_eff]
             k_discounts = discounts[:k_eff]
             dcg = (top_labels * k_discounts).sum(dim=1)
-            idcg = (ideal_labels[:, :k_eff] * k_discounts).sum(dim=1).clamp(min=1.0e-12)
+            ideal_counts = total_relevant.clamp(max=k_eff).to(dtype=torch.long)
+            idcg = torch.zeros_like(dcg)
+            has_ideal_gain = ideal_counts > 0
+            idcg[has_ideal_gain] = cumulative_discounts[ideal_counts[has_ideal_gain] - 1]
+            idcg = idcg.clamp(min=1.0e-12)
             recall = top_labels.sum(dim=1) / total_relevant
 
             metric_sums[f"dcg@{k}"] = float(dcg.sum().item())
