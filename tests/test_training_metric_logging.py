@@ -210,3 +210,51 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline Recall@1")] == [1]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline Recall@1")] == [1]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline Recall@1")] == [1]
+
+
+def test_two_tower_logs_final_classification_metrics_by_split():
+    tracker = _RecordingTracker()
+
+    stage_train_two_tower._log_final_classification_metrics(
+        tracker,
+        {
+            "train": {"auc_roc": 0.75, "average_precision": 0.50},
+            "val": {"auc_roc": None, "average_precision": float("nan")},
+            "holdout_unseen_users": {"auc_roc": 0.80},
+        },
+        iteration=3,
+    )
+
+    assert len(tracker.calls) == 3
+    assert tracker.calls[0] == {
+        "title": "Final AUC-ROC by Split",
+        "series": "Train AUC-ROC",
+        "value": 0.75,
+        "iteration": 3,
+    }
+    assert tracker.calls[1] == {
+        "title": "Final Average Precision by Split",
+        "series": "Train Average Precision",
+        "value": 0.50,
+        "iteration": 3,
+    }
+    assert tracker.calls[2] == {
+        "title": "Final AUC-ROC by Split",
+        "series": "Holdout Unseen Users AUC-ROC",
+        "value": 0.80,
+        "iteration": 3,
+    }
+
+
+def test_two_tower_stage_info_metric_lines_include_final_classification_metrics():
+    lines = stage_train_two_tower._stage_info_metric_lines({
+        "train": {"auc_roc": 0.75, "average_precision": 0.50},
+        "val": {"auc_roc": None, "average_precision": float("nan")},
+        "holdout_unseen_users": {"auc_roc": 0.80},
+    })
+
+    assert lines == [
+        "train_auc_roc: 0.7500",
+        "train_average_precision: 0.5000",
+        "holdout_unseen_users_auc_roc: 0.8000",
+    ]

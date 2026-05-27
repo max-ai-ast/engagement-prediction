@@ -128,6 +128,7 @@ from utils.dataloaders import (
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
 DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS = 2_000_000
+FINAL_CLASSIFICATION_METRICS = ("auc_roc", "average_precision")
 
 
 # =============================================================================
@@ -1164,6 +1165,57 @@ def _evaluate_two_tower_model(
     }
 
 
+def _optional_float_metric(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    metric_value = float(value)
+    if math.isnan(metric_value):
+        return None
+    return metric_value
+
+
+def _split_metric_label(split_name: str) -> str:
+    return split_name.replace("_", " ").title()
+
+
+def _clearml_metric_label(metric_name: str) -> str:
+    return {
+        "auc_roc": "AUC-ROC",
+        "average_precision": "Average Precision",
+    }.get(metric_name, metric_name.replace("_", " ").title())
+
+
+def _log_final_classification_metrics(
+    experiment_tracker: Optional[Any],
+    split_metrics: Dict[str, Dict[str, Any]],
+    iteration: int,
+) -> None:
+    if experiment_tracker is None:
+        return
+    for split_name, metrics in split_metrics.items():
+        for metric_name in FINAL_CLASSIFICATION_METRICS:
+            metric_value = _optional_float_metric(metrics.get(metric_name))
+            if metric_value is None:
+                continue
+            metric_label = _clearml_metric_label(metric_name)
+            experiment_tracker.log_scalar(
+                title=f"Final {metric_label} by Split",
+                series=f"{_split_metric_label(split_name)} {metric_label}",
+                value=metric_value,
+                iteration=iteration,
+            )
+
+
+def _stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[str]:
+    lines = []
+    for split_name, metrics in split_metrics.items():
+        for metric_name in FINAL_CLASSIFICATION_METRICS:
+            metric_value = _optional_float_metric(metrics.get(metric_name))
+            if metric_value is not None:
+                lines.append(f"{split_name}_{metric_name}: {metric_value:.4f}")
+    return lines
+
+
 # =============================================================================
 # Plotting
 # =============================================================================
@@ -1439,6 +1491,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
+    all_holdout_metrics: Dict[str, Dict[str, Any]] = {}
     for holdout_type in ["unseen_users", "seen_users"]:
         split_name = f"holdout_{holdout_type}"
         try:
@@ -1464,10 +1517,28 @@ def run(context: Context, args) -> Dict[str, Any]:
             holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim, metrics_top_ks)
             split_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics ({holdout_type}): {split_metrics}")
+            all_holdout_metrics[split_name] = split_metrics
             if holdout_type == eval_holdout_type:
                 holdout_metrics = split_metrics
         except Exception as exc:
             logger.warning(f"Holdout evaluation ({holdout_type}) failed (non-fatal): {exc}")
+
+    final_split_metrics: Dict[str, Dict[str, Any]] = {
+        "train": train_eval["metrics"],
+        "val": val_eval["metrics"],
+        "val_unseen_users": val_unseen_eval["metrics"],
+        **all_holdout_metrics,
+    }
+    final_metric_iteration = (
+        len(training_results["history"]["train_loss"])
+        if training_results is not None
+        else 0
+    )
+    _log_final_classification_metrics(
+        context.tracker,
+        final_split_metrics,
+        final_metric_iteration,
+    )
 
     # --- training config ---
     training_config = {
@@ -1486,6 +1557,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "val_metrics": val_eval["metrics"],
         "val_unseen_metrics": val_unseen_eval["metrics"],
         "holdout_metrics": holdout_metrics,
+        "all_holdout_metrics": all_holdout_metrics,
         "primary_metric_name": primary_metric_name,
         "best_val_metric": best_val_metric,
     }
@@ -1504,6 +1576,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"primary_metric_name: {primary_metric_name}",
         f"best_val_metric: {best_val_metric:.4f}",
     ]
+    info_lines.extend(_stage_info_metric_lines(final_split_metrics))
     if holdout_metrics.get(primary_metric_name) is not None:
         info_lines.append(f"holdout_{primary_metric_name}: {holdout_metrics[primary_metric_name]:.4f}")
     (out_dir / "stage_info.txt").write_text("\n".join(info_lines) + "\n")
