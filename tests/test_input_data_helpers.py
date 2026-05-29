@@ -7,6 +7,7 @@ import shared
 
 from shared.input_data_helpers import (
     AUTHOR_PAD_IDX,
+    AUTHOR_UNK_IDX,
     _decompress_and_unpack_embedding,
     _extract_compressed_embedding_vector_from_struct,
     classify_history_embeddings_shape,
@@ -177,6 +178,18 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_single_history():
     assert author_indices == [[2, 3, AUTHOR_PAD_IDX]]
 
 
+def test_get_padded_embedding_history_and_mask_batched_defaults_single_history_author_indices_to_unknown():
+    padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
+        [[1.0, 2.0], [3.0, 4.0]],
+        max_history_len=3,
+        embed_dim=2,
+        author_indices=None,
+    )
+    assert padded == [[[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]]
+    assert mask == [[True, True, False]]
+    assert author_indices == [[AUTHOR_UNK_IDX, AUTHOR_UNK_IDX, AUTHOR_PAD_IDX]]
+
+
 def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories_and_normalizes_empty_entries():
     padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
         [[], [[1.0, 2.0], [3.0, 4.0]], [[]]],
@@ -198,6 +211,30 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories
         [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX],
         [2, 3, AUTHOR_PAD_IDX],
         [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX],
+    ]
+
+
+def test_get_padded_embedding_history_and_mask_batched_defaults_batched_author_indices_to_unknown():
+    padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
+        [[], [[1.0, 2.0]], [[]]],
+        max_history_len=2,
+        embed_dim=2,
+        author_indices=None,
+    )
+    assert padded == [
+        [[0.0, 0.0], [0.0, 0.0]],
+        [[1.0, 2.0], [0.0, 0.0]],
+        [[0.0, 0.0], [0.0, 0.0]],
+    ]
+    assert mask == [
+        [False, False],
+        [True, False],
+        [False, False],
+    ]
+    assert author_indices == [
+        [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX],
+        [AUTHOR_UNK_IDX, AUTHOR_PAD_IDX],
+        [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX],
     ]
 
 

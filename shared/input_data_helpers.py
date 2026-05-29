@@ -232,9 +232,9 @@ def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:
 
 
 def _normalize_history_inputs_to_batch(
-    history_embeddings: Any,
+    history_embeddings: list[list[float]] | list[list[list[float]]],
     shape: HistoryEmbeddingsShape,
-    author_indices: Any,
+    author_indices: list[int] | list[list[int]] | None,
 ) -> tuple[list[list[list[float]]], list[list[int]]]:
     """
     Normalize supported history input shapes into a batched ``[B, T, D]``-style list.
@@ -247,12 +247,20 @@ def _normalize_history_inputs_to_batch(
             return [[]], [[]]
         case "single_history":
             # Wrap a single user's history in an outer batch dimension.
-            return [history_embeddings], [author_indices]
+            if author_indices is None:
+                author_indices = [AUTHOR_UNK_IDX] * len(history_embeddings)
+            return [history_embeddings], [author_indices] # type: ignore
         case "batched_history":
-            return [
+            batch_history_embeddings = [
                 _normalize_empty_user_history(user_history)
                 for user_history in history_embeddings
-            ], author_indices
+            ]
+            if author_indices is None:
+                return batch_history_embeddings, [
+                    [AUTHOR_UNK_IDX] * len(user_history)
+                    for user_history in batch_history_embeddings
+                ]
+            return batch_history_embeddings, author_indices # type: ignore
 
 
 def get_padded_author_indices(
@@ -270,7 +278,7 @@ def get_padded_embedding_history_and_mask_batched(
     history_embeddings: list[list[float]] | list[list[list[float]]],
     max_history_len: int, 
     embed_dim: int,
-    author_indices: list[int] | list[list[int]],
+    author_indices: list[int] | list[list[int]] | None,
 ) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]]]:
     """
     Pad and mask one or more users' embedding histories.
