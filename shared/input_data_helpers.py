@@ -244,8 +244,6 @@ def _normalize_history_inputs_to_batch(
     """
     match shape:
         case "single_empty":
-            if not isinstance(author_indices, list) or len(author_indices) != 0:
-                raise ValueError("author_indices must be empty when history_embeddings is empty")
             return [[]], [[]]
         case "single_history":
             # Wrap a single user's history in an outer batch dimension.
