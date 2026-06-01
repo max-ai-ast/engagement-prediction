@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 # Import from module with numeric prefix
 stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
+matrix_ranking = importlib.import_module("utils.matrix_ranking")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
 PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
@@ -223,7 +224,7 @@ def test_run_one_epoch_accumulates_baseline_metric_user_count(monkeypatch):
             for k in metrics_top_ks
         }, user_count
 
-    monkeypatch.setattr(stage_train_two_tower, "_calc_baseline_rank_metrics_for_batch", fake_baseline_metrics)
+    monkeypatch.setattr(matrix_ranking, "calc_baseline_rank_metrics_for_batch", fake_baseline_metrics)
 
     _, _, baseline_metrics = _run_one_epoch(
         train=False,

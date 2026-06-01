@@ -47,10 +47,10 @@ class EvalContext:
     Standardized evaluation context passed to all evaluation modules.
     
     Attributes:
-        predictions_df: DataFrame with columns [did, post_id, y_true, y_pred_proba]
-                       Contains legacy pairwise holdout predictions from training stage.
-        ranking_rows_df: Optional DataFrame with one row per user-hour ranking
-                         evaluation row from bucketed two-tower training.
+        predictions_df: Reserved DataFrame field for modules that still inspect
+                       prediction counts. Stage 5 now evaluates ranking rows.
+        ranking_rows_df: DataFrame with one row per user-hour ranking
+                         evaluation row from bucketed training.
         user_metadata_df: DataFrame with columns [did, num_embedding_likes, num_total_likes]
                          Contains per-user metadata computed from the bundle.
         output_dir: Base output directory for all evaluation artifacts.
@@ -90,7 +90,7 @@ class EvalModule(ABC):
     """
     Abstract base class for evaluation modules.
     
-    Each evaluation module computes specific metrics on holdout predictions
+    Each evaluation module computes specific metrics on holdout ranking rows
     and saves artifacts (plots, CSVs, JSON summaries) to its own subdirectory.
     
     Subclasses must define:

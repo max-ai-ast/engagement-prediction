@@ -4,18 +4,15 @@
 Stage 5: Evaluate a trained model using modular evaluation framework.
 
 This stage orchestrates the evaluation pipeline by:
-1. Loading training data (target_posts, user history) via shared dataloaders
-2. Locating holdout predictions from Stage 4 (04_train)
-3. Computing user metadata (number of embedding likes per user)
-4. Creating an EvalContext and running all discovered evaluation modules
+1. Loading holdout ranking rows from Stage 4 (04_train)
+2. Computing user metadata from those rows
+3. Creating an EvalContext and running all discovered evaluation modules
 
 Evaluation modules are auto-discovered from utils/05_evaluate/evals/ and each
 produces its own set of artifacts (plots, CSVs, JSON summaries).
 
 Inputs (from prior pipeline stages):
-- target_posts_*.parquet from 02_target_posts  (includes train/val/holdout split column)
-- history_posts_*.parquet from 03_user_history
-- predictions/holdout_<type>.parquet from 04_train  (e.g. holdout_unseen_users.parquet)
+- eval/holdout_<type>_ranking_rows.parquet from 04_train
 
 Outputs under artifacts/05_evaluate/<stage_run_id>/
 - eval_summary.json: Combined results from all modules
@@ -31,11 +28,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pandas as pd
-import polars as pl
 
 from utils.pipeline.core import Context, generate_run_timestamp
-from utils.helpers import get_stage_logger, log_operation_start, log_prior_stage_inputs
-from utils.dataloaders import filter_pairwise_split_and_join_history, load_pairwise_training_data
+from utils.helpers import get_stage_logger, log_operation_start
 
 # ---------------------------------------------------------------------------
 # Import evaluation framework
@@ -102,45 +97,8 @@ def resolve_train_output(
 
 
 # ---------------------------------------------------------------------------
-# Holdout predictions
+# Holdout ranking rows
 # ---------------------------------------------------------------------------
-
-def load_holdout_predictions(
-    predictions_dir: Optional[Path],
-    holdout_type: str,
-    logger=None,
-) -> pd.DataFrame:
-    """
-    Load pre-computed holdout predictions from the training stage.
-
-    Both MLP and Two-Tower training stages save predictions to
-    ``predictions/holdout_<holdout_type>.parquet`` with columns
-    [did, post_id, y_true, y_pred_proba].
-
-    Args:
-        predictions_dir: Path to the ``predictions/`` directory inside the
-            04_train output directory.
-        holdout_type: One of ``"unseen_users"`` or ``"seen_users"``.
-
-    Returns:
-        DataFrame with columns [did, post_id, y_true, y_pred_proba]
-
-    Raises:
-        FileNotFoundError: If no predictions file can be found.
-    """
-    if predictions_dir is not None:
-        pred_parquet = predictions_dir / f'holdout_{holdout_type}.parquet'
-        if pred_parquet.exists():
-            if logger:
-                logger.info(f"Loading pre-computed predictions from {pred_parquet}")
-            return pd.read_parquet(pred_parquet)
-
-    raise FileNotFoundError(
-        f"No holdout predictions found (expected predictions/holdout_{holdout_type}.parquet "
-        "in the 04_train output directory). Please ensure Stage 4 (train) "
-        "completed successfully with holdout evaluation enabled."
-    )
-
 
 def load_holdout_ranking_rows(
     eval_dir: Optional[Path],
@@ -155,127 +113,6 @@ def load_holdout_ranking_rows(
     if logger:
         logger.info(f"Loading ranking rows from {ranking_path}")
     return pd.read_parquet(ranking_path)
-
-
-# ---------------------------------------------------------------------------
-# Shared holdout join (used by both enrichment and user-metadata)
-# ---------------------------------------------------------------------------
-
-def _join_holdout_with_history(
-    target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
-    holdout_split: str,
-) -> pl.DataFrame:
-    """Join holdout target rows with history and compute per-row history length."""
-    return filter_pairwise_split_and_join_history(
-        target_posts_df, history_df, holdout_split
-    ).with_columns(
-        pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-prediction history length enrichment
-# ---------------------------------------------------------------------------
-
-def enrich_predictions_with_history_len(
-    predictions_df: pd.DataFrame,
-    holdout_joined: pl.DataFrame,
-) -> pd.DataFrame:
-    """Add a per-row ``num_embedding_likes`` column to ``predictions_df``.
-
-    Uses **positional assignment**: predictions are emitted in strict
-    alternating order ``[pos_0, neg_0, pos_1, neg_1, …]`` by the training
-    stage's ``_collect_predictions``, so ``predictions_df[i]`` always
-    belongs to holdout target row ``i // 2``.  Both the positive and
-    negative sample from the same target row therefore receive the same
-    history length.
-
-    A join-based approach cannot be used because ``post_id`` is
-    ``like_uri`` for positives but ``neg_uri`` for negatives, and
-    collisions between the two sets make a key-based merge ambiguous.
-
-    Raises:
-        ValueError: If the number of predictions is not exactly twice the
-            number of holdout target rows (which would indicate the
-            positional assumption is violated).
-
-    Returns:
-        Copy of ``predictions_df`` with ``num_embedding_likes`` column added.
-    """
-    hist_per_row = holdout_joined["num_embedding_likes"].fill_null(0).to_list()
-    n_target_rows = len(hist_per_row)
-    n_predictions = len(predictions_df)
-
-    if n_predictions != 2 * n_target_rows:
-        raise ValueError(
-            f"predictions_df has {n_predictions} rows but holdout targets "
-            f"have {n_target_rows} rows (expected 2x). "
-            f"Cannot assign history by position."
-        )
-
-    enriched = predictions_df.copy()
-    enriched["num_embedding_likes"] = [
-        hist_per_row[i // 2] for i in range(n_predictions)
-    ]
-    return enriched
-
-
-# ---------------------------------------------------------------------------
-# User metadata
-# ---------------------------------------------------------------------------
-
-def compute_user_metadata(
-    predictions_df: pd.DataFrame,
-    target_posts_df: pl.DataFrame,
-    holdout_joined: pl.DataFrame,
-) -> pd.DataFrame:
-    """Compute per-user metadata including number of embedding likes.
-
-    The number of embedding likes is derived from the user history: for each
-    holdout (user, like_event) pair, it is the count of prior embedding indices.
-    When a user has multiple holdout rows, we take the maximum history length.
-
-    Returns:
-        DataFrame with columns [did, num_embedding_likes, num_total_likes]
-    """
-    holdout_user_ids = set(predictions_df['did'].astype(str).unique())
-
-    user_history_lens = (
-        holdout_joined
-        .group_by("target_did")
-        .agg(
-            pl.col("num_embedding_likes").max().alias("num_embedding_likes"),
-        )
-        .rename({"target_did": "did"})
-    )
-
-    total_likes = (
-        target_posts_df
-        .filter(pl.col("target_did").is_in(list(holdout_user_ids)))
-        .group_by("target_did")
-        .agg(pl.col("like_uri").n_unique().alias("num_total_likes"))
-        .rename({"target_did": "did"})
-    )
-
-    metadata_pl = user_history_lens.join(total_likes, on="did", how="left")
-    metadata_df = metadata_pl.to_pandas()
-    metadata_df['did'] = metadata_df['did'].astype(str)
-    metadata_df['num_embedding_likes'] = metadata_df['num_embedding_likes'].fillna(0).astype(int)
-    metadata_df['num_total_likes'] = metadata_df['num_total_likes'].fillna(0).astype(int)
-
-    existing_users = set(metadata_df['did'])
-    missing_users = holdout_user_ids - existing_users
-
-    if missing_users:
-        missing_df = pd.DataFrame({
-            'did': list(missing_users),
-            'num_embedding_likes': 0,
-            'num_total_likes': 0,
-        })
-        metadata_df = pd.concat([metadata_df, missing_df], ignore_index=True)
-
-    return metadata_df[['did', 'num_embedding_likes', 'num_total_likes']]
 
 
 def compute_user_metadata_from_ranking_rows(ranking_rows_df: pd.DataFrame) -> pd.DataFrame:
@@ -301,7 +138,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     """
     Main entry point for Stage 5: Evaluation.
 
-    Loads holdout predictions from the training stage and runs all evaluation
+    Loads holdout ranking rows from the training stage and runs all evaluation
     modules.
     """
     t0 = time.time()
@@ -309,14 +146,12 @@ def run(context: Context, args) -> Dict[str, Any]:
     # --- hyperparams ---
     eval_batch_size = int(args.eval_batch_size)
     eval_holdout_type = str(args.eval_holdout_type)
-    holdout_split = f"holdout_{eval_holdout_type}"
     skip_modules = args.skip_modules
     if skip_modules and isinstance(skip_modules, str):
         skip_modules = [m.strip() for m in skip_modules.split(',')]
 
     # Resolve training output (inputs)
     train_dir = resolve_train_output(context)
-    predictions_dir = train_dir / 'predictions'
     train_eval_dir = train_dir / 'eval'
 
     # Canonical stage output
@@ -326,7 +161,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / 'stage.log')
     log_operation_start('Stage 5: Evaluation', STAGE_LOG_NAME, logger)
     logger.info(f"Training output dir: {train_dir}")
-    logger.info(f"Holdout type for evaluation: {eval_holdout_type} (split={holdout_split})")
+    logger.info(f"Holdout type for evaluation: {eval_holdout_type}")
 
     log_operation_start('Load evaluation artifact', STAGE_LOG_NAME, logger)
     ranking_rows_df = load_holdout_ranking_rows(
@@ -334,58 +169,15 @@ def run(context: Context, args) -> Dict[str, Any]:
         holdout_type=eval_holdout_type,
         logger=logger,
     )
-    if ranking_rows_df is not None:
-        predictions_df = pd.DataFrame(columns=['did', 'post_id', 'y_true', 'y_pred_proba'])
-        user_metadata_df = compute_user_metadata_from_ranking_rows(ranking_rows_df)
-        embed_dim = None
-        logger.info(f"Loaded {len(ranking_rows_df)} ranking rows for {ranking_rows_df['did'].nunique()} users")
-    else:
-        # Step 1: Load training data from prior stages (target_posts + history for metadata)
-        log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-        _, target_posts_df, history_df, _, embed_dim = load_pairwise_training_data(
-            context, logger=logger,
+    if ranking_rows_df is None:
+        raise FileNotFoundError(
+            f"No holdout ranking rows found. Expected {train_eval_dir / f'holdout_{eval_holdout_type}_ranking_rows.parquet'}. "
+            "Please rerun Stage 4 training so it writes matrix ranking-row artifacts."
         )
-        log_prior_stage_inputs(context, logger)
-
-        holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
-        holdout_users = holdout_target_rows["target_did"].unique().to_list()
-        holdout_users = [str(u) for u in holdout_users]
-
-        if not holdout_users:
-            raise RuntimeError(
-                f"No holdout users found in target_posts (no rows with split='{holdout_split}'). "
-                f"Did the target_posts stage produce a {eval_holdout_type} holdout split? "
-                f"Check --holdout-user-fraction and --holdout-start in your pipeline configuration."
-            )
-        logger.info(f"Holdout users ({eval_holdout_type}): {len(holdout_users)}")
-        logger.info(f"Holdout target rows ({eval_holdout_type}): {len(holdout_target_rows)}")
-
-        # Step 2: Load holdout predictions
-        log_operation_start('Load holdout predictions', STAGE_LOG_NAME, logger)
-        predictions_df = load_holdout_predictions(
-            predictions_dir=predictions_dir if predictions_dir.exists() else None,
-            holdout_type=eval_holdout_type,
-            logger=logger,
-        )
-
-        if len(predictions_df) == 0:
-            raise RuntimeError("No holdout predictions available")
-
-        logger.info(f"Loaded {len(predictions_df)} predictions for {predictions_df['did'].nunique()} users")
-
-        # Step 2b: Join holdout targets with history (shared by enrichment + metadata)
-        log_operation_start('Join holdout targets with history', STAGE_LOG_NAME, logger)
-        holdout_joined = _join_holdout_with_history(target_posts_df, history_df, holdout_split)
-
-        # Step 2c: Enrich predictions with per-row history length
-        log_operation_start('Enrich predictions with per-row history length', STAGE_LOG_NAME, logger)
-        predictions_df = enrich_predictions_with_history_len(predictions_df, holdout_joined)
-        logger.info(f"Enriched predictions with num_embedding_likes (post-level history length)")
-
-        # Step 3: Compute user metadata
-        log_operation_start('Compute user metadata', STAGE_LOG_NAME, logger)
-        user_metadata_df = compute_user_metadata(predictions_df, target_posts_df, holdout_joined)
-        logger.info(f"Computed metadata for {len(user_metadata_df)} users")
+    predictions_df = pd.DataFrame(columns=['did', 'post_id', 'y_true', 'y_pred_proba'])
+    user_metadata_df = compute_user_metadata_from_ranking_rows(ranking_rows_df)
+    embed_dim = None
+    logger.info(f"Loaded {len(ranking_rows_df)} ranking rows for {ranking_rows_df['did'].nunique()} users")
 
     # Step 4: Create EvalContext
     timestamp = generate_run_timestamp()
@@ -393,7 +185,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_config: Dict[str, Any] = {
         'batch_size': eval_batch_size,
         'embed_dim': embed_dim,
-        'eval_mode': 'ranking_rows' if ranking_rows_df is not None else 'pairwise_predictions',
+        'eval_mode': 'ranking_rows',
     }
 
     ctx = EvalContext(
@@ -437,7 +229,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"num_predictions: {ctx.num_predictions}",
         f"num_ranking_rows: {ctx.num_ranking_rows}",
         f"modules_run: {', '.join(module_results.keys())}",
-        f"inputs: {'ranking rows' if ranking_rows_df is not None else 'target_posts, user_history, holdout predictions'}",
+        "inputs: ranking rows",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 

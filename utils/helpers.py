@@ -434,9 +434,11 @@ def _configure_matplotlib_backend():
 def plot_training_history(history: Dict[str, List[float]], save_path: Optional[Path] = None, best_epoch: Optional[int] = None):
     _configure_matplotlib_backend()
     import matplotlib.pyplot as plt  # type: ignore
-    required_keys = ['train_loss', 'val_loss', 'train_auc', 'val_auc']
-    if any(k not in history for k in required_keys) or len(history.get('train_loss', [])) == 0:
+    if any(k not in history for k in ['train_loss', 'val_loss']) or len(history.get('train_loss', [])) == 0:
         return
+    train_metric_key = next((k for k in history if k.startswith('train_') and k != 'train_loss'), None)
+    metric_key = train_metric_key.replace('train_', '', 1) if train_metric_key is not None else None
+    val_metric_key = f'val_{metric_key}' if metric_key is not None else None
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=FIGURE_SIZE)
     epochs = range(1, len(history['train_loss']) + 1)
     ax1.plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
@@ -446,11 +448,12 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
     ax1.set_ylabel('Loss')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    ax2.plot(epochs, history['train_auc'], 'b-', label='Train AUC', linewidth=2)
-    ax2.plot(epochs, history['val_auc'], 'r-', label='Val AUC', linewidth=2)
-    ax2.set_title('Training and Validation AUC')
+    if train_metric_key is not None and val_metric_key in history:
+        ax2.plot(epochs, history[train_metric_key], 'b-', label=f'Train {metric_key}', linewidth=2)
+        ax2.plot(epochs, history[val_metric_key], 'r-', label=f'Val {metric_key}', linewidth=2)
+    ax2.set_title('Training and Validation Metric')
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('AUC')
+    ax2.set_ylabel(metric_key or 'Metric')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     if best_epoch is not None:
