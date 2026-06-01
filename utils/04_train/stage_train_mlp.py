@@ -33,12 +33,16 @@ from utils.helpers import (
     set_random_seeds,
 )
 from utils.dataloaders import (
+    AUTHOR_PAD_IDX,
+    AUTHOR_UNK_IDX,
     BucketedEngagementDataset,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
     create_bucketed_data_loaders,
+    get_author_table_num_rows,
     load_bucketed_training_data,
 )
+from utils.author_features import PostAuthorFeatureEncoder
 from utils.matrix_ranking import (
     evaluate_matrix_model,
     log_final_classification_metrics,
@@ -102,6 +106,10 @@ class MLPModel(nn.Module):
         user_encoder_type: str,
         user_summarization: str,
         ema_alpha: float,
+        use_author_embedding_table: bool = False,
+        author_table_num_rows: Optional[int] = None,
+        author_embedding_dim: Optional[int] = None,
+        author_unknown_dropout_rate: float = 0.0,
     ):
         super().__init__()
         self.post_embedding_dim = int(post_embedding_dim)
@@ -109,6 +117,19 @@ class MLPModel(nn.Module):
         self.user_encoder_type = str(user_encoder_type)
         self.user_summarization = str(user_summarization)
         self.ema_alpha = float(ema_alpha)
+        self.use_author_embedding_table = bool(use_author_embedding_table)
+        self.post_author_feature_encoder = None
+        if self.use_author_embedding_table:
+            if author_table_num_rows is None or author_table_num_rows < 2:
+                raise ValueError("author_table_num_rows must be provided and >= 2 when use_author_embedding_table is True")
+            if author_embedding_dim is None or author_embedding_dim <= 0:
+                raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
+            self.post_author_feature_encoder = PostAuthorFeatureEncoder(
+                post_embedding_dim=post_embedding_dim,
+                author_table_num_rows=author_table_num_rows,
+                author_embedding_dim=author_embedding_dim,
+                author_unknown_dropout_rate=author_unknown_dropout_rate,
+            )
 
         if self.user_encoder_type == "cross_attention":
             self.user_encoder = CrossAttentionPoolingEncoder(
@@ -170,7 +191,27 @@ class MLPModel(nn.Module):
         history_mask: torch.Tensor,
         history_author_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_author_embedding_table:
+            if history_author_indices is None:
+                raise RuntimeError("history_author_indices are required when use_author_embedding_table is True")
+            if self.post_author_feature_encoder is None:
+                raise RuntimeError("post_author_feature_encoder must be initialized when author embeddings are enabled")
+            history_embeddings = self.post_author_feature_encoder(history_embeddings, history_author_indices)
+            history_embeddings = history_embeddings.masked_fill(~history_mask.unsqueeze(-1), 0.0)
         return self.user_encoder(history_embeddings, history_mask)
+
+    def encode_post(
+        self,
+        post_embeddings: torch.Tensor,
+        target_author_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.use_author_embedding_table:
+            if target_author_indices is None:
+                raise RuntimeError("target_author_indices are required when use_author_embedding_table is True")
+            if self.post_author_feature_encoder is None:
+                raise RuntimeError("post_author_feature_encoder must be initialized when author embeddings are enabled")
+            return self.post_author_feature_encoder(post_embeddings, target_author_indices)
+        return post_embeddings
 
     def score_matrix(
         self,
@@ -181,6 +222,7 @@ class MLPModel(nn.Module):
         candidate_post_author_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         user_vec = self.encode_user(history_embeddings, history_mask, history_author_indices)
+        candidate_post_embeddings = self.encode_post(candidate_post_embeddings, candidate_post_author_idx)
         num_users = user_vec.size(0)
         num_candidates = candidate_post_embeddings.size(0)
         user_features = user_vec.unsqueeze(1).expand(num_users, num_candidates, user_vec.size(-1))
@@ -438,6 +480,20 @@ def train_mlp_model(
     }
 
 
+def _find_author_idx_artifact_path(context: Context) -> Optional[Path]:
+    get_data_dir = context.get_active_stage_inputs().get("01_get_data")
+    if get_data_dir is None:
+        get_data_dir = context.get_artifact_dir("get_data")
+    if get_data_dir is None:
+        return None
+    candidates = sorted(
+        Path(get_data_dir).glob("author_idx_*.parquet"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     device = get_device(args.device)
     timestamp = context.run_timestamp
@@ -499,11 +555,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     summarizer_name = str(args.user_summarization)
     ema_alpha = float(args.ema_alpha)
     use_author_embedding_table = bool(args.use_author_embedding_table)
+    author_embedding_dim = int(args.author_embedding_dim)
+    author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     metrics_top_ks = list(args.metrics_top_ks)
     if not metrics_top_ks:
         raise ValueError("metrics_top_ks must contain at least one value")
-    if use_author_embedding_table:
-        raise ValueError("use_author_embedding_table is not supported with model_type='mlp' yet")
 
     if user_encoder == "summarized":
         effective_user_output_dim = embed_dim
@@ -515,6 +571,29 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "Choose 'summarized', 'full_transformer' or 'cross_attention'."
         )
     primary_metric_name = f"ndcg@{metrics_top_ks[0]}"
+    if use_author_embedding_table and author_idx_mapping_df is None:
+        raise FileNotFoundError(
+            "author_idx artifact was not found in 01_get_data output, but --use-author-embedding-table was enabled."
+        )
+    author_table_num_rows = 0
+    if use_author_embedding_table:
+        if author_idx_mapping_df is None:
+            raise FileNotFoundError("author_idx_mapping_df is required when use_author_embedding_table is True")
+        author_table_num_rows = get_author_table_num_rows(author_idx_mapping_df)
+        logger.info(
+            "Author embedding table enabled: "
+            f"author_embedding_dim={author_embedding_dim}, "
+            f"author_table_num_rows={author_table_num_rows}"
+        )
+        author_idx_artifact_path = _find_author_idx_artifact_path(context)
+        if author_idx_artifact_path is None:
+            logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
+        else:
+            author_idx_artifact_id = context.tracker.log_file_artifact(
+                name="author_idx_mapping",
+                path=author_idx_artifact_path,
+            )
+            logger.info(f"Author index mapping artifact id: {author_idx_artifact_id}")
 
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
@@ -525,19 +604,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     train_dataset = BucketedEngagementDataset(
         embeddings_mmap, likes_core_df, posts_core_df, history_df, split="train",
         max_history_len=max_history_len, embed_dim=embed_dim,
-        use_author_embedding_table=False,
+        use_author_embedding_table=use_author_embedding_table,
         logger=logger,
     )
     val_dataset = BucketedEngagementDataset(
         embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val",
         max_history_len=max_history_len, embed_dim=embed_dim,
-        use_author_embedding_table=False,
+        use_author_embedding_table=use_author_embedding_table,
         logger=logger,
     )
     val_unseen_dataset = BucketedEngagementDataset(
         embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val_unseen_users",
         max_history_len=max_history_len, embed_dim=embed_dim,
-        use_author_embedding_table=False,
+        use_author_embedding_table=use_author_embedding_table,
         logger=logger,
     )
 
@@ -564,6 +643,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         user_encoder_type=user_encoder,
         user_summarization=summarizer_name,
         ema_alpha=ema_alpha,
+        use_author_embedding_table=use_author_embedding_table,
+        author_table_num_rows=author_table_num_rows if use_author_embedding_table else None,
+        author_embedding_dim=author_embedding_dim if use_author_embedding_table else None,
+        author_unknown_dropout_rate=author_unknown_dropout_rate,
     )
 
     log_operation_start(f"Training MLP (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
@@ -628,7 +711,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "attention_dropout": attention_dropout,
         "user_summarization": summarizer_name,
         "ema_alpha": ema_alpha,
-        "use_author_embedding_table": False,
+        "use_author_embedding_table": use_author_embedding_table,
+        "author_embedding_dim": author_embedding_dim if use_author_embedding_table else None,
+        "author_unknown_dropout_rate": author_unknown_dropout_rate if use_author_embedding_table else None,
+        "author_table_num_rows": author_table_num_rows if use_author_embedding_table else None,
+        "author_pad_idx": AUTHOR_PAD_IDX,
+        "author_unk_idx": AUTHOR_UNK_IDX,
     }
     if save_model:
         log_operation_start("Save model checkpoint", STAGE_LOG_NAME, logger)
@@ -661,7 +749,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             holdout_dataset = BucketedEngagementDataset(
                 embeddings_mmap, likes_core_df, posts_core_df, history_df, split=split_name,
                 max_history_len=max_history_len, embed_dim=embed_dim,
-                use_author_embedding_table=False,
+                use_author_embedding_table=use_author_embedding_table,
                 logger=logger,
             )
             if len(holdout_dataset) == 0:

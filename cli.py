@@ -593,9 +593,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     if int(args.min_author_support) < 1:
         raise ValueError("--min-author-support must be >= 1.")
     if use_author_embedding_table:
-        if model_type != "two-tower":
-            raise ValueError("--use-author-embedding-table is only supported for --model-type 'two-tower'.")
-        if user_encoder == "summarized":
+        if model_type == "two-tower" and user_encoder == "summarized":
             raise ValueError("--use-author-embedding-table is not supported with --user-encoder 'summarized'.")
         if int(args.author_embedding_dim) <= 0:
             raise ValueError("--author-embedding-dim must be positive.")

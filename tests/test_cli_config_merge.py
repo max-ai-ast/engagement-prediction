@@ -130,6 +130,20 @@ def test_mlp_allows_cross_attention_user_encoder():
     assert merged.user_encoder in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE[merged.model_type]
 
 
+def test_mlp_allows_author_embedding_table():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "mlp",
+        "--user-encoder", "summarized",
+        "--use-author-embedding-table",
+        "--author-embedding-dim", "8",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.use_author_embedding_table is True
+    assert merged.model_type == "mlp"
+
+
 def test_min_author_support_must_be_positive_even_without_author_table(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "get_data"])

@@ -17,6 +17,7 @@ def _make_mlp(
     embed_dim: int = 4,
     user_encoder_type: str = "summarized",
     user_summarization: str = "mean",
+    use_author_embedding_table: bool = False,
 ) -> MLPModel:
     return MLPModel(
         post_embedding_dim=embed_dim,
@@ -31,6 +32,10 @@ def _make_mlp(
         user_encoder_type=user_encoder_type,
         user_summarization=user_summarization,
         ema_alpha=0.5,
+        use_author_embedding_table=use_author_embedding_table,
+        author_table_num_rows=6 if use_author_embedding_table else None,
+        author_embedding_dim=3 if use_author_embedding_table else None,
+        author_unknown_dropout_rate=0.0,
     )
 
 
@@ -68,6 +73,19 @@ def _matrix_batch() -> dict:
         "user_id": ["u1", "u2"],
         "bucket": "2026-05-01T00:00:00Z",
     }
+
+
+def _matrix_batch_with_authors() -> dict:
+    batch = _matrix_batch()
+    batch["history_author_indices"] = torch.tensor(
+        [
+            [2, 3, 0],
+            [4, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    batch["candidate_post_author_idx"] = torch.tensor([2, 3, 5], dtype=torch.long)
+    return batch
 
 
 def test_summarized_mlp_initialization():
@@ -163,6 +181,57 @@ def test_cross_attention_mlp_uses_learned_sequence_encoder_for_matrix_batches():
     assert scores.shape == (2, 3)
 
 
+def test_mlp_author_embeddings_affect_history_and_candidate_paths():
+    torch.manual_seed(0)
+    model = _make_mlp(use_author_embedding_table=True)
+    model.eval()
+    batch = _matrix_batch_with_authors()
+
+    scores_1 = model.score_matrix(
+        batch["history_embeddings"],
+        batch["history_mask"],
+        batch["candidate_post_embeddings"],
+        batch["history_author_indices"],
+        batch["candidate_post_author_idx"],
+    )
+    changed_batch = dict(batch)
+    changed_batch["history_author_indices"] = torch.tensor(
+        [
+            [5, 3, 0],
+            [4, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    changed_batch["candidate_post_author_idx"] = torch.tensor([2, 5, 5], dtype=torch.long)
+    scores_2 = model.score_matrix(
+        changed_batch["history_embeddings"],
+        changed_batch["history_mask"],
+        changed_batch["candidate_post_embeddings"],
+        changed_batch["history_author_indices"],
+        changed_batch["candidate_post_author_idx"],
+    )
+
+    assert not torch.allclose(scores_1, scores_2)
+
+
+def test_mlp_author_embeddings_require_author_indices():
+    model = _make_mlp(use_author_embedding_table=True)
+    batch = _matrix_batch()
+
+    with pytest.raises(RuntimeError, match="history_author_indices"):
+        model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)
+
+
+def test_mlp_compute_loss_and_preds_with_author_embeddings():
+    model = _make_mlp(use_author_embedding_table=True)
+    batch = _matrix_batch_with_authors()
+
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)
+
+    assert torch.isfinite(loss)
+    assert scores.shape == batch["label_matrix"].shape
+
+
 def test_summarized_mlp_torchscript():
     model = _make_mlp()
     model.eval()
@@ -173,6 +242,23 @@ def test_summarized_mlp_torchscript():
         batch["history_embeddings"],
         batch["history_mask"],
         batch["candidate_post_embeddings"],
+    )
+
+    assert output.shape == (2, 3)
+
+
+def test_author_aware_mlp_torchscript():
+    model = _make_mlp(use_author_embedding_table=True)
+    model.eval()
+    scripted = torch.jit.script(model)
+    batch = _matrix_batch_with_authors()
+
+    output = scripted.forward(
+        batch["history_embeddings"],
+        batch["history_mask"],
+        batch["candidate_post_embeddings"],
+        batch["history_author_indices"],
+        batch["candidate_post_author_idx"],
     )
 
     assert output.shape == (2, 3)
