@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
+stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_tower")
 
 
 class _RecordingTracker:
@@ -65,7 +65,7 @@ def _scalar_calls_by_series(calls, series: str):
 
 
 def test_train_mlp_model_logs_epoch_metrics_to_tracker(tmp_path):
-    stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
+    stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
     torch.manual_seed(0)
     embed_dim = 4
     tracker = _RecordingTracker()
@@ -230,7 +230,7 @@ def test_two_tower_logs_final_classification_metrics_by_split():
 
 
 def test_mlp_logs_final_classification_metrics_by_split():
-    stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
+    stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
     tracker = _RecordingTracker()
 
     stage_train_mlp.log_final_classification_metrics(

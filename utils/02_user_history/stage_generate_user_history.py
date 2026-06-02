@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Stage 3: Generate User-Hour History Directory
+Stage 2: Generate User-Hour History Directory
 
 Creates a directory-style artifact that maps each (user, like-hour bucket) to a
 list of prior liked post embedding indices and, when author metadata is
@@ -14,7 +14,7 @@ Inputs:
 - author_idx_*.parquet from 01_get_data, when available: Author index mapping with
   {author_did, author_train_count, author_idx}
 
-Outputs under <run_dir>/03_user_history/<timestamp>/:
+Outputs under <run_dir>/02_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
   {did, like_hour_bucket, prior_emb_indices} and, when author_idx is available,
   {prior_author_indices}
@@ -274,15 +274,15 @@ def _log_and_plot_history_distribution(
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
-    Stage 3: Generate user history directory.
+    Stage 2: Generate user history directory.
 
     Creates a parquet file mapping each target row to a list of prior liked
     post embedding indices for efficient on-the-fly lookup during training.
     """
-    out_dir = context.new_stage_dir('03_user_history')
+    out_dir = context.new_stage_dir('02_user_history')
 
     # Initialize logger and memory tracker
-    logger = get_stage_logger('STAGE_03_USER_HISTORY', log_file=out_dir / 'stage.log')
+    logger = get_stage_logger('STAGE_02_USER_HISTORY', log_file=out_dir / 'stage.log')
     t0 = time.time()
     mem_tracker = MemoryTracker(logger=logger)
     mem_tracker.checkpoint("stage_start")
@@ -301,7 +301,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
 
     # === Load data ===
-    log_operation_start('Load likes_core from prior stage', 'STAGE_03_USER_HISTORY', logger)
+    log_operation_start('Load likes_core from prior stage', 'STAGE_02_USER_HISTORY', logger)
     likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
 
     # Validate likes schema
@@ -321,7 +321,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Input: {n_likes:,} likes")
 
     # === Build user history directory ===
-    log_operation_start('Build user history directory', 'STAGE_03_USER_HISTORY', logger)
+    log_operation_start('Build user history directory', 'STAGE_02_USER_HISTORY', logger)
 
     directory_lf = _build_user_history_directory(
         likes_lf=likes_lf,
@@ -332,7 +332,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     mem_tracker.checkpoint("after_build_history", quiet=True)
 
     # === Write output ===
-    log_operation_start('Write user history directory', 'STAGE_03_USER_HISTORY', logger)
+    log_operation_start('Write user history directory', 'STAGE_02_USER_HISTORY', logger)
 
     # Collect using the streaming engine so that the intermediate fan-out join
     # is processed in batches rather than fully materialised in memory.
@@ -343,8 +343,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
     # Select only the required persisted output columns. Author history is
-    # optional so older Stage 2 outputs can still feed Stage 3 when the Stage 4
-    # author embedding feature is not being used.
+    # optional so user-history outputs without author columns can still feed
+    # training when the author embedding feature is not being used.
     user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
     directory_df.write_parquet(user_history_output_path, compression="zstd")
 
@@ -383,7 +383,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 
-    logger.info(f"Stage 3 (user_history) completed in {runtime:.2f}s")
+    logger.info(f"Stage 2 (user_history) completed in {runtime:.2f}s")
 
     return {
         'output_dir': out_dir,

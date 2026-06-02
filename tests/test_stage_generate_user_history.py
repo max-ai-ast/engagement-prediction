@@ -16,7 +16,7 @@ import pytest
 @pytest.fixture(scope="session")
 def stage_module():
     repo_root = Path(__file__).resolve().parents[1]
-    module_path = repo_root / "utils" / "03_user_history" / "stage_generate_user_history.py"
+    module_path = repo_root / "utils" / "02_user_history" / "stage_generate_user_history.py"
     spec = importlib.util.spec_from_file_location("stage_generate_user_history", module_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["stage_generate_user_history"] = module

@@ -22,14 +22,14 @@ def test_generate_run_timestamp_uses_los_angeles_time(monkeypatch):
 
 def test_select_prior_output_prefers_latest(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
-    older = artifacts_dir / "03_user_history" / "20240101_000000"
-    newer = artifacts_dir / "03_user_history" / "20240102_000000"
+    older = artifacts_dir / "02_user_history" / "20240101_000000"
+    newer = artifacts_dir / "02_user_history" / "20240102_000000"
     older.mkdir(parents=True)
     newer.mkdir(parents=True)
     os.utime(older, (1, 1))
     os.utime(newer, (2, 2))
 
-    chosen = select_prior_output(artifacts_dir=artifacts_dir, stage_folder="03_user_history")
+    chosen = select_prior_output(artifacts_dir=artifacts_dir, stage_folder="02_user_history")
 
     assert chosen == newer
 
@@ -37,18 +37,18 @@ def test_select_prior_output_prefers_latest(tmp_path):
 def test_select_prior_output_honors_explicit_prior_path(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
     explicit = Path(tmp_path) / "custom_prior"
-    other = artifacts_dir / "04_train" / "20240101_000000"
+    other = artifacts_dir / "03_train" / "20240101_000000"
     explicit.mkdir(parents=True)
     other.mkdir(parents=True)
 
-    chosen = select_prior_output(artifacts_dir=artifacts_dir, stage_folder="04_train", prior_path=explicit)
+    chosen = select_prior_output(artifacts_dir=artifacts_dir, stage_folder="03_train", prior_path=explicit)
 
     assert chosen == explicit
 
 
 def test_list_stage_outputs_sorts_by_timestamp_then_mtime(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
-    stage_folder = "03_user_history"
+    stage_folder = "02_user_history"
     base = artifacts_dir / stage_folder
     base.mkdir(parents=True, exist_ok=True)
 
@@ -81,11 +81,11 @@ def test_stage_metadata_json_includes_nulls(tmp_path):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", pipeline_run_id="run1")
-    ctx.begin_stage("user_history", "03_user_history")
+    ctx.begin_stage("user_history", "02_user_history")
     out_dir = ctx.new_stage_dir(tag="test")
 
     args = argparse.Namespace(foo=None, bar="baz")
-    ctx.finalize_stage(stage_key="user_history", stage_folder="03_user_history", output_dir=out_dir, args=args, argv=None)
+    ctx.finalize_stage(stage_key="user_history", stage_folder="02_user_history", output_dir=out_dir, args=args, argv=None)
 
     manifest_path = out_dir / "manifest.json"
     resolved_config_path = out_dir / "resolved_config.json"
@@ -110,13 +110,13 @@ def test_finalize_stage_appends_prior_inputs_to_stage_info(tmp_path):
     prior_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", pipeline_run_id="run1")
-    ctx.begin_stage("user_history", "03_user_history")
+    ctx.begin_stage("user_history", "02_user_history")
     ctx.record_prior_input("01_get_data", prior_dir)
     out_dir = ctx.new_stage_dir(tag="test")
     (out_dir / "stage_info.txt").write_text("stage: user_history\n")
 
     args = argparse.Namespace()
-    ctx.finalize_stage(stage_key="user_history", stage_folder="03_user_history", output_dir=out_dir, args=args, argv=None)
+    ctx.finalize_stage(stage_key="user_history", stage_folder="02_user_history", output_dir=out_dir, args=args, argv=None)
 
     stage_info = (out_dir / "stage_info.txt").read_text()
     assert "prior_inputs: 1" in stage_info
@@ -129,10 +129,10 @@ def test_new_stage_dir_rejects_mismatched_stage_folder_when_active(tmp_path):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", pipeline_run_id="run1")
-    ctx.begin_stage("user_history", "03_user_history")
+    ctx.begin_stage("user_history", "02_user_history")
 
     try:
-        ctx.new_stage_dir("04_train")
+        ctx.new_stage_dir("03_train")
         assert False, "Expected ValueError for mismatched stage folder"
     except ValueError as e:
         assert "mismatch" in str(e).lower()

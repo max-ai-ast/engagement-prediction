@@ -8,7 +8,7 @@ focused on argument handling and stage orchestration.
 
 The current pipeline is linear at the artifact-folder level:
 
-01_get_data -> 03_user_history -> 04_train -> 05_evaluate
+01_get_data -> 02_user_history -> 03_train -> 04_evaluate
 
 Later stages depend on all earlier stage folders. We derive that folder order
  from the registry's canonical folder names rather than maintaining a second
@@ -55,8 +55,8 @@ def get_stage_folder_to_keys() -> Dict[str, Tuple[str, ...]]:
 def get_stage_input_folders() -> Dict[str, List[str]]:
     """Return cumulative artifact-folder dependencies for the linear pipeline.
 
-    For example, ``04_train`` depends on ``01_get_data`` and
-    ``03_user_history``. The result is derived from
+    For example, ``03_train`` depends on ``01_get_data`` and
+    ``02_user_history``. The result is derived from
     the registered stage folders sorted by their numeric prefixes, so there is
     no separate hand-maintained dependency table to update.
     """
@@ -123,7 +123,7 @@ def validate_explicit_prior_pin_consistency(ctx: Context) -> None:
     """Fail fast when explicitly pinned prior artifacts disagree on lineage.
 
     This runs before any stage execution starts. It catches cases like a pinned
-    ``03_user_history`` artifact whose manifest says it was built from a
+    ``02_user_history`` artifact whose manifest says it was built from a
     different ``01_get_data`` artifact than the one also pinned for the run.
     """
     explicit = {

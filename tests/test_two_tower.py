@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Import from module with numeric prefix
-stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
+stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_tower")
 matrix_ranking = importlib.import_module("utils.matrix_ranking")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel

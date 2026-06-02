@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Stage 4 (Two-Tower): Train two-tower engagement prediction models with flexible user encoders.
+Stage 3 (Two-Tower): Train two-tower engagement prediction models with flexible user encoders.
 
 This stage trains Two-Tower models, a popular architecture for large-scale recommendation
 systems that separates user and item (post) representations into independent "towers",
@@ -74,9 +74,9 @@ candidate posts, learning a metric space where similar preferences cluster.
 
 Inputs (from prior pipeline stages):
     - embeddings_*.npy, likes_core_*.parquet, posts_core_*.parquet from 01_get_data
-    - history_posts_*.parquet from 03_user_history
+    - history_posts_*.parquet from 02_user_history
 
-Outputs under <run_dir>/04_train/<timestamp>/:
+Outputs under <run_dir>/03_train/<timestamp>/:
     - checkpoints/two_tower_best.pth (best-by-validation checkpoint during training)
     - checkpoints/two_tower_<timestamp>.pth (final model checkpoint)
     - logs/ (training logs)
@@ -137,7 +137,7 @@ from utils.matrix_ranking import (
     write_ranking_rows,
 )
 
-STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
+STAGE_LOG_NAME = "STAGE_03_TRAIN_TWO_TOWER"
 
 
 # =============================================================================
@@ -1006,7 +1006,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- output dirs ---
     run_tag = args.run_tag or ""
-    out_dir = context.new_stage_dir("04_train", tag=run_tag)
+    out_dir = context.new_stage_dir("03_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"
@@ -1015,7 +1015,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         d.mkdir(parents=True, exist_ok=True)
 
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / "stage.log")
-    log_operation_start("Stage 4 Two-Tower training", STAGE_LOG_NAME, logger)
+    log_operation_start("Stage 3 Two-Tower training", STAGE_LOG_NAME, logger)
     t0 = time.time()
 
     # --- seeds & cuda ---

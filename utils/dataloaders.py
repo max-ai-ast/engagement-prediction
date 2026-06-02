@@ -936,7 +936,7 @@ def load_bucketed_training_data(
         logger.info("No author_idx artifact found in get_data output")
 
     log_operation_start("Locate user_history", "DATALOADERS", logger)
-    history_dir = _resolve_prior(context, stage_key="user_history", folder="03_user_history")
+    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 

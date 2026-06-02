@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 
 """
-Stage 5: Evaluate a trained model using modular evaluation framework.
+Stage 4: Evaluate a trained model using modular evaluation framework.
 
 This stage orchestrates the evaluation pipeline by:
-1. Loading holdout ranking rows from Stage 4 (04_train)
+1. Loading holdout ranking rows from Stage 3 (03_train)
 2. Computing user metadata from those rows
 3. Creating an EvalContext and running all discovered evaluation modules
 
-Evaluation modules are auto-discovered from utils/05_evaluate/evals/ and each
+Evaluation modules are auto-discovered from utils/04_evaluate/evals/ and each
 produces its own set of artifacts (plots, CSVs, JSON summaries).
 
 Inputs (from prior pipeline stages):
-- eval/holdout_<type>_ranking_rows.parquet from 04_train
+- eval/holdout_<type>_ranking_rows.parquet from 03_train
 
-Outputs under artifacts/05_evaluate/<stage_run_id>/
+Outputs under artifacts/04_evaluate/<stage_run_id>/
 - eval_summary.json: Combined results from all modules
 - stage_info.txt: Stage metadata
 - <module_name>/: Subdirectory for each evaluation module's artifacts
@@ -36,7 +36,7 @@ from utils.helpers import get_stage_logger, log_operation_start
 # Import evaluation framework
 # ---------------------------------------------------------------------------
 # We use importlib with sys.modules registration to avoid issues with the
-# numeric directory name (05_evaluate is not a valid Python identifier).
+# numeric directory name (04_evaluate is not a valid Python identifier).
 import sys
 import importlib.util
 
@@ -66,7 +66,7 @@ EvalContext = _evals.EvalContext
 discover_modules = _evals.discover_modules
 run_all_modules = _evals.run_all_modules
 
-STAGE_LOG_NAME = 'STAGE_05_EVALUATE'
+STAGE_LOG_NAME = 'STAGE_04_EVALUATE'
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def resolve_train_output(
     Locate the training stage output directory.
 
     Tries same-session artifacts (``train_mlp`` / ``train_two_tower``) first,
-    then falls back to filesystem scanning under ``04_train/``.
+    then falls back to filesystem scanning under ``03_train/``.
 
     Returns:
         Path to the training stage timestamp directory.
@@ -91,9 +91,9 @@ def resolve_train_output(
     for stage_key in ("train_mlp", "train_two_tower"):
         art_dir = context.get_artifact_dir(stage_key)
         if art_dir is not None and Path(art_dir).exists():
-            return context.record_prior_input("04_train", art_dir)
+            return context.record_prior_input("03_train", art_dir)
 
-    return context.resolve_prior_output("04_train", prior_path=context.prior_outputs.get("04_train"))
+    return context.resolve_prior_output("03_train", prior_path=context.prior_outputs.get("03_train"))
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ def compute_user_metadata_from_ranking_rows(ranking_rows_df: pd.DataFrame) -> pd
 
 def run(context: Context, args) -> Dict[str, Any]:
     """
-    Main entry point for Stage 5: Evaluation.
+    Main entry point for Stage 4: Evaluation.
 
     Loads holdout ranking rows from the training stage and runs all evaluation
     modules.
@@ -155,11 +155,11 @@ def run(context: Context, args) -> Dict[str, Any]:
     train_eval_dir = train_dir / 'eval'
 
     # Canonical stage output
-    out_dir = context.new_stage_dir("05_evaluate", tag=eval_holdout_type)
+    out_dir = context.new_stage_dir("04_evaluate", tag=eval_holdout_type)
 
     # Initialize logger
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / 'stage.log')
-    log_operation_start('Stage 5: Evaluation', STAGE_LOG_NAME, logger)
+    log_operation_start('Stage 4: Evaluation', STAGE_LOG_NAME, logger)
     logger.info(f"Training output dir: {train_dir}")
     logger.info(f"Holdout type for evaluation: {eval_holdout_type}")
 
@@ -172,7 +172,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     if ranking_rows_df is None:
         raise FileNotFoundError(
             f"No holdout ranking rows found. Expected {train_eval_dir / f'holdout_{eval_holdout_type}_ranking_rows.parquet'}. "
-            "Please rerun Stage 4 training so it writes matrix ranking-row artifacts."
+            "Please rerun Stage 3 training so it writes matrix ranking-row artifacts."
         )
     predictions_df = pd.DataFrame(columns=['did', 'post_id', 'y_true', 'y_pred_proba'])
     user_metadata_df = compute_user_metadata_from_ranking_rows(ranking_rows_df)

@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from utils.matrix_ranking import ranking_rows_for_batch
 
-stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
+stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
 MLPModel = stage_train_mlp.MLPModel
 CrossAttentionPoolingEncoder = stage_train_mlp.CrossAttentionPoolingEncoder
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
-"""Stage 4 (MLP): Train bucketed matrix-ranker engagement models.
+"""Stage 3 (MLP): Train bucketed matrix-ranker engagement models.
 
-The MLP stage uses the same Stage 1/3 bucketed data contract as Two-Tower:
+The MLP stage uses the same Stage 1/2 bucketed data contract as Two-Tower:
 each batch contains a set of user-hour rows and same-hour candidate posts. The
 model scores the full user x candidate matrix and trains with a row-wise
 multi-positive softmax loss.
@@ -51,7 +51,7 @@ from utils.matrix_ranking import (
     write_ranking_rows,
 )
 
-STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
+STAGE_LOG_NAME = "STAGE_03_TRAIN_MLP"
 
 
 class SummarizedHistoryEncoder(nn.Module):
@@ -499,7 +499,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     timestamp = context.run_timestamp
 
     run_tag = args.run_tag or ""
-    out_dir = context.new_stage_dir("04_train", tag=run_tag)
+    out_dir = context.new_stage_dir("03_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"
@@ -508,7 +508,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         d.mkdir(parents=True, exist_ok=True)
 
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / "stage.log")
-    log_operation_start("Stage 4 MLP training", STAGE_LOG_NAME, logger)
+    log_operation_start("Stage 3 MLP training", STAGE_LOG_NAME, logger)
     t0 = time.time()
 
     clear_cuda_memory()

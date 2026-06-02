@@ -48,7 +48,7 @@ class EvalContext:
     
     Attributes:
         predictions_df: Reserved DataFrame field for modules that still inspect
-                       prediction counts. Stage 5 now evaluates ranking rows.
+                       prediction counts. Stage 4 now evaluates ranking rows.
         ranking_rows_df: DataFrame with one row per user-hour ranking
                          evaluation row from bucketed training.
         user_metadata_df: DataFrame with columns [did, num_embedding_likes, num_total_likes]

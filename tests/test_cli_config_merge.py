@@ -237,7 +237,7 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
         textwrap.dedent(
             """
             prior_01_get_data: 20260101_000000_deadbeef
-            prior_03_user_history: 20260102_000000_cafebabe
+            prior_02_user_history: 20260102_000000_cafebabe
             """
         ).strip()
         + "\n"
@@ -248,4 +248,4 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     merged = cli._merge_args_with_config(raw)
 
     assert merged.prior_01_get_data == "20260101_000000_deadbeef"
-    assert merged.prior_03_user_history == "20260102_000000_cafebabe"
+    assert merged.prior_02_user_history == "20260102_000000_cafebabe"
