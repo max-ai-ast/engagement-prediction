@@ -15,12 +15,12 @@ TwoTowerModel = stage_train_two_tower.TwoTowerModel
 PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
 AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
 AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
-_rank_metric_sums_for_batch = stage_train_two_tower._rank_metric_sums_for_batch
-_calc_baseline_rank_metrics_for_batch = stage_train_two_tower._calc_baseline_rank_metrics_for_batch
-_finalize_rank_metrics = stage_train_two_tower._finalize_rank_metrics
+_rank_metric_sums_for_batch = matrix_ranking.rank_metric_sums_for_batch
+_calc_baseline_rank_metrics_for_batch = matrix_ranking.calc_baseline_rank_metrics_for_batch
+_finalize_rank_metrics = matrix_ranking.finalize_rank_metrics
 _run_one_epoch = stage_train_two_tower._run_one_epoch
-_evaluate_two_tower_model = stage_train_two_tower._evaluate_two_tower_model
-_ranking_rows_for_batch = stage_train_two_tower._ranking_rows_for_batch
+_evaluate_two_tower_model = matrix_ranking.evaluate_matrix_model
+_ranking_rows_for_batch = matrix_ranking.ranking_rows_for_batch
 
 
 # =============================================================================

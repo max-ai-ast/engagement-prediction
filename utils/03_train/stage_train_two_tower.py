@@ -123,16 +123,8 @@ from utils.dataloaders import (
 )
 from utils.author_features import PostAuthorFeatureEncoder
 from utils.matrix_ranking import (
-    DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
-    FINAL_CLASSIFICATION_METRICS,
-    calc_baseline_rank_metrics_for_batch,
-    empty_rank_metric_sums,
     evaluate_matrix_model,
-    finalize_rank_metrics,
     log_final_classification_metrics,
-    optional_float_metric,
-    rank_metric_sums_for_batch,
-    ranking_rows_for_batch,
     run_matrix_epoch,
     stage_info_metric_lines,
     write_ranking_rows,
@@ -597,37 +589,6 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
-def _empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
-    return empty_rank_metric_sums(metrics_top_ks)
-
-
-def _calc_baseline_rank_metrics_for_batch(
-    unranked_labels: torch.Tensor,
-    metrics_top_ks: list[int],
-) -> Tuple[Dict[str, float], int]:
-    return calc_baseline_rank_metrics_for_batch(unranked_labels, metrics_top_ks)
-
-
-def _rank_metric_sums_for_batch(
-    ranked_labels: torch.Tensor,
-    metrics_top_ks: list[int],
-) -> Tuple[Dict[str, float], int]:
-    return rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
-
-
-def _finalize_rank_metrics(metric_sums: Dict[str, float], user_count: int) -> Dict[str, float]:
-    return finalize_rank_metrics(metric_sums, user_count)
-
-
-def _ranking_rows_for_batch(
-    batch: Dict[str, Any],
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-    metrics_top_ks: list[int],
-) -> List[Dict[str, Any]]:
-    return ranking_rows_for_batch(batch, scores, labels, metrics_top_ks)
-
-
 def _run_one_epoch(
     train: bool,
     split_name: str,
@@ -918,66 +879,6 @@ def train_two_tower_model(
 # Evaluation
 # =============================================================================
 
-def _evaluate_two_tower_model(
-    model: TwoTowerModel,
-    data_loader: DataLoader,
-    device: str,
-    embed_dim: int,
-    metrics_top_ks: list[int],
-    max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
-    collect_ranking_rows: bool = False,
-    progress_desc: Optional[str] = None,
-    disable_progress: bool = True,
-) -> Dict[str, Any]:
-    return evaluate_matrix_model(
-        model=model,
-        data_loader=data_loader,
-        device=device,
-        embed_dim=embed_dim,
-        metrics_top_ks=metrics_top_ks,
-        max_classification_metric_pairs=max_classification_metric_pairs,
-        collect_ranking_rows=collect_ranking_rows,
-        progress_desc=progress_desc,
-        disable_progress=disable_progress,
-    )
-
-
-def _optional_float_metric(value: Any) -> Optional[float]:
-    return optional_float_metric(value)
-
-
-def _split_metric_label(split_name: str) -> str:
-    return split_name.replace("_", " ").title()
-
-
-def _clearml_metric_label(metric_name: str) -> str:
-    return {
-        "auc_roc": "AUC-ROC",
-        "average_precision": "Average Precision",
-    }.get(metric_name, metric_name.replace("_", " ").title())
-
-
-def _log_final_classification_metrics(
-    experiment_tracker: Optional[Any],
-    split_metrics: Dict[str, Dict[str, Any]],
-    iteration: int,
-) -> None:
-    log_final_classification_metrics(experiment_tracker, split_metrics, iteration)
-
-
-def _stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[str]:
-    return stage_info_metric_lines(split_metrics)
-
-
-def _write_ranking_rows(
-    rows: List[Dict[str, Any]],
-    output_path: Path,
-    split_name: str,
-    num_total_likes_by_user: Dict[str, int],
-) -> None:
-    write_ranking_rows(rows, output_path, split_name, num_total_likes_by_user)
-
-
 def _find_author_idx_artifact_path(context: Context) -> Optional[Path]:
     get_data_dir = context.get_active_stage_inputs().get("01_get_data")
     if get_data_dir is None:
@@ -991,10 +892,6 @@ def _find_author_idx_artifact_path(context: Context) -> Optional[Path]:
     )
     return candidates[0] if candidates else None
 
-
-# =============================================================================
-# Plotting
-# =============================================================================
 
 # =============================================================================
 # Pipeline entry point
@@ -1202,17 +1099,17 @@ def run(context: Context, args) -> Dict[str, Any]:
             plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect split metrics without materializing per-user-candidate predictions
-    train_eval = _evaluate_two_tower_model(
+    train_eval = evaluate_matrix_model(
         trained_model, train_loader, device, embed_dim, metrics_top_ks,
         progress_desc="Evaluate train",
         disable_progress=disable_progress,
     )
-    val_eval = _evaluate_two_tower_model(
+    val_eval = evaluate_matrix_model(
         trained_model, val_loader, device, embed_dim, metrics_top_ks,
         progress_desc="Evaluate validation",
         disable_progress=disable_progress,
     )
-    val_unseen_eval = _evaluate_two_tower_model(
+    val_unseen_eval = evaluate_matrix_model(
         trained_model, val_unseen_loader, device, embed_dim, metrics_top_ks,
         progress_desc="Evaluate validation unseen users",
         disable_progress=disable_progress,
@@ -1328,7 +1225,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
                 seed=random_seed,
             )
-            holdout_eval = _evaluate_two_tower_model(
+            holdout_eval = evaluate_matrix_model(
                 trained_model,
                 holdout_loader,
                 device,

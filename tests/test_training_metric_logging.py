@@ -198,7 +198,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
 def test_two_tower_logs_final_classification_metrics_by_split():
     tracker = _RecordingTracker()
 
-    stage_train_two_tower._log_final_classification_metrics(
+    stage_train_two_tower.log_final_classification_metrics(
         tracker,
         {
             "train": {"auc_roc": 0.75, "average_precision": 0.50},
@@ -258,7 +258,7 @@ def test_mlp_logs_final_classification_metrics_by_split():
 
 
 def test_two_tower_stage_info_metric_lines_include_final_classification_metrics():
-    lines = stage_train_two_tower._stage_info_metric_lines({
+    lines = stage_train_two_tower.stage_info_metric_lines({
         "train": {"auc_roc": 0.75, "average_precision": 0.50},
         "val": {"auc_roc": None, "average_precision": float("nan")},
         "holdout_unseen_users": {"auc_roc": 0.80},
