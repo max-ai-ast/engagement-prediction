@@ -110,7 +110,7 @@ def _build_user_history_directory(
     if include_author_idx:
         agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
 
-    # Group by integer target_idx (cheap) and collect prior emb_idx as list.
+    # Group by user and hour bucket, and collect prior emb_idx as list.
     # Also compute raw (uncapped) count for distribution analysis.
     history_lists_lf = (
         pairs_with_prior_likes_lf
@@ -127,7 +127,7 @@ def _build_user_history_directory(
             .alias("prior_emb_indices"),
             pl.col("raw_prior_count").fill_null(0),
         )
-    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, (prior_author_indices)]
+    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count]
     
     if include_author_idx:
         pairs_with_history_list_lf = (
