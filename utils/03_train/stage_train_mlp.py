@@ -762,6 +762,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
                 seed=random_seed,
             )
+            if holdout_loader is None:
+                logger.info(f"No holdout loader created for split '{split_name}', skipping.")
+                continue
             holdout_eval = evaluate_matrix_model(
                 trained_model,
                 holdout_loader,
