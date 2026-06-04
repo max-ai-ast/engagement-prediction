@@ -237,7 +237,7 @@ def run_matrix_epoch(
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
-            if train:
+            if train and optimizer is not None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
                 optimizer.step()
@@ -304,7 +304,7 @@ def evaluate_matrix_model(
             classification_pair_count += int(flat_labels.size)
             classification_positive_count += int(flat_labels.sum())
             if max_classification_metric_pairs is None:
-                if metric_labels is None:
+                if metric_labels is None or metric_scores is None:
                     metric_labels = flat_labels
                     metric_scores = flat_scores
                 else:
@@ -312,7 +312,7 @@ def evaluate_matrix_model(
                     metric_scores = np.concatenate([metric_scores, flat_scores])
             elif max_classification_metric_pairs > 0:
                 flat_priorities = rng.random(flat_labels.size)
-                if metric_labels is None:
+                if metric_labels is None or metric_scores is None or metric_priorities is None:
                     metric_labels = flat_labels
                     metric_scores = flat_scores
                     metric_priorities = flat_priorities
@@ -320,11 +320,12 @@ def evaluate_matrix_model(
                     metric_labels = np.concatenate([metric_labels, flat_labels])
                     metric_scores = np.concatenate([metric_scores, flat_scores])
                     metric_priorities = np.concatenate([metric_priorities, flat_priorities])
-                if metric_labels.size > max_classification_metric_pairs:
-                    keep_idx = np.argpartition(metric_priorities, max_classification_metric_pairs - 1)[:max_classification_metric_pairs]
-                    metric_labels = metric_labels[keep_idx]
-                    metric_scores = metric_scores[keep_idx]
-                    metric_priorities = metric_priorities[keep_idx]
+                if metric_labels is not None and metric_scores is not None and metric_priorities is not None: 
+                    if metric_labels.size > max_classification_metric_pairs:
+                        keep_idx = np.argpartition(metric_priorities, max_classification_metric_pairs - 1)[:max_classification_metric_pairs]
+                        metric_labels = metric_labels[keep_idx]
+                        metric_scores = metric_scores[keep_idx]
+                        metric_priorities = metric_priorities[keep_idx]
 
     metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
     metrics["loss"] = (loss_sum / max(batches, 1)).item()
@@ -336,11 +337,11 @@ def evaluate_matrix_model(
         max_classification_metric_pairs is not None
         and classification_pair_count > max_classification_metric_pairs
     )
-    if metric_labels is not None and np.unique(metric_labels).size > 1:
+    if metric_labels is not None and np.unique(metric_labels).size > 1 and metric_scores is not None:
         metrics["auc_roc"] = float(roc_auc_score(metric_labels, metric_scores))
     else:
         metrics["auc_roc"] = None
-    if metric_labels is not None and int(metric_labels.sum()) > 0:
+    if metric_labels is not None and int(metric_labels.sum()) > 0 and metric_scores is not None:
         metrics["average_precision"] = float(average_precision_score(metric_labels, metric_scores))
     else:
         metrics["average_precision"] = None

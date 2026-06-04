@@ -102,6 +102,20 @@ def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
     return pl.scan_parquet(candidates[0])
 
 
+def find_author_idx_artifact_path(context: Context) -> Optional[Path]:
+    get_data_dir = context.get_active_stage_inputs().get("01_get_data")
+    if get_data_dir is None:
+        get_data_dir = context.get_artifact_dir("get_data")
+    if get_data_dir is None:
+        return None
+    candidates = sorted(
+        Path(get_data_dir).glob("author_idx_*.parquet"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 # ----------------------------------------
 # Feature column helpers
 # ----------------------------------------

@@ -32,6 +32,7 @@ from utils.helpers import (
     plot_training_history,
     clear_cuda_memory,
     set_random_seeds,
+    find_author_idx_artifact_path,
 )
 from utils.dataloaders import (
     AUTHOR_PAD_IDX,
@@ -110,7 +111,7 @@ class MLPModel(nn.Module):
         use_author_embedding_table: bool = False,
         author_table_num_rows: Optional[int] = None,
         author_embedding_dim: Optional[int] = None,
-        author_unknown_dropout_rate: float = 0.0,
+        author_unknown_dropout_rate: Optional[float] = None,
     ):
         super().__init__()
         self.post_embedding_dim = int(post_embedding_dim)
@@ -125,6 +126,8 @@ class MLPModel(nn.Module):
                 raise ValueError("author_table_num_rows must be provided and >= 2 when use_author_embedding_table is True")
             if author_embedding_dim is None or author_embedding_dim <= 0:
                 raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
+            if author_unknown_dropout_rate is None or author_unknown_dropout_rate < 0.0 or author_unknown_dropout_rate > 1.0:
+                raise ValueError("author_unknown_dropout_rate must be provided when use_author_embedding_table is True")
             self.post_author_feature_encoder = PostAuthorFeatureEncoder(
                 post_embedding_dim=post_embedding_dim,
                 author_table_num_rows=author_table_num_rows,
@@ -481,20 +484,6 @@ def train_mlp_model(
     }
 
 
-def _find_author_idx_artifact_path(context: Context) -> Optional[Path]:
-    get_data_dir = context.get_active_stage_inputs().get("01_get_data")
-    if get_data_dir is None:
-        get_data_dir = context.get_artifact_dir("get_data")
-    if get_data_dir is None:
-        return None
-    candidates = sorted(
-        Path(get_data_dir).glob("author_idx_*.parquet"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
-
-
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     device = get_device(args.device)
     timestamp = context.run_timestamp
@@ -586,7 +575,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"author_embedding_dim={author_embedding_dim}, "
             f"author_table_num_rows={author_table_num_rows}"
         )
-        author_idx_artifact_path = _find_author_idx_artifact_path(context)
+        author_idx_artifact_path = find_author_idx_artifact_path(context)
         if author_idx_artifact_path is None:
             logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
         else:

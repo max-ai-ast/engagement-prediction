@@ -109,6 +109,7 @@ from utils.helpers import (
     plot_training_history,
     clear_cuda_memory,
     set_random_seeds,
+    find_author_idx_artifact_path,
 )
 from utils.dataloaders import (
     AUTHOR_PAD_IDX,
@@ -636,7 +637,9 @@ def train_two_tower_model(
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
+        # only need to calculate the baseline metrics once - at the first epoch
         calc_baseline_metrics: bool = epoch == 0
+        
         train_loss, train_metrics_dict, train_baseline_metrics_dict = run_matrix_epoch(
             train=True,
             split_name="Train",
@@ -848,24 +851,6 @@ def train_two_tower_model(
 
 
 # =============================================================================
-# Evaluation
-# =============================================================================
-
-def _find_author_idx_artifact_path(context: Context) -> Optional[Path]:
-    get_data_dir = context.get_active_stage_inputs().get("01_get_data")
-    if get_data_dir is None:
-        get_data_dir = context.get_artifact_dir("get_data")
-    if get_data_dir is None:
-        return None
-    candidates = sorted(
-        Path(get_data_dir).glob("author_idx_*.parquet"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
-
-
-# =============================================================================
 # Pipeline entry point
 # =============================================================================
 
@@ -960,7 +945,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             f"author_embedding_dim={author_embedding_dim}, "
             f"author_table_num_rows={author_table_num_rows}"
         )
-        author_idx_artifact_path = _find_author_idx_artifact_path(context)
+        author_idx_artifact_path = find_author_idx_artifact_path(context)
         if author_idx_artifact_path is None:
             logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
         else:
@@ -1168,9 +1153,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
         logger.info(f"Post tower model id: {post_model_id}")
 
-    # Prediction parquet writing is intentionally disabled for now. The bucketed
-    # path produces one row per user-candidate pair, which can be hundreds of
-    # millions of rows per split with current sampling settings.
+    # Full per-pair prediction parquet writing is intentionally disabled for now.
+    # The bucketed path would produce one row per user-candidate pair, which can
+    # be hundreds of millions of rows per split with current sampling settings.
+    # Stage 4 uses the compact holdout ranking-row artifacts written below instead.
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
@@ -1197,6 +1183,9 @@ def run(context: Context, args) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
                 seed=random_seed,
             )
+            if holdout_loader is None:
+                logger.info(f"Holdout dataset for split '{split_name}' is empty after loading, skipping.")
+                continue
             holdout_eval = evaluate_matrix_model(
                 trained_model,
                 holdout_loader,
