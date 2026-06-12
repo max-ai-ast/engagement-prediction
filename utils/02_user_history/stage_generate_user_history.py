@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 
 """
-Stage 3: Generate User History Directory
+Stage 2: Generate User-Hour History Directory
 
-Creates a directory-style artifact that maps each target row to a list of prior
-liked post embedding indices and, when author metadata is available, author
-indices. This enables efficient on-the-fly embedding retrieval during training
-and stable author-history features.
+Creates a directory-style artifact that maps each (user, like-hour bucket) to a
+list of prior liked post embedding indices and, when author metadata is
+available, author indices. This enables efficient on-the-fly embedding retrieval
+during training and stable author-history features.
 
 Inputs:
 - likes_core_*.parquet from 01_get_data: Contains
-  {did, subject_uri, record_created_at, emb_idx}
-- target_posts_*.parquet from 02_target_posts: Wide format with
-  {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
-- author_idx_*.parquet from 02_target_posts, when available: Author index mapping with
-  {emb_idx, author_did, author_train_count, author_idx}
+  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, author_idx}
+- author_idx_*.parquet from 01_get_data, when available: Author index mapping with
+  {author_did, author_train_count, author_idx}
 
-Outputs under <run_dir>/03_user_history/<timestamp>/:
+Outputs under <run_dir>/02_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
-  {target_did, like_uri, prior_emb_indices} and, when author_idx is available,
+  {did, like_hour_bucket, prior_emb_indices} and, when author_idx is available,
   {prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
   prior_author_indices is a List[UInt32] aligned element-wise with
-  prior_emb_indices, and rows where the user has no prior likes in the dataset
-  get empty lists.
+  prior_emb_indices, and user-hour rows where the user has no prior likes in
+  the dataset get empty lists.
 """
 
 from __future__ import annotations
@@ -38,7 +36,6 @@ from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
-    log_prior_stage_inputs,
     validate_dataframe_schema,
     load_parquet_from_prior,
     TIMESTAMP_COL_NAME,
@@ -47,160 +44,103 @@ from utils.memory_helpers import MemoryTracker
 
 
 def _build_user_history_directory(
-    targets_lf: pl.LazyFrame,
     likes_lf: pl.LazyFrame,
     max_prior_likes: Optional[int],
     logger: logging.Logger,
-    history_buffer_hours: Optional[float] = None,
-    author_idx_lf: Optional[pl.LazyFrame] = None,
 ) -> pl.LazyFrame:
     """
-    Build a directory mapping each target (user, like-event) to prior liked embedding indices.
-
-    The target posts use a wide format where each row represents a (user, like-event)
-    training pair.  The user history depends only on the user (target_did) and the
-    event timestamp (seen_at), so a single history list is produced per pair.
-    The output is indexed on (target_did, like_uri).
-
-    Internally, the heavy join/filter/group_by operations use an integer target_idx
-    to avoid carrying expensive string columns (like_uri) through the fan-out join.
-    The string keys are mapped back only at the end.
+    Build a directory mapping each (user, like-hour bucket) to prior liked embedding indices.
 
     Uses vectorized Polars operations for efficiency:
-    1. Assign integer target_idx to each target row
-    2. Join with likes on user (target_did == did) carrying only target_idx
-    3. Filter to likes that occurred before the target timestamp (seen_at),
-       optionally with a buffer period subtracted from seen_at
-    4. Group by target_idx and collect emb_idx values sorted by recency
-    5. Left-join back to ensure every target appears (empty list for no history)
-    6. Map target_idx back to (target_did, like_uri) for the final output
+    1. Get distinct user-hour pairs from likes_core
+    2. Join each pair to that user's likes
+    3. Filter to likes that occurred before the hour bucket
+    4. Group by (did, like_hour_bucket) and collect emb_idx values sorted by recency
+    5. Left-join back to ensure every user-hour appears, including empty histories
 
     Args:
-        targets_lf: LazyFrame with at least columns [target_did, seen_at, like_uri, ...]
-        likes_lf: LazyFrame with columns [did, subject_uri, record_created_at, emb_idx]
+        likes_lf: LazyFrame with columns [did, like_hour_bucket, record_created_at, emb_idx]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
-        history_buffer_hours: Optional buffer in hours to subtract from seen_at when
-            determining prior likes.  When set, a like must satisfy
-            ``like_ts < seen_at - buffer`` instead of ``like_ts < seen_at``.
-            Useful for simulating information delay or avoiding leakage near the
-            boundary.  None or 0 means no buffer (original behaviour).
 
     Returns:
-        LazyFrame with columns [target_did, like_uri, seen_at, prior_emb_indices, raw_prior_count]
+        LazyFrame with columns [did, like_hour_bucket, prior_emb_indices, raw_prior_count]
         where raw_prior_count is the uncapped number of prior likes (for distribution analysis).
     """
     logger.info("Building user history directory...")
+    likes_schema = likes_lf.collect_schema()
+    include_author_idx = "author_idx" in likes_schema
 
-    # Assign an integer row index for memory-efficient keying during the
-    # expensive fan-out join.  Carrying a UInt32 target_idx through hundreds
-    # of millions of intermediate rows is far cheaper than carrying like_uri
-    # strings (~80-100 bytes each).
-    targets_indexed = targets_lf.with_row_index("target_idx")
-
-    # For the heavy join, only carry target_idx + the columns needed for
-    # joining (target_did) and filtering (seen_at).  like_uri is NOT included
-    # here to save memory during the fan-out.
-    join_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
-
-    # Rename likes columns to avoid collision after join
-    # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
-    likes_cols = [
-        pl.col("did"),
-        pl.col(TIMESTAMP_COL_NAME).alias("like_ts"),
-        pl.col("emb_idx").alias("like_emb_idx"),
-    ]
-
-    if author_idx_lf is not None:
-        likes_renamed = likes_lf.select(likes_cols + [pl.col("author_did")])
-        likes_renamed = (
-            likes_renamed
-            .join(
-                author_idx_lf.select("author_did", "author_idx"),
-                on="author_did",
-                how="left",
-            )
-        )
-    else:
-        likes_renamed = likes_lf.select(likes_cols)
+    user_bucket_pairs_lf = (
+        likes_lf
+        .select(['did', 'like_hour_bucket'])
+        .unique()
+    ) # [did, like_hour_bucket]
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
-    joined = join_keys.join(
-        likes_renamed,
-        left_on="target_did",
-        right_on="did",
-        how="left",
-    )
-
-    # Filter to likes that occurred BEFORE the target timestamp (minus optional buffer).
-    # This ensures we only include prior history, not future likes.
-    if history_buffer_hours is not None and history_buffer_hours > 0:
-        buffer_us = int(history_buffer_hours * 3_600_000_000)  # hours → microseconds
-        cutoff_expr = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
-        logger.info(f"  Applying history buffer of {history_buffer_hours}h (like_ts < seen_at - {history_buffer_hours}h)")
-    else:
-        cutoff_expr = pl.col("seen_at")
-
-    prior_likes = joined.filter(
-        pl.col("like_ts") < cutoff_expr
-    )
+    likes_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx']
+    if include_author_idx:
+        likes_cols.append('author_idx')
+    pairs_with_prior_likes_lf = (
+        user_bucket_pairs_lf
+        .join(
+            likes_lf.select(likes_cols),
+            on="did",
+            how="left"
+        )
+        .filter(pl.col(TIMESTAMP_COL_NAME) < pl.col("like_hour_bucket"))
+    ) # [did, like_hour_bucket, record_created_at, emb_idx, (author_idx)]
 
     def _get_agg_expr(col_name: str):
         # Build aggregation expression: sort by recency (descending) and optionally cap
         # The result is a list of emb_idx values, most recent first
         agg_expr = (
             pl.col(col_name)
-            .sort_by(pl.col("like_ts"), descending=True)
+            .sort_by(pl.col(TIMESTAMP_COL_NAME), descending=True)
         )
         if max_prior_likes is not None and max_prior_likes > 0:
             agg_expr = agg_expr.head(max_prior_likes)
         return agg_expr
     
     agg_exprs = [
-        _get_agg_expr("like_emb_idx").alias("prior_emb_indices"),
+        _get_agg_expr("emb_idx").alias("prior_emb_indices"),
         pl.len().alias("raw_prior_count"),
     ]
-    if author_idx_lf is not None:
+    if include_author_idx:
         agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
 
-    # Group by integer target_idx (cheap) and collect prior emb_idx as list.
+    # Group by user and hour bucket, and collect prior emb_idx as list.
     # Also compute raw (uncapped) count for distribution analysis.
-    directory_lf = prior_likes.group_by("target_idx").agg(agg_exprs)
-
-    # Left-join back to ensure every target row appears, including those with
-    # no prior likes (e.g. a user's first like in the dataset).
-    # Also map back from target_idx to the meaningful (target_did, like_uri) keys.
-    #
-    # NOTE: The left side preserves the original row order from the target_posts
-    # file.  This means the output rows are 1:1 aligned with target_posts, even
-    # though (target_did, like_uri) is the official join key.  Downstream
-    # consumers should join on the key columns, but positional alignment can be
-    # relied upon as an optimization if needed.
-    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at"])
-    directory_lf = all_target_keys.join(
-        directory_lf,
-        on="target_idx",
-        how="left",
-    ).with_columns(
-        pl.when(pl.col("prior_emb_indices").is_null())
-        .then(pl.lit([]).cast(pl.List(pl.UInt32)))
-        .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
-        .alias("prior_emb_indices"),
-        pl.col("raw_prior_count").fill_null(0),
+    history_lists_lf = (
+        pairs_with_prior_likes_lf
+        .group_by(["did", "like_hour_bucket"])
+        .agg(agg_exprs)
     )
-    output_columns = ["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"]
-    if author_idx_lf is not None:
-        directory_lf = directory_lf.with_columns(
-            pl.when(pl.col("prior_author_indices").is_null())
+    pairs_with_history_list_lf = (
+        user_bucket_pairs_lf
+        .join(history_lists_lf, on=["did", "like_hour_bucket"], how="left")
+        .with_columns(
+            pl.when(pl.col("prior_emb_indices").is_null())
             .then(pl.lit([]).cast(pl.List(pl.UInt32)))
-            .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
-            .alias("prior_author_indices"),
+            .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
+            .alias("prior_emb_indices"),
+            pl.col("raw_prior_count").fill_null(0),
         )
-        output_columns.insert(4, "prior_author_indices")
-    directory_lf = directory_lf.select(output_columns)
+    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count]
+    
+    if include_author_idx:
+        pairs_with_history_list_lf = (
+            pairs_with_history_list_lf
+            .with_columns(
+                pl.when(pl.col("prior_author_indices").is_null())
+                .then(pl.lit([]).cast(pl.List(pl.UInt32)))
+                .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
+                .alias("prior_author_indices"),
+            )
+        ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, (prior_author_indices)]
 
-    return directory_lf
+    return pairs_with_history_list_lf
 
 
 def _log_and_plot_history_distribution(
@@ -219,8 +159,8 @@ def _log_and_plot_history_distribution(
     users reveals how many users are actually affected by the cap.
     """
     # For each user, find the raw prior count at their last target post
-    last_target_per_user = directory_df.group_by("target_did").agg(
-        pl.col("raw_prior_count").sort_by("seen_at").last().alias("history_len_before"),
+    last_target_per_user = directory_df.group_by("did").agg(
+        pl.col("raw_prior_count").sort_by("like_hour_bucket").last().alias("history_len_before"),
     )
 
     before = last_target_per_user["history_len_before"]
@@ -334,15 +274,15 @@ def _log_and_plot_history_distribution(
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
-    Stage 3: Generate user history directory.
+    Stage 2: Generate user history directory.
 
     Creates a parquet file mapping each target row to a list of prior liked
     post embedding indices for efficient on-the-fly lookup during training.
     """
-    out_dir = context.new_stage_dir('03_user_history')
+    out_dir = context.new_stage_dir('02_user_history')
 
     # Initialize logger and memory tracker
-    logger = get_stage_logger('STAGE_03_USER_HISTORY', log_file=out_dir / 'stage.log')
+    logger = get_stage_logger('STAGE_02_USER_HISTORY', log_file=out_dir / 'stage.log')
     t0 = time.time()
     mem_tracker = MemoryTracker(logger=logger)
     mem_tracker.checkpoint("stage_start")
@@ -355,26 +295,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         prior_path=context.prior_outputs.get('01_get_data'),
     )
 
-    # 2. Target posts from 02_target_posts stage
-    prior_target_posts_dir = context.resolve_prior_output(
-        '02_target_posts',
-        prior_path=context.prior_outputs.get('02_target_posts'),
-    )
-    log_prior_stage_inputs(context, logger)
-    logger.info(f"Using likes from: {prior_get_data}")
-    logger.info(f"Using target posts from: {prior_target_posts_dir}")
-
     # === Get CLI args ===
     max_prior_likes: Optional[int] = args.max_prior_likes
     if max_prior_likes is not None and max_prior_likes <= 0:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
 
-    history_buffer_hours: Optional[float] = args.history_buffer_hours
-    if history_buffer_hours is not None and history_buffer_hours <= 0:
-        history_buffer_hours = None  # Treat 0 or negative as "no buffer"
-
     # === Load data ===
-    log_operation_start('Load likes_core from prior stage', 'STAGE_03_USER_HISTORY', logger)
+    log_operation_start('Load likes_core from prior stage', 'STAGE_02_USER_HISTORY', logger)
     likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
 
     # Validate likes schema
@@ -387,58 +314,25 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
 
-    log_operation_start('Load target_posts', 'STAGE_03_USER_HISTORY', logger)
-    targets_lf: pl.LazyFrame = load_parquet_from_prior(prior_target_posts_dir, "target_posts_")
-
-    # Validate target posts schema (wide format)
-    targets_schema = {
-        "target_did": str,
-        "seen_at": pl.Datetime,
-        "like_uri": str,
-    }
-    validate_dataframe_schema(targets_lf, targets_schema)
-    logger.info("✓ target_posts schema validated")
-
-    log_operation_start('Load author_idx (optional)', 'STAGE_03_USER_HISTORY', logger)
-    author_idx_lf: Optional[pl.LazyFrame]
-    try:
-        author_idx_lf = load_parquet_from_prior(prior_target_posts_dir, "author_idx_")
-
-        # Validate author idx schema
-        author_idx_schema = {
-            "author_did": str,
-            "author_train_count": int,
-            "author_idx": int,
-        }
-        validate_dataframe_schema(author_idx_lf, author_idx_schema)
-        logger.info("✓ author_idx schema validated")
-    except FileNotFoundError:
-        author_idx_lf = None
-        logger.info("No author_idx artifact found; prior_author_indices will not be written")
-
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
     # Log input sizes (collect counts efficiently)
     n_likes = likes_lf.select(pl.len()).collect().item()
-    n_targets = targets_lf.select(pl.len()).collect().item()
-    logger.info(f"Input sizes: {n_likes:,} likes, {n_targets:,} targets")
+    logger.info(f"Input: {n_likes:,} likes")
 
     # === Build user history directory ===
-    log_operation_start('Build user history directory', 'STAGE_03_USER_HISTORY', logger)
+    log_operation_start('Build user history directory', 'STAGE_02_USER_HISTORY', logger)
 
     directory_lf = _build_user_history_directory(
-        targets_lf=targets_lf,
         likes_lf=likes_lf,
         max_prior_likes=max_prior_likes,
         logger=logger,
-        history_buffer_hours=history_buffer_hours,
-        author_idx_lf=author_idx_lf,
     )
 
     mem_tracker.checkpoint("after_build_history", quiet=True)
 
     # === Write output ===
-    log_operation_start('Write user history directory', 'STAGE_03_USER_HISTORY', logger)
+    log_operation_start('Write user history directory', 'STAGE_02_USER_HISTORY', logger)
 
     # Collect using the streaming engine so that the intermediate fan-out join
     # is processed in batches rather than fully materialised in memory.
@@ -449,27 +343,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
     # Select only the required persisted output columns. Author history is
-    # optional so older Stage 2 outputs can still feed Stage 3 when the Stage 4
-    # author embedding feature is not being used.
-    output_columns = ["target_did", "like_uri", "prior_emb_indices"]
-    if author_idx_lf is not None:
-        output_columns.append("prior_author_indices")
-    user_history_df = directory_df.select(output_columns)
+    # optional so user-history outputs without author columns can still feed
+    # training when the author embedding feature is not being used.
     user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
-    user_history_df.write_parquet(user_history_output_path, compression="zstd")
+    directory_df.write_parquet(user_history_output_path, compression="zstd")
 
     n_output = len(directory_df)
-
-    # Sanity check: history_posts must have exactly the same number of rows as target_posts
-    if n_output != n_targets:
-        logger.error(
-            f"Row count mismatch! history_posts has {n_output:,} rows but "
-            f"target_posts has {n_targets:,} rows. These should be 1:1."
-        )
-        raise ValueError(
-            f"history_posts row count ({n_output:,}) != target_posts row count ({n_targets:,})"
-        )
-    logger.info(f"✓ Row count check passed: {n_output:,} history rows == {n_targets:,} target rows")
 
     n_with_history = directory_df.filter(pl.col("prior_emb_indices").list.len() > 0).height
     n_empty_history = n_output - n_with_history
@@ -496,15 +375,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: user_history",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: max_prior_likes={max_prior_likes}, history_buffer_hours={history_buffer_hours}",
-        f"inputs: likes_core ({n_likes:,}), target_posts ({n_targets:,})",
+        f"settings: max_prior_likes={max_prior_likes}",
+        f"inputs: likes_core ({n_likes:,})",
         f"outputs: user_history_directory ({n_output:,} entries)",
         f"stats: with_history={n_with_history:,}, empty_history={n_empty_history:,}",
         f"stats: mean_prior={mean_prior:.1f}, max_prior={max_prior}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 
-    logger.info(f"Stage 3 (user_history) completed in {runtime:.2f}s")
+    logger.info(f"Stage 2 (user_history) completed in {runtime:.2f}s")
 
     return {
         'output_dir': out_dir,

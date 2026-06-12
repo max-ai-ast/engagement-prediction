@@ -4,8 +4,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
-stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
+stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_tower")
 
 
 class _RecordingTracker:
@@ -23,28 +22,42 @@ class _RecordingTracker:
         )
 
 
-class _TinySummarizedDataset(Dataset):
+class _TinyBucketedDataset(Dataset):
     def __init__(self, embed_dim: int) -> None:
-        self.features = torch.tensor(
-            [
-                [1.0, 0.5, 0.2, 0.1, 0.9, 0.3, 0.1, 0.0],
-                [0.8, 0.2, 0.4, 0.7, 0.1, 0.9, 0.3, 0.2],
-                [0.2, 0.9, 0.7, 0.3, 0.4, 0.2, 0.8, 0.6],
-                [0.3, 0.1, 0.9, 0.8, 0.6, 0.7, 0.2, 0.4],
-            ],
-            dtype=torch.float32,
-        )
-        self.labels = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.float32)
-        assert self.features.shape[1] == 2 * embed_dim
+        self.batches = [
+            {
+                "history_embeddings": torch.tensor(
+                    [
+                        [[1.0, 0.5, 0.2, 0.1], [0.8, 0.2, 0.4, 0.7]],
+                        [[0.2, 0.9, 0.7, 0.3], [0.3, 0.1, 0.9, 0.8]],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "history_mask": torch.ones(2, 2, dtype=torch.bool),
+                "candidate_post_embeddings": torch.tensor(
+                    [
+                        [1.0, 0.0, 0.2, 0.4],
+                        [0.3, 0.8, 0.6, 0.1],
+                        [0.2, 0.4, 0.9, 0.5],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "label_matrix": torch.tensor(
+                    [
+                        [1.0, 0.0, 1.0],
+                        [0.0, 1.0, 0.0],
+                    ],
+                    dtype=torch.float32,
+                ),
+            }
+        ]
+        assert self.batches[0]["history_embeddings"].shape[-1] == embed_dim
 
     def __len__(self) -> int:
-        return len(self.labels)
+        return len(self.batches)
 
     def __getitem__(self, idx: int):
-        return {
-            "features": self.features[idx],
-            "label": self.labels[idx],
-        }
+        return self.batches[idx]
 
 
 def _scalar_calls_by_series(calls, series: str):
@@ -52,12 +65,14 @@ def _scalar_calls_by_series(calls, series: str):
 
 
 def test_train_mlp_model_logs_epoch_metrics_to_tracker(tmp_path):
+    stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
     torch.manual_seed(0)
     embed_dim = 4
     tracker = _RecordingTracker()
-    dataset = _TinySummarizedDataset(embed_dim=embed_dim)
-    train_loader = DataLoader(dataset, batch_size=2, shuffle=False)
-    val_loader = DataLoader(dataset, batch_size=2, shuffle=False)
+    dataset = _TinyBucketedDataset(embed_dim=embed_dim)
+    train_loader = DataLoader(dataset, batch_size=None, shuffle=False)
+    val_loader = DataLoader(dataset, batch_size=None, shuffle=False)
+    val_unseen_loader = DataLoader(dataset, batch_size=None, shuffle=False)
 
     model = stage_train_mlp.MLPModel(
         post_embedding_dim=embed_dim,
@@ -70,12 +85,15 @@ def test_train_mlp_model_logs_epoch_metrics_to_tracker(tmp_path):
         max_history_len=4,
         attention_dropout=0.0,
         user_encoder_type="summarized",
+        user_summarization="mean",
+        ema_alpha=0.1,
     )
 
     results = stage_train_mlp.train_mlp_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        val_unseen_loader=val_unseen_loader,
         device="cpu",
         epochs=2,
         learning_rate=1e-3,
@@ -87,24 +105,30 @@ def test_train_mlp_model_logs_epoch_metrics_to_tracker(tmp_path):
         checkpoints_dir=tmp_path,
         disable_progress=True,
         gradient_clip_max_norm=1.0,
+        embed_dim=embed_dim,
+        metrics_top_ks=[1, 2],
         experiment_tracker=tracker,
     )
 
-    assert len(results["history"]["train_auc"]) == 2
-    assert len(tracker.calls) == 8
+    assert len(results["history"]["train_ndcg@1"]) == 2
+    assert results["primary_metric_name"] == "ndcg@1"
+    assert len(tracker.calls) == 48
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Loss")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train AUC")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation AUC")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Loss")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train ndcg@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation ndcg@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users ndcg@1")] == [1, 2]
 
 
 def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
     torch.manual_seed(0)
     embed_dim = 4
     tracker = _RecordingTracker()
-    dataset = _TinySummarizedDataset(embed_dim=embed_dim)
-    train_loader = DataLoader(dataset, batch_size=2, shuffle=False)
-    val_loader = DataLoader(dataset, batch_size=2, shuffle=False)
+    dataset = _TinyBucketedDataset(embed_dim=embed_dim)
+    train_loader = DataLoader(dataset, batch_size=None, shuffle=False)
+    val_loader = DataLoader(dataset, batch_size=None, shuffle=False)
+    val_unseen_loader = DataLoader(dataset, batch_size=None, shuffle=False)
 
     model = stage_train_two_tower.TwoTowerModel(
         post_embedding_dim=embed_dim,
@@ -117,14 +141,15 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
         dropout_rate=0.0,
         l2_normalize_embeddings=True,
         similarity_temperature=1.0,
-        user_encoder_type="summarized",
-        use_post_encoder=False,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
     )
 
     results = stage_train_two_tower.train_two_tower_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        val_unseen_loader=val_unseen_loader,
         device="cpu",
         epochs=2,
         learning_rate=1e-3,
@@ -137,12 +162,110 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
         lr_scheduler_patience=2,
         gradient_clip_max_norm=1.0,
         embed_dim=embed_dim,
+        metrics_top_ks=[1, 2],
         experiment_tracker=tracker,
     )
 
-    assert len(results["history"]["train_auc"]) == 2
-    assert len(tracker.calls) == 8
+    assert len(results["history"]["train_ndcg@1"]) == 2
+    assert results["primary_metric_name"] == "ndcg@1"
+    assert len(tracker.calls) == 48
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Loss")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train AUC")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation AUC")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Loss")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train ndcg@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation ndcg@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users ndcg@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train NDCG@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation NDCG@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users NDCG@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train NDCG@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation NDCG@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users NDCG@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Recall@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Recall@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Recall@1")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Recall@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Recall@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Recall@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline NDCG@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline NDCG@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline NDCG@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline Recall@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline Recall@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline Recall@1")] == [1]
+
+
+def test_two_tower_logs_final_classification_metrics_by_split():
+    tracker = _RecordingTracker()
+
+    stage_train_two_tower.log_final_classification_metrics(
+        tracker,
+        {
+            "train": {"auc_roc": 0.75, "average_precision": 0.50},
+            "val": {"auc_roc": None, "average_precision": float("nan")},
+            "holdout_unseen_users": {"auc_roc": 0.80},
+        },
+        iteration=3,
+    )
+
+    assert len(tracker.calls) == 3
+    assert tracker.calls[0] == {
+        "title": "Final AUC-ROC by Split",
+        "series": "Train AUC-ROC",
+        "value": 0.75,
+        "iteration": 3,
+    }
+    assert tracker.calls[1] == {
+        "title": "Final Average Precision by Split",
+        "series": "Train Average Precision",
+        "value": 0.50,
+        "iteration": 3,
+    }
+    assert tracker.calls[2] == {
+        "title": "Final AUC-ROC by Split",
+        "series": "Holdout Unseen Users AUC-ROC",
+        "value": 0.80,
+        "iteration": 3,
+    }
+
+
+def test_mlp_logs_final_classification_metrics_by_split():
+    stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
+    tracker = _RecordingTracker()
+
+    stage_train_mlp.log_final_classification_metrics(
+        tracker,
+        {
+            "val_unseen_users": {"auc_roc": 0.81, "average_precision": 0.62},
+        },
+        iteration=2,
+    )
+
+    assert tracker.calls == [
+        {
+            "title": "Final AUC-ROC by Split",
+            "series": "Val Unseen Users AUC-ROC",
+            "value": 0.81,
+            "iteration": 2,
+        },
+        {
+            "title": "Final Average Precision by Split",
+            "series": "Val Unseen Users Average Precision",
+            "value": 0.62,
+            "iteration": 2,
+        },
+    ]
+
+
+def test_two_tower_stage_info_metric_lines_include_final_classification_metrics():
+    lines = stage_train_two_tower.stage_info_metric_lines({
+        "train": {"auc_roc": 0.75, "average_precision": 0.50},
+        "val": {"auc_roc": None, "average_precision": float("nan")},
+        "holdout_unseen_users": {"auc_roc": 0.80},
+    })
+
+    assert lines == [
+        "train_auc_roc: 0.7500",
+        "train_average_precision: 0.5000",
+        "holdout_unseen_users_auc_roc: 0.8000",
+    ]

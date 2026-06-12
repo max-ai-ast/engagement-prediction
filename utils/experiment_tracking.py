@@ -23,6 +23,9 @@ class ExperimentTracker(Protocol):
     def log_artifact(self, name: str, path: Path) -> None:
         ...
 
+    def log_file_artifact(self, name: str, path: Path) -> Any:
+        ...
+
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         ...
 
@@ -62,6 +65,9 @@ class NoOpExperimentTracker:
         return None
 
     def log_artifact(self, name: str, path: Path) -> None:
+        return None
+
+    def log_file_artifact(self, name: str, path: Path) -> None:
         return None
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
@@ -224,6 +230,12 @@ class ClearMLExperimentTracker:
         om.set_metadata("git_sha", getattr(script, "version_num", ""))
 
         return om.id
+
+    def log_file_artifact(self, name: str, path: Path) -> Any:
+        p = Path(path)
+        if not p.exists():
+            return None
+        return self._task.upload_artifact(name=name, artifact_object=str(p))
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         normalized = normalize_params(params)

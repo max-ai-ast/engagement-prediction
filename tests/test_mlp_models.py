@@ -1,904 +1,279 @@
-"""Comprehensive tests for MLP model architectures."""
+"""Tests for matrix-native MLP ranking models."""
 import importlib
+
 import pytest
 import torch
 import torch.nn as nn
 
-# Import from module with numeric prefix
-stage_train_mlp = importlib.import_module("utils.04_train.stage_train_mlp")
+from utils.matrix_ranking import ranking_rows_for_batch
+
+stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
 MLPModel = stage_train_mlp.MLPModel
 CrossAttentionPoolingEncoder = stage_train_mlp.CrossAttentionPoolingEncoder
 
 
-# =============================================================================
-# MLPModel (summarized) Tests
-# =============================================================================
+def _make_mlp(
+    *,
+    embed_dim: int = 4,
+    user_encoder_type: str = "summarized",
+    user_summarization: str = "mean",
+    use_author_embedding_table: bool = False,
+) -> MLPModel:
+    return MLPModel(
+        post_embedding_dim=embed_dim,
+        hidden_dims=[8],
+        dropout_rate=0.0,
+        user_hidden_dim=8,
+        user_output_dim=embed_dim,
+        num_attention_heads=2,
+        num_attention_layers=1,
+        max_history_len=4,
+        attention_dropout=0.0,
+        user_encoder_type=user_encoder_type,
+        user_summarization=user_summarization,
+        ema_alpha=0.5,
+        use_author_embedding_table=use_author_embedding_table,
+        author_table_num_rows=6 if use_author_embedding_table else None,
+        author_embedding_dim=3 if use_author_embedding_table else None,
+        author_unknown_dropout_rate=0.0,
+    )
+
+
+def _matrix_batch() -> dict:
+    return {
+        "history_embeddings": torch.tensor(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0], [0.0, 0.0, 0.0, 0.0]],
+                [[4.0, 3.0, 2.0, 1.0], [1.0, 3.0, 5.0, 7.0], [9.0, 9.0, 9.0, 9.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        "history_mask": torch.tensor(
+            [
+                [True, True, False],
+                [True, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        "candidate_post_embeddings": torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0, 0.0],
+                [0.5, 0.5, 0.5, 0.5],
+            ],
+            dtype=torch.float32,
+        ),
+        "label_matrix": torch.tensor(
+            [
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+        "user_id": ["u1", "u2"],
+        "bucket": "2026-05-01T00:00:00Z",
+    }
+
+
+def _matrix_batch_with_authors() -> dict:
+    batch = _matrix_batch()
+    batch["history_author_indices"] = torch.tensor(
+        [
+            [2, 3, 0],
+            [4, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    batch["candidate_post_author_idx"] = torch.tensor([2, 3, 5], dtype=torch.long)
+    return batch
+
 
 def test_summarized_mlp_initialization():
-    """Test summarized MLPModel initializes with correct architecture."""
-    model = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[512, 256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=384,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-    
-    # Check model has the expected structure
+    model = _make_mlp(embed_dim=384)
+
     assert isinstance(model.mlp_head, nn.Sequential)
-    
-    # Count linear layers (should be len(hidden_dims) + 1 for output)
     linear_layers = [m for m in model.mlp_head.modules() if isinstance(m, nn.Linear)]
-    assert len(linear_layers) == 4  # 3 hidden + 1 output
+    assert len(linear_layers) == 2
 
 
-def test_summarized_mlp_forward_shape():
-    """Test summarized MLPModel forward pass produces correct output shape."""
-    batch_size = 16
-    embed_dim = 384
-    
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[512, 256],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=embed_dim,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
+def test_mlp_score_matrix_shape_and_raw_logits():
+    model = _make_mlp()
+    model.eval()
+    batch = _matrix_batch()
+
+    logits = model.score_matrix(
+        batch["history_embeddings"],
+        batch["history_mask"],
+        batch["candidate_post_embeddings"],
     )
-    
-    history_embeddings = torch.randn(batch_size, 1, embed_dim)
-    history_mask = torch.ones(batch_size, 1, dtype=torch.bool)
-    post_embedding = torch.randn(batch_size, embed_dim)
-    
-    # Forward pass
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    
-    # Check output shape and range
-    assert output.shape == (batch_size, 1)
-    assert output.dtype == torch.float32
-    assert (output >= 0).all() and (output <= 1).all(), "Output should be in [0, 1] due to sigmoid"
+
+    assert logits.shape == (2, 3)
+    assert logits.dtype == torch.float32
 
 
-def test_summarized_mlp_single_hidden_layer():
-    """Test summarized MLPModel with single hidden layer."""
-    embed_dim = 128
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[128],
-        dropout_rate=0.2,
-        user_hidden_dim=64,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-    
-    history_embeddings = torch.randn(8, 1, embed_dim)
-    history_mask = torch.ones(8, 1, dtype=torch.bool)
-    post_embedding = torch.randn(8, embed_dim)
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    
-    assert output.shape == (8, 1)
+def test_mlp_compute_loss_and_preds_matrix_multi_positive_rows():
+    model = _make_mlp()
+    batch = _matrix_batch()
 
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)
 
-def test_summarized_mlp_multiple_hidden_layers():
-    """Test summarized MLPModel with multiple hidden layers."""
-    embed_dim = 512
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[512, 256, 128, 64],
-        dropout_rate=0.4,
-        user_hidden_dim=256,
-        user_output_dim=embed_dim,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-    
-    history_embeddings = torch.randn(4, 1, embed_dim)
-    history_mask = torch.ones(4, 1, dtype=torch.bool)
-    post_embedding = torch.randn(4, embed_dim)
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    
-    assert output.shape == (4, 1)
-
-
-def test_summarized_mlp_compute_loss_and_preds():
-    """Test summarized MLPModel compute_loss_and_preds method (features path)."""
-    embed_dim = 384
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=embed_dim,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-    
-    batch = {
-        "features": torch.randn(16, 2 * embed_dim),
-        "label": torch.randint(0, 2, (16,)).float(),
-    }
-    
-    device = "cpu"
-    loss, preds = model.compute_loss_and_preds(batch, device)
-    
-    # Check loss is a scalar
     assert loss.shape == ()
-    assert loss.dtype == torch.float32
-    assert loss.item() >= 0, "BCE loss should be non-negative"
-    
-    # Check predictions shape and range
-    assert preds.shape == (16,)
-    assert (preds >= 0).all() and (preds <= 1).all()
+    assert torch.isfinite(loss)
+    assert scores.shape == batch["label_matrix"].shape
 
 
-def test_summarized_mlp_compute_loss_and_preds_empty_history_uses_empty_embedding():
-    """Empty-history summarized batches should route through the cold-start embedding."""
+def test_summarized_mean_outputs_expected_masked_history_summary():
+    model = _make_mlp(user_summarization="mean")
+    batch = _matrix_batch()
+
+    summary = model.encode_user(batch["history_embeddings"], batch["history_mask"])
+
+    assert torch.allclose(summary[0], torch.tensor([1.5, 3.0, 4.5, 6.0]))
+    assert torch.allclose(summary[1], torch.tensor([4.0, 3.0, 2.0, 1.0]))
+
+
+def test_summarized_ema_outputs_expected_masked_history_summary():
+    model = _make_mlp(user_summarization="ema")
+    batch = _matrix_batch()
+
+    summary = model.encode_user(batch["history_embeddings"], batch["history_mask"])
+
+    expected = (0.5 * batch["history_embeddings"][0, 0] + 0.25 * batch["history_embeddings"][0, 1]) / 0.75
+    assert torch.allclose(summary[0], expected)
+
+
+def test_summarized_linear_recency_outputs_expected_masked_history_summary():
+    model = _make_mlp(user_summarization="linear_recency")
+    batch = _matrix_batch()
+
+    summary = model.encode_user(batch["history_embeddings"], batch["history_mask"])
+
+    expected = (3.0 * batch["history_embeddings"][0, 0] + 2.0 * batch["history_embeddings"][0, 1]) / 5.0
+    assert torch.allclose(summary[0], expected)
+
+
+def test_all_positive_candidate_rows_have_valid_ap_and_undefined_auc():
+    batch = _matrix_batch()
+    labels = torch.ones((2, 3), dtype=torch.float32)
+    scores = torch.tensor(
+        [
+            [0.9, 0.2, 0.1],
+            [0.4, 0.5, 0.6],
+        ],
+        dtype=torch.float32,
+    )
+
+    rows = ranking_rows_for_batch(batch, scores, labels, [1, 2])
+
+    assert rows[0]["average_precision"] == pytest.approx(1.0)
+    assert rows[0]["auc_roc"] is None
+    assert rows[0]["recall@2"] == pytest.approx(2.0 / 3.0)
+
+
+def test_cross_attention_mlp_uses_learned_sequence_encoder_for_matrix_batches():
+    model = _make_mlp(user_encoder_type="cross_attention")
+    batch = _matrix_batch()
+
+    assert isinstance(model.user_encoder, CrossAttentionPoolingEncoder)
+    loss, scores = model.compute_loss_and_preds(batch, "cpu", embed_dim=4)
+
+    assert torch.isfinite(loss)
+    assert scores.shape == (2, 3)
+
+
+def test_mlp_author_embeddings_affect_history_and_candidate_paths():
     torch.manual_seed(0)
-    embed_dim = 16
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[],
-        dropout_rate=0.0,
-        user_hidden_dim=32,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=10,
-        attention_dropout=0.0,
-        user_encoder_type="summarized",
-    )
+    model = _make_mlp(use_author_embedding_table=True)
     model.eval()
+    batch = _matrix_batch_with_authors()
 
-    batch_size = 8
-    user_summary = torch.zeros(batch_size, embed_dim)
-    post_embedding = torch.randn(batch_size, embed_dim)
-    features = torch.cat([user_summary, post_embedding], dim=1)
-    batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
-
-    with torch.no_grad():
-        model.user_encoder.empty_user_embedding.fill_(0.1)
-    _, preds1 = model.compute_loss_and_preds(batch, device="cpu")
-
-    with torch.no_grad():
-        model.user_encoder.empty_user_embedding.fill_(0.2)
-    _, preds2 = model.compute_loss_and_preds(batch, device="cpu")
-
-    assert not torch.allclose(preds1, preds2), "Predictions should depend on the cold-start embedding for empty histories"
-
-
-def test_summarized_mlp_compute_loss_and_preds_non_empty_history_ignores_empty_embedding():
-    """Non-empty summarized batches should ignore the cold-start embedding."""
-    torch.manual_seed(0)
-    embed_dim = 16
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[],
-        dropout_rate=0.0,
-        user_hidden_dim=32,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=10,
-        attention_dropout=0.0,
-        user_encoder_type="summarized",
+    scores_1 = model.score_matrix(
+        batch["history_embeddings"],
+        batch["history_mask"],
+        batch["candidate_post_embeddings"],
+        batch["history_author_indices"],
+        batch["candidate_post_author_idx"],
     )
-    model.eval()
-
-    batch_size = 8
-    user_summary = torch.ones(batch_size, embed_dim)
-    post_embedding = torch.randn(batch_size, embed_dim)
-    features = torch.cat([user_summary, post_embedding], dim=1)
-    batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
-
-    with torch.no_grad():
-        model.user_encoder.empty_user_embedding.fill_(0.1)
-    _, preds1 = model.compute_loss_and_preds(batch, device="cpu")
-
-    with torch.no_grad():
-        model.user_encoder.empty_user_embedding.fill_(0.2)
-    _, preds2 = model.compute_loss_and_preds(batch, device="cpu")
-
-    assert torch.allclose(preds1, preds2), "Predictions should not depend on the cold-start embedding when history exists"
-
-
-def test_summarized_mlp_backward_pass():
-    """Test summarized MLPModel gradients flow correctly."""
-    embed_dim = 128
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[128, 64],
-        dropout_rate=0.2,
-        user_hidden_dim=64,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
+    changed_batch = dict(batch)
+    changed_batch["history_author_indices"] = torch.tensor(
+        [
+            [5, 3, 0],
+            [4, 0, 0],
+        ],
+        dtype=torch.long,
     )
-    
-    history_embeddings = torch.randn(8, 1, embed_dim)
-    history_mask = torch.ones(8, 1, dtype=torch.bool)
-    post_embedding = torch.randn(8, embed_dim)
-    labels = torch.randint(0, 2, (8,)).float()
-    
-    # Forward
-    output = model.forward(history_embeddings, history_mask, post_embedding).squeeze(-1)
-    loss = nn.functional.binary_cross_entropy(output, labels)
-    
-    # Backward
-    loss.backward()
-    
-    # Check gradients exist
-    for param in model.parameters():
-        assert param.grad is not None, "All parameters should have gradients"
-
-
-def test_summarized_mlp_eval_mode():
-    """Test summarized MLPModel behaves differently in eval mode (dropout)."""
-    embed_dim = 128
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[128],
-        dropout_rate=0.5,  # High dropout for testing
-        user_hidden_dim=64,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
+    changed_batch["candidate_post_author_idx"] = torch.tensor([2, 5, 5], dtype=torch.long)
+    scores_2 = model.score_matrix(
+        changed_batch["history_embeddings"],
+        changed_batch["history_mask"],
+        changed_batch["candidate_post_embeddings"],
+        changed_batch["history_author_indices"],
+        changed_batch["candidate_post_author_idx"],
     )
-    
-    history_embeddings = torch.randn(16, 1, embed_dim)
-    history_mask = torch.ones(16, 1, dtype=torch.bool)
-    post_embedding = torch.randn(16, embed_dim)
-    
-    # Train mode - run multiple times, should get different results
-    model.train()
-    outputs_train = [model.forward(history_embeddings, history_mask, post_embedding) for _ in range(3)]
-    
-    # Eval mode - should be deterministic
-    model.eval()
-    with torch.no_grad():
-        outputs_eval = [model.forward(history_embeddings, history_mask, post_embedding) for _ in range(3)]
-    
-    # Eval outputs should be identical
-    for i in range(len(outputs_eval) - 1):
-        assert torch.allclose(outputs_eval[i], outputs_eval[i + 1])
+
+    assert not torch.allclose(scores_1, scores_2)
 
 
-def test_summarized_mlp_zero_dropout():
-    """Test summarized MLPModel with zero dropout."""
-    embed_dim = 128
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[128, 64],
-        dropout_rate=0.0,
-        user_hidden_dim=64,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-    
-    history_embeddings = torch.randn(8, 1, embed_dim)
-    history_mask = torch.ones(8, 1, dtype=torch.bool)
-    post_embedding = torch.randn(8, embed_dim)
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    
-    assert output.shape == (8, 1)
+def test_mlp_author_embeddings_require_author_indices():
+    model = _make_mlp(use_author_embedding_table=True)
+    batch = _matrix_batch()
+
+    with pytest.raises(RuntimeError, match="history_author_indices"):
+        model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)
+
+
+def test_mlp_compute_loss_and_preds_with_author_embeddings():
+    model = _make_mlp(use_author_embedding_table=True)
+    batch = _matrix_batch_with_authors()
+
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)
+
+    assert torch.isfinite(loss)
+    assert scores.shape == batch["label_matrix"].shape
+
 
 def test_summarized_mlp_torchscript():
-    """Test summarized MLPModel can be TorchScript scripted (serving artifact)."""
-    embed_dim = 128
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[64],
-        dropout_rate=0.1,
-        user_hidden_dim=64,
-        user_output_dim=embed_dim,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-
-    scripted = torch.jit.script(model)
-    history_embeddings = torch.randn(4, 1, embed_dim)
-    history_mask = torch.ones(4, 1, dtype=torch.bool)
-    post_embedding = torch.randn(4, embed_dim)
-    out = scripted(history_embeddings, history_mask, post_embedding)
-    assert out.shape == (4, 1)
-
-def test_full_transformer_mlp_torchscript_no_sdpa():
-    """TorchScript for full_transformer should avoid aten::scaled_dot_product_attention (Triton compatibility)."""
-    embed_dim = 128
-    seq_len = 10
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[64],
-        dropout_rate=0.1,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-
-    scripted = torch.jit.script(model)
-    assert "scaled_dot_product_attention" not in scripted.code
-
-    history_embeddings = torch.randn(2, seq_len, embed_dim)
-    history_mask = torch.ones(2, seq_len, dtype=torch.bool)
-    post_embedding = torch.randn(2, embed_dim)
-    out = scripted(history_embeddings, history_mask, post_embedding)
-    assert out.shape == (2, 1)
-
-
-def test_cross_attention_mlp_initialization():
-    """Test cross_attention MLPModel initializes with the efficient sequence encoder."""
-    model = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="cross_attention",
-    )
-
-    assert model.post_embedding_dim == 384
-    assert model.user_output_dim == 128
-    assert isinstance(model.user_encoder, CrossAttentionPoolingEncoder)
-    assert isinstance(model.mlp_head, nn.Sequential)
-
-
-def test_cross_attention_mlp_forward_shape():
-    """Test cross_attention MLPModel forward pass produces correct output shape."""
-    batch_size = 16
-    seq_len = 50
-    embed_dim = 384
-
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="cross_attention",
-    )
-
-    history_embeddings = torch.randn(batch_size, seq_len, embed_dim)
-    history_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-    post_embedding = torch.randn(batch_size, embed_dim)
-
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-
-    assert output.shape == (batch_size, 1)
-    assert output.dtype == torch.float32
-    assert (output >= 0).all() and (output <= 1).all(), "Output should be in [0, 1]"
-
-
-def test_cross_attention_mlp_compute_loss_and_preds():
-    """Test cross_attention MLPModel compute_loss_and_preds uses sequence batches."""
-    model = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="cross_attention",
-    )
-
-    batch_size = 16
-    batch = {
-        "history_embeddings": torch.randn(batch_size, 50, 384),
-        "history_mask": torch.ones(batch_size, 50, dtype=torch.bool),
-        "target_post_embedding": torch.randn(batch_size, 384),
-        "label": torch.randint(0, 2, (batch_size,)).float(),
-    }
-
-    loss, preds = model.compute_loss_and_preds(batch, "cpu")
-
-    assert loss.shape == ()
-    assert loss.dtype == torch.float32
-    assert loss.item() >= 0
-    assert preds.shape == (batch_size,)
-    assert (preds >= 0).all() and (preds <= 1).all()
-
-
-def test_cross_attention_mlp_torchscript():
-    """Test cross_attention MLPModel can be TorchScript scripted for serving."""
-    embed_dim = 128
-    seq_len = 10
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[64],
-        dropout_rate=0.1,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="cross_attention",
-    )
-
-    scripted = torch.jit.script(model)
-    assert "scaled_dot_product_attention" not in scripted.code
-
-    history_embeddings = torch.randn(2, seq_len, embed_dim)
-    history_mask = torch.ones(2, seq_len, dtype=torch.bool)
-    post_embedding = torch.randn(2, embed_dim)
-    out = scripted(history_embeddings, history_mask, post_embedding)
-    assert out.shape == (2, 1)
-
-# =============================================================================
-# MLPModel (full_transformer) Tests
-# =============================================================================
-
-def test_attention_mlp_initialization():
-    """Test full_transformer MLPModel initializes correctly."""
-    model = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    assert model.post_embedding_dim == 384
-    assert model.user_output_dim == 128
-    assert hasattr(model, "user_encoder")
-    assert hasattr(model, "mlp_head")
-    assert isinstance(model.mlp_head, nn.Sequential)
-
-
-def test_attention_mlp_forward_shape():
-    """Test full_transformer MLPModel forward pass produces correct output shape."""
-    batch_size = 16
-    seq_len = 50
-    embed_dim = 384
-    
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    # Create random inputs
-    history_embeddings = torch.randn(batch_size, seq_len, embed_dim)
-    history_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-    post_embedding = torch.randn(batch_size, embed_dim)
-    
-    # Forward pass
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    
-    # Check output shape and range
-    assert output.shape == (batch_size, 1)
-    assert output.dtype == torch.float32
-    assert (output >= 0).all() and (output <= 1).all(), "Output should be in [0, 1]"
-
-
-def test_attention_mlp_with_mask():
-    """Test full_transformer MLPModel correctly uses history mask."""
-    batch_size = 8
-    seq_len = 20
-    embed_dim = 128
-    
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[64],
-        dropout_rate=0.2,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    # Create inputs with partial masking
-    history_embeddings = torch.randn(batch_size, seq_len, embed_dim)
-    history_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-    history_mask[:, :10] = True  # Only first 10 positions valid
-    post_embedding = torch.randn(batch_size, embed_dim)
-    
-    # Should run without error
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    assert output.shape == (batch_size, 1)
-
-
-def test_attention_mlp_empty_history():
-    """Test full_transformer MLPModel with empty history (all-False mask)."""
-    batch_size = 4
-    seq_len = 20
-    embed_dim = 128
-    
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[64],
-        dropout_rate=0.2,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    # Empty history - all zeros with all-False mask
-    history_embeddings = torch.zeros(batch_size, seq_len, embed_dim)
-    history_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-    post_embedding = torch.randn(batch_size, embed_dim)
-    
-    # Should handle gracefully
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    assert output.shape == (batch_size, 1)
-    assert torch.isfinite(output).all(), "Output should be finite even with empty history"
-
-
-def test_attention_mlp_compute_loss_and_preds():
-    """Test full_transformer MLPModel compute_loss_and_preds method."""
-    model = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    batch_size = 16
-    batch = {
-        "history_embeddings": torch.randn(batch_size, 50, 384),
-        "history_mask": torch.ones(batch_size, 50, dtype=torch.bool),
-        "target_post_embedding": torch.randn(batch_size, 384),
-        "label": torch.randint(0, 2, (batch_size,)).float(),
-    }
-    
-    device = "cpu"
-    loss, preds = model.compute_loss_and_preds(batch, device)
-    
-    # Check loss is a scalar
-    assert loss.shape == ()
-    assert loss.dtype == torch.float32
-    assert loss.item() >= 0, "BCE loss should be non-negative"
-    
-    # Check predictions shape and range
-    assert preds.shape == (batch_size,)
-    assert (preds >= 0).all() and (preds <= 1).all()
-
-
-def test_attention_mlp_different_sequence_lengths():
-    """Test full_transformer MLPModel with different sequence lengths via masking."""
-    batch_size = 8
-    seq_len = 30
-    embed_dim = 128
-    
-    model = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[64],
-        dropout_rate=0.2,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=seq_len,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    history_embeddings = torch.randn(batch_size, seq_len, embed_dim)
-    
-    # Create masks with different lengths
-    history_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-    for i in range(batch_size):
-        valid_len = (i + 1) * 3  # Varying lengths: 3, 6, 9, ...
-        history_mask[i, :min(valid_len, seq_len)] = True
-    
-    post_embedding = torch.randn(batch_size, embed_dim)
-    
-    output = model.forward(history_embeddings, history_mask, post_embedding)
-    assert output.shape == (batch_size, 1)
-    assert torch.isfinite(output).all()
-
-
-def test_attention_mlp_backward_pass():
-    """Test full_transformer MLPModel gradients flow correctly."""
-    model = MLPModel(
-        post_embedding_dim=128,
-        hidden_dims=[64],
-        dropout_rate=0.2,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    batch_size = 8
-    history_embeddings = torch.randn(batch_size, 20, 128)
-    history_mask = torch.ones(batch_size, 20, dtype=torch.bool)
-    post_embedding = torch.randn(batch_size, 128)
-    labels = torch.randint(0, 2, (batch_size,)).float()
-    
-    # Forward
-    output = model.forward(history_embeddings, history_mask, post_embedding).squeeze(-1)
-    loss = nn.functional.binary_cross_entropy(output, labels)
-    
-    # Backward
-    loss.backward()
-    
-    # Check gradients exist in both encoder and MLP
-    for name, param in model.named_parameters():
-        # `empty_history_embedding` is only used when an example has an empty history
-        # (all-masked). For fully non-empty batches, it's expected to have no grad.
-        if "empty_history_embedding" in name:
-            continue
-        assert param.grad is not None, f"Parameter {name} should have gradient"
-
-
-def test_attention_mlp_eval_mode():
-    """Test full_transformer MLPModel behaves consistently in eval mode."""
-    model = MLPModel(
-        post_embedding_dim=128,
-        hidden_dims=[64],
-        dropout_rate=0.5,
-        user_hidden_dim=64,
-        user_output_dim=32,
-        num_attention_heads=2,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.3,
-        user_encoder_type="full_transformer",
-    )
-    
-    batch_size = 8
-    history_embeddings = torch.randn(batch_size, 20, 128)
-    history_mask = torch.ones(batch_size, 20, dtype=torch.bool)
-    post_embedding = torch.randn(batch_size, 128)
-    
-    # Eval mode - should be deterministic
+    model = _make_mlp()
     model.eval()
-    with torch.no_grad():
-        outputs_eval = [
-            model.forward(history_embeddings, history_mask, post_embedding)
-            for _ in range(3)
-        ]
-    
-    # All outputs should be identical
-    for i in range(len(outputs_eval) - 1):
-        assert torch.allclose(outputs_eval[i], outputs_eval[i + 1])
+    scripted = torch.jit.script(model)
+    batch = _matrix_batch()
 
-
-def test_attention_mlp_attention_heads():
-    """Test full_transformer MLPModel with different numbers of attention heads."""
-    embed_dim = 128
-    
-    for num_heads in [1, 2, 4, 8]:
-        # user_hidden_dim must be divisible by num_heads
-        user_hidden_dim = 64 if num_heads <= 4 else 128
-        
-        model = MLPModel(
-            post_embedding_dim=embed_dim,
-            hidden_dims=[64],
-            dropout_rate=0.2,
-            user_hidden_dim=user_hidden_dim,
-            user_output_dim=32,
-            num_attention_heads=num_heads,
-            num_attention_layers=1,
-            max_history_len=20,
-            attention_dropout=0.1,
-            user_encoder_type="full_transformer",
-        )
-        
-        history_embeddings = torch.randn(4, 20, embed_dim)
-        history_mask = torch.ones(4, 20, dtype=torch.bool)
-        post_embedding = torch.randn(4, embed_dim)
-        
-        output = model.forward(history_embeddings, history_mask, post_embedding)
-        assert output.shape == (4, 1)
-
-
-def test_attention_mlp_attention_layers():
-    """Test full_transformer MLPModel with different numbers of attention layers."""
-    embed_dim = 128
-    
-    for num_layers in [1, 2, 3, 4]:
-        model = MLPModel(
-            post_embedding_dim=embed_dim,
-            hidden_dims=[64],
-            dropout_rate=0.2,
-            user_hidden_dim=64,
-            user_output_dim=32,
-            num_attention_heads=2,
-            num_attention_layers=num_layers,
-            max_history_len=20,
-            attention_dropout=0.1,
-            user_encoder_type="full_transformer",
-        )
-        
-        history_embeddings = torch.randn(4, 20, embed_dim)
-        history_mask = torch.ones(4, 20, dtype=torch.bool)
-        post_embedding = torch.randn(4, embed_dim)
-        
-        output = model.forward(history_embeddings, history_mask, post_embedding)
-        assert output.shape == (4, 1)
-
-
-# =============================================================================
-# Comparison Tests
-# =============================================================================
-
-def test_models_different_architectures():
-    """Test that summarized and full_transformer variants have different parameter counts."""
-    summarized_mlp = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=384,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
-    )
-    
-    attention_mlp = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    # full_transformer variant should have more parameters due to encoder
-    summarized_params = sum(p.numel() for p in summarized_mlp.parameters())
-    attention_params = sum(p.numel() for p in attention_mlp.parameters())
-    
-    assert attention_params > summarized_params, "full_transformer variant should have more parameters"
-
-
-def test_cross_attention_mlp_fewer_params_than_full_transformer():
-    """Test cross_attention MLP has fewer params than full_transformer."""
-    full_transformer_mlp = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
+    output = scripted.forward(
+        batch["history_embeddings"],
+        batch["history_mask"],
+        batch["candidate_post_embeddings"],
     )
 
-    cross_attention_mlp = MLPModel(
-        post_embedding_dim=384,
-        hidden_dims=[256, 128],
-        dropout_rate=0.3,
-        user_hidden_dim=256,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        attention_dropout=0.1,
-        user_encoder_type="cross_attention",
+    assert output.shape == (2, 3)
+
+
+def test_author_aware_mlp_torchscript():
+    model = _make_mlp(use_author_embedding_table=True)
+    model.eval()
+    scripted = torch.jit.script(model)
+    batch = _matrix_batch_with_authors()
+
+    output = scripted.forward(
+        batch["history_embeddings"],
+        batch["history_mask"],
+        batch["candidate_post_embeddings"],
+        batch["history_author_indices"],
+        batch["candidate_post_author_idx"],
     )
 
-    full_transformer_params = sum(p.numel() for p in full_transformer_mlp.parameters())
-    cross_attention_params = sum(p.numel() for p in cross_attention_mlp.parameters())
-
-    assert cross_attention_params < full_transformer_params
+    assert output.shape == (2, 3)
 
 
-def test_models_output_same_type():
-    """Test that both models produce compatible outputs."""
-    embed_dim = 384
-    summarized_mlp = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[256],
-        dropout_rate=0.3,
-        user_hidden_dim=128,
-        user_output_dim=embed_dim,
-        num_attention_heads=4,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="summarized",
+def test_mlp_compute_loss_rejects_rows_without_positives():
+    model = _make_mlp()
+    batch = _matrix_batch()
+    batch["label_matrix"] = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
     )
-    
-    attention_mlp = MLPModel(
-        post_embedding_dim=embed_dim,
-        hidden_dims=[256],
-        dropout_rate=0.3,
-        user_hidden_dim=128,
-        user_output_dim=128,
-        num_attention_heads=4,
-        num_attention_layers=1,
-        max_history_len=20,
-        attention_dropout=0.1,
-        user_encoder_type="full_transformer",
-    )
-    
-    # Summarized output (summary token at position 0)
-    history1 = torch.randn(8, 1, embed_dim)
-    mask1 = torch.ones(8, 1, dtype=torch.bool)
-    post1 = torch.randn(8, embed_dim)
-    out1 = summarized_mlp.forward(history1, mask1, post1)
-    
-    # Full transformer output
-    history = torch.randn(8, 20, embed_dim)
-    mask = torch.ones(8, 20, dtype=torch.bool)
-    post = torch.randn(8, embed_dim)
-    out2 = attention_mlp.forward(history, mask, post)
-    
-    # Both should produce same shape and type
-    assert out1.shape == out2.shape
-    assert out1.dtype == out2.dtype
-    assert (out1 >= 0).all() and (out1 <= 1).all()
-    assert (out2 >= 0).all() and (out2 <= 1).all()
+
+    with pytest.raises(RuntimeError, match="at least one positive"):
+        model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)

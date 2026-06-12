@@ -99,6 +99,9 @@ class ColdStartCurvesModule(EvalModule):
         # --- hyperparams ---
         bin_edges = ctx.config.get('cold_start_bin_edges', self.DEFAULT_BIN_EDGES)
 
+        if ctx.has_ranking_rows:
+            return self._run_ranking_rows(ctx, bin_edges)
+
         # Require per-prediction history length
         if 'num_embedding_likes' not in ctx.predictions_df.columns:
             print("    Warning: num_embedding_likes not in predictions_df, skipping cold start analysis")
@@ -165,6 +168,73 @@ class ColdStartCurvesModule(EvalModule):
         summary_path = out_dir / "cold_start_summary.json"
         self.save_json(summary, summary_path)
 
+        return summary
+
+    def _run_ranking_rows(self, ctx: EvalContext, bin_edges: List[float]) -> Dict[str, Any]:
+        out_dir = self.get_output_dir(ctx)
+        ranking_rows_df = ctx.ranking_rows_df.copy()
+        ranking_rows_df['num_embedding_likes'] = ranking_rows_df['num_embedding_likes'].fillna(0).astype(int)
+
+        bin_labels = self._make_bin_labels(bin_edges)
+        ranking_rows_df['likes_bin'] = pd.cut(
+            ranking_rows_df['num_embedding_likes'],
+            bins=bin_edges,
+            labels=bin_labels,
+            right=False,
+        )
+
+        metric_cols = [
+            col for col in ranking_rows_df.columns
+            if col.startswith('ndcg@') or col.startswith('recall@') or col in ('average_precision', 'auc_roc')
+        ]
+        rows = []
+        for bin_label in bin_labels:
+            bin_data = ranking_rows_df[ranking_rows_df['likes_bin'] == bin_label]
+            if len(bin_data) == 0:
+                continue
+            row: Dict[str, Any] = {
+                'bin': str(bin_label),
+                'n_predictions': len(bin_data),
+                'n_ranking_rows': len(bin_data),
+                'n_users': bin_data['did'].nunique(),
+                'n_positive': int(bin_data['positive_count'].sum()),
+                'mean_embedding_likes': float(bin_data['num_embedding_likes'].mean()),
+                'mean_candidate_count': float(bin_data['candidate_count'].mean()),
+            }
+            for metric in metric_cols:
+                values = bin_data[metric].dropna()
+                row[metric] = float(values.mean()) if len(values) else float('nan')
+                row[f'{metric}_n'] = len(values)
+            rows.append(row)
+
+        binned_metrics = pd.DataFrame(rows)
+        binned_path = out_dir / "binned_metrics.csv"
+        binned_metrics.to_csv(binned_path, index=False)
+
+        plot_paths = {}
+        for metric in metric_cols:
+            n_col = f'{metric}_n'
+            if n_col not in binned_metrics.columns or binned_metrics[n_col].sum() == 0:
+                continue
+            plot_path = out_dir / f"{metric.replace('@', '_at_')}_cold_start.png"
+            self._plot_cold_start_per_metric(
+                metric=metric,
+                binned_metrics=binned_metrics,
+                save_path=plot_path,
+            )
+            plot_paths[f"{metric}_plot_path"] = str(plot_path)
+
+        dist_path = out_dir / "user_distribution_by_bin.png"
+        self._plot_distribution(ranking_rows_df, dist_path)
+        plot_paths['distribution_plot_path'] = str(dist_path)
+
+        summary = self._compute_summary_for_ranking_rows(ranking_rows_df, binned_metrics, metric_cols)
+        summary.update(plot_paths)
+        summary['binned_metrics_path'] = str(binned_path)
+        summary['bin_edges'] = [float(e) if e != float('inf') else 'inf' for e in bin_edges]
+
+        summary_path = out_dir / "cold_start_summary.json"
+        self.save_json(summary, summary_path)
         return summary
 
     # ------------------------------------------------------------------
@@ -418,6 +488,34 @@ class ColdStartCurvesModule(EvalModule):
             summary[f'{metric}_max_bin'] = str(binned_metrics['bin'].iloc[int(values.argmax())])
             summary[f'{metric}_improvement_first_to_last'] = float(values[-1] - values[0])
 
+        return summary
+
+    def _compute_summary_for_ranking_rows(
+        self,
+        ranking_rows_df: pd.DataFrame,
+        binned_metrics: pd.DataFrame,
+        metric_cols: List[str],
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            'total_ranking_rows_analyzed': len(ranking_rows_df),
+            'total_users_analyzed': int(ranking_rows_df['did'].nunique()),
+            'num_bins': len(binned_metrics),
+            'embedding_likes_stats': {
+                'mean': float(ranking_rows_df['num_embedding_likes'].mean()),
+                'median': float(ranking_rows_df['num_embedding_likes'].median()),
+                'std': float(ranking_rows_df['num_embedding_likes'].std()),
+                'min': int(ranking_rows_df['num_embedding_likes'].min()),
+                'max': int(ranking_rows_df['num_embedding_likes'].max()),
+            },
+        }
+        for metric in metric_cols:
+            if metric not in binned_metrics.columns:
+                continue
+            values = binned_metrics[metric].dropna().to_numpy()
+            if len(values) < 2:
+                continue
+            summary[f'{metric}_max_bin'] = str(binned_metrics['bin'].iloc[int(values.argmax())])
+            summary[f'{metric}_improvement_first_to_last'] = float(values[-1] - values[0])
         return summary
 
 

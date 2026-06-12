@@ -3,46 +3,9 @@
 """
 Shared dataloaders and user-encoder building blocks for engagement prediction.
 
-A **modular framework for representing user engagement history**
-in different formats, enabling flexible model architectures while maintaining
-code reuse and memory efficiency.
-
-═══════════════════════════════════════════════════════════════════════════════
-MODULAR USER-HISTORY REPRESENTATION
-═══════════════════════════════════════════════════════════════════════════════
-
-User engagement history (the sequence of posts a user has liked) can be
-represented in two fundamentally different ways, each optimized for different
-model architectures:
-
-1. **Fixed-Size Summary Vectors** (SummarizedEngagementDataset)
-   ─────────────────────────────────────────────────────────────────────────
-   Reduces variable-length history to a single fixed-dimensional vector using
-   HAND-CRAFTED, DETERMINISTIC summarization strategies (no learnable parameters):
-   
-   • MeanSummarizer          : Simple arithmetic average of all liked posts
-   • EMASummarizer           : Exponential moving average (recent posts weighted higher)
-   • LinearRecencySummarizer : Linear decay weighting (most recent = highest weight)
-   
-   Output format: Concatenated [user_summary || post_embedding] vector
-   Memory:        Pre-computed and cached in RAM (user summaries + pos/neg post
-                  embeddings). Roughly ~3 * N * D * 4 bytes for float32 tensors
-                  (e.g., N=178K, D=384 → ~0.8 GB).
-   
-2. **Variable-Length Sequences** (SequenceEngagementDataset)
-   ─────────────────────────────────────────────────────────────────────────
-   Preserves full temporal structure as padded/masked embedding sequences,
-   enabling LEARNED, TRAINABLE encoders (neural networks with parameters) to
-   discover optimal history aggregation during training:
-   
-   • TransformerDualPoolingEncoder  : Full transformer self-attention
-                                      Dual pooling: attention-weighted + mean
-   • CrossAttentionPoolingEncoder   : Single learned-query cross-attention pooling
-                                      Faster and fewer parameters
-   
-   Output format: Dict with keys {"history_embeddings", "history_mask",
-                  "target_post_embedding", "label", "user_id", "post_id"}
-   Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
+The active training path is bucketed matrix training. Each batch contains
+positive likes from one hour bucket plus candidate posts from that same bucket,
+so the trainer can score the full user x post matrix in one forward pass.
 
 ═══════════════════════════════════════════════════════════════════════════════
 KEY TERMINOLOGY
@@ -64,28 +27,11 @@ Both transform user history → fixed-size vector, but:
   - Summarizers use predetermined statistical operations
   - Encoders learn optimal transformations via backpropagation
 
-═══════════════════════════════════════════════════════════════════════════════
-ARCHITECTURE PATTERNS
-═══════════════════════════════════════════════════════════════════════════════
-
-The modular design supports multiple training approaches:
-
-    MLP + Summarizer             : SummarizedEngagementDataset + MLPModel(user_encoder_type="summarized")
-    MLP + Full Transformer       : SequenceEngagementDataset + MLPModel(user_encoder_type="full_transformer")
-    MLP + Cross-Attention        : SequenceEngagementDataset + MLPModel(user_encoder_type="cross_attention")
-    Two-Tower + Full Transformer : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="full_transformer")
-    Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="cross_attention")
-
-This separation allows experimentation with different history representations
-without modifying model code, and vice versa.
-
-═══════════════════════════════════════════════════════════════════════════════
 MAIN COMPONENTS
 ═══════════════════════════════════════════════════════════════════════════════
 
 Datasets:
-    SummarizedEngagementDataset  -- Fixed-size [user_summary ‖ post_emb] vectors
-    SequenceEngagementDataset    -- Padded variable-length history sequences + mask
+    BucketedEngagementDataset    -- User histories + same-hour candidate posts
 
 Hand-Crafted Summarizers (deterministic, no learnable parameters):
     UserSummarizer               -- Abstract base class
@@ -98,7 +44,7 @@ Learned Encoders (trainable neural networks):
     CrossAttentionPoolingEncoder    -- Efficient single-query cross-attention pooling
 
 Utilities:
-    load_training_data()         -- Locates and loads upstream pipeline artifacts
+    load_bucketed_training_data() -- Locates and loads upstream pipeline artifacts
 """
 
 from __future__ import annotations
@@ -106,99 +52,62 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
-from utils.pipeline.core import Context, select_prior_output
+from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     load_parquet_from_prior,
     log_operation_start,
+    validate_dataframe_schema,
 )
-from shared.input_data_helpers import get_padded_embedding_history_and_mask, AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
+from shared.input_data_helpers import (
+    get_padded_embedding_history_and_mask,
+    get_padded_author_indices,
+    AUTHOR_PAD_IDX,
+    AUTHOR_UNK_IDX,
+)
 
 
-def _map_raw_author_idx_to_table_row(
-    raw_author_idx: Any,
-    author_idx_to_table_row: np.ndarray,
-) -> int:
-    """Translate a raw Stage 2 author_idx into the model table row."""
-    if raw_author_idx is None:
+def _author_idx_or_unk(author_idx: Any) -> int:
+    """Return the Stage 1 author_idx as an embedding-table row, mapping nulls to UNK."""
+    if author_idx is None:
         return AUTHOR_UNK_IDX
     try:
-        if raw_author_idx != raw_author_idx:  # NaN
+        if author_idx != author_idx:  # NaN
             return AUTHOR_UNK_IDX
     except TypeError:
         pass
-    raw_author_idx_int = int(raw_author_idx)
-    if 0 <= raw_author_idx_int < len(author_idx_to_table_row):
-        return int(author_idx_to_table_row[raw_author_idx_int])
-    return AUTHOR_UNK_IDX
+    return int(author_idx)
 
 
-def build_author_table_lookup(
+def get_author_table_num_rows(
     author_idx_mapping_df: pl.DataFrame,
-    min_author_support: int,
-) -> Tuple[np.ndarray, int]:
-    """Map Stage 2 author indices to final embedding-table rows.
-
-    Returns a pair ``(author_idx_to_table_row, author_table_num_rows)``.
-
-    These represent two different index spaces:
-
-    - ``author_idx_to_table_row`` is a lookup array keyed by raw Stage 2
-      ``author_idx`` values. It only needs entries for raw author ids that may
-      appear in the history artifact. Missing or out-of-range lookups are
-      handled downstream as ``AUTHOR_UNK_IDX``.
-    - ``author_table_num_rows`` is the size of the actual embedding table used
-      at training time. That table always reserves row ``0`` for padding and
-      row ``1`` for unknown authors, so it must be at least ``2`` even when no
-      supported authors survive filtering.
-    """
-    if min_author_support < 1:
-        raise ValueError("min_author_support must be >= 1")
-    required_cols = {"author_idx", "author_train_count"}
+) -> int:
+    """Return the number of rows needed for the Stage 1 author embedding table."""
+    required_cols = {"author_idx"}
     missing_cols = required_cols.difference(author_idx_mapping_df.columns)
     if missing_cols:
         missing = ", ".join(sorted(missing_cols))
         raise ValueError(f"author_idx_mapping_df is missing required columns: {missing}")
 
     if len(author_idx_mapping_df) == 0:
-        # Empty Stage 2 mapping means there are no known raw author_idx values
-        # to translate. The lookup therefore only needs a dummy slot, while the
-        # embedding table still needs PAD=0 and UNK=1 rows.
-        author_idx_to_table_row = np.full(1, AUTHOR_UNK_IDX, dtype=np.uint32)
-        author_table_num_rows = 2
-        return author_idx_to_table_row, author_table_num_rows
+        return 2
 
-    max_author_idx = int(author_idx_mapping_df["author_idx"].max())
-    if max_author_idx < 1:
-        raise ValueError("author_idx values must start at 1")
-
-    author_idx_to_table_row = np.full(max_author_idx + 1, AUTHOR_UNK_IDX, dtype=np.uint32)
-    supported_df = author_idx_mapping_df.filter(
-        pl.col("author_train_count") >= int(min_author_support)
-    )
-    if len(supported_df) == 0:
-        # Keep the full raw-author lookup shape so in-range Stage 2 author_idx
-        # values still resolve deterministically to UNK after support filtering.
-        author_table_num_rows = 2
-        return author_idx_to_table_row, author_table_num_rows
-
-    supported_author_indices = supported_df["author_idx"].to_numpy().astype(np.int64)
-    author_idx_to_table_row[supported_author_indices] = (supported_author_indices + 1).astype(np.uint32)
-    # Table row layout:
-    #   0 -> PAD
-    #   1 -> UNK
-    #   raw author_idx N -> row N + 1 when that author survives filtering
-    author_table_num_rows = int(supported_author_indices.max()) + 2
-    return author_idx_to_table_row, author_table_num_rows
+    max_author_idx_value = author_idx_mapping_df.select(pl.col("author_idx").max()).item()
+    if max_author_idx_value is None:
+        raise ValueError("author_idx column must contain at least one non-null value")
+    max_author_idx = int(max_author_idx_value)
+    if max_author_idx < AUTHOR_UNK_IDX:
+        raise ValueError("author_idx values must reserve rows 0 and 1 for PAD/UNK")
+    return max(max_author_idx + 1, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -982,88 +891,6 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
 # Shared data-loading helper
 # ---------------------------------------------------------------------------
 
-def load_training_data(
-    context: Context,
-    logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, Optional[pl.DataFrame], int]:
-    """Locate and load the three upstream pipeline artifacts needed for training.
-    
-    This function abstracts away the complexity of finding prior stage outputs,
-    supporting both same-session pipeline runs (via context.artifacts) and
-    multi-session workflows (via filesystem scanning).
-    
-    Resolution order for each artifact:
-        1. context.artifacts - Set by pipeline when stages run in same session
-        2. Filesystem scan of the canonical artifact store (context.artifacts_dir)
-    
-    The three required artifacts:
-        1. embeddings_*.npy   : Memmap array of post embeddings from Stage 1
-        2. target_posts_*.parquet : Train/val/holdout split assignments from Stage 2
-        3. history_posts_*.parquet: User engagement history from Stage 3
-    
-    Args:
-        context: Pipeline context with artifact tracking and configuration
-        logger: Optional logger for progress reporting
-    
-    Returns:
-        Tuple of (embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim):
-            - embeddings_mmap: Read-only numpy memmap [n_posts, D]
-            - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
-            - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
-            - author_idx_mapping_df: Optional Polars DataFrame with Stage 2
-              author_idx / author_train_count metadata
-            - embed_dim: Integer embedding dimensionality D
-    
-    Raises:
-        FileNotFoundError: If any required artifact cannot be located
-        
-    Example:
-        >>> embeddings, targets, history, author_idx_mapping, dim = load_training_data(
-        ...     context=context,
-        ...     logger=logger
-        ... )
-        >>> print(f"Loaded {len(targets):,} target posts with {dim}-d embeddings")
-    """
-    if logger is None:
-        logger = get_stage_logger("DATALOADERS")
-
-    # --- 1. Embeddings memmap from 01_get_data ---
-    # This is a read-only memory-mapped array that allows accessing post
-    # embeddings without loading the entire matrix into RAM
-    log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
-    get_data_dir = _resolve_prior(context, stage_key="get_data", folder="01_get_data")
-    emb_candidates = sorted(get_data_dir.glob("embeddings_*.npy"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not emb_candidates:
-        raise FileNotFoundError(f"No embeddings_*.npy found under {get_data_dir}")
-    embeddings_path = emb_candidates[0]
-    embeddings_mmap: np.ndarray = np.load(str(embeddings_path), mmap_mode="r")
-    embed_dim = embeddings_mmap.shape[1]
-    logger.info(f"Loaded embeddings memmap: shape={embeddings_mmap.shape}, path={embeddings_path}")
-
-    # --- 2. Target posts from 02_target_posts ---
-    # Contains the train/val/holdout split assignments and negative sampling results
-    log_operation_start("Locate target_posts", "DATALOADERS", logger)
-    target_posts_dir = _resolve_prior(context, stage_key="target_posts", folder="02_target_posts")
-    target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
-    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
-
-    try:
-        author_idx_mapping_df = load_parquet_from_prior(target_posts_dir, "author_idx_").collect()
-        logger.info(f"Loaded author_idx: {len(author_idx_mapping_df):,} rows")
-    except FileNotFoundError:
-        author_idx_mapping_df = None
-        logger.info("No author_idx artifact found in target_posts stage output")
-
-    # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
-    # Contains the (most-recent-first-ordered) list of post indices each user engaged with
-    log_operation_start("Locate user_history", "DATALOADERS", logger)
-    history_dir = _resolve_prior(context, stage_key="user_history", folder="03_user_history")
-    history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
-    logger.info(f"Loaded user_history: {len(history_df):,} rows")
-
-    return embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim
-
-
 def _resolve_prior(
     context: Context,
     *,
@@ -1081,659 +908,423 @@ def _resolve_prior(
 
 
 # ---------------------------------------------------------------------------
-# Internal: shared filter + join used by both datasets and evaluation
+# Bucketed two-tower data path
 # ---------------------------------------------------------------------------
 
-def filter_split_and_join_history(
-    target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
-    split: str,
-    include_prior_author_indices: bool = False,
-) -> pl.DataFrame:
-    """Filter target posts to a split and left-join with user history.
-
-    This is the canonical implementation of the two-step operation that both
-    the training dataloaders and the evaluation stage need:
-      1. Keep only rows for the requested *split* that have a valid negative sample.
-      2. Left-join with history to attach ``prior_emb_indices`` per row.
-
-    Returns:
-        Polars DataFrame with all columns from the filtered target posts plus
-        ``prior_emb_indices`` from the history.
-    """
-    filtered = target_posts_df.filter(
-        (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
-    )
-    history_columns = ["target_did", "like_uri", "prior_emb_indices"]
-    if include_prior_author_indices:
-        if "prior_author_indices" not in history_df.columns:
-            raise ValueError("history_df must contain prior_author_indices when author embeddings are enabled")
-        history_columns.append("prior_author_indices")
-    return filtered.join(
-        history_df.select(history_columns),
-        on=["target_did", "like_uri"],
-        how="left",
-        maintain_order="left",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Internal: prepare the row-aligned index arrays shared by both datasets
-# ---------------------------------------------------------------------------
-
-def _prepare_split_data(
-    target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
-    split: str,
-    use_author_embedding_table: bool = False,
-    author_idx_to_table_row: Optional[np.ndarray] = None,
+def load_bucketed_training_data(
+    context: Context,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    List[np.ndarray],
-    List[str],
-    List[str],
-    List[str],
-    Optional[List[np.ndarray]],
-    Optional[np.ndarray],
-    Optional[np.ndarray],
-]:
-    """Filter data to a single split and return aligned numpy arrays.
-    
-    This internal helper performs the core data preparation logic shared by both
-    SummarizedEngagementDataset and SequenceEngagementDataset. It:
-    1. Filters target_posts to the requested split (train/val/holdout)
-    2. Drops rows with missing negative samples
-    3. Joins with user history to get engagement sequences
-    4. Converts to numpy arrays for fast indexing
-    
-    The returned arrays are **row-aligned**: position i in each array corresponds
-    to the same user-post interaction. This alignment is critical for dataset
-    __getitem__ to efficiently construct training samples.
-    
-    Args:
-        target_posts_df: Full target posts DataFrame with all splits
-        history_df: User engagement history DataFrame
-        split: Split name to filter to ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
-        logger: Optional logger for progress reporting
-    
-    Returns:
-        Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list, 
-                  target_dids, like_uris, neg_uris, prior_author_indices_list,
-                  like_author_idx, neg_author_idx):
-        
-        - like_emb_idx: Indices into embeddings memmap for positive posts [N]
-        - neg_emb_idx: Indices into embeddings memmap for negative posts [N]
-        - prior_emb_indices_list: List of N variable-length arrays, each containing
-                                  embedding indices for that user's history
-                                  (most-recent-first, uint32)
-        - target_dids: User IDs as string array [N]
-        - like_uris: Liked post URIs as string array [N]
-        - neg_uris: Non-liked post URIs as string array [N]
-        - prior_author_indices_list: Optional author table rows aligned with
-                                     prior_emb_indices_list
-        - like_author_idx: Optional author table row for each positive target post
-        - neg_author_idx: Optional author table row for each negative target post
-        
-        Where N = number of target posts in the requested split (after filtering).
-    
-    Note:
-        Each target post row produces TWO training samples (positive + negative),
-        so dataset length will be 2*N. This function returns N-length arrays that
-        the datasets will expand to 2*N samples in their __getitem__ methods.
-    """
+) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, pl.DataFrame, Optional[pl.DataFrame], int]:
+    """Locate and load artifacts for bucketed two-tower training."""
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    joined = filter_split_and_join_history(
-        target_posts_df,
-        history_df,
-        split,
-        include_prior_author_indices=use_author_embedding_table,
-    )
-    logger.info(f"  Split '{split}': {len(joined):,} target rows (after dropping null neg_emb_idx)")
+    log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
+    get_data_dir = _resolve_prior(context, stage_key="get_data", folder="01_get_data")
+    emb_candidates = sorted(get_data_dir.glob("embeddings_*.npy"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not emb_candidates:
+        raise FileNotFoundError(f"No embeddings_*.npy found under {get_data_dir}")
+    embeddings_path = emb_candidates[0]
+    embeddings_mmap: np.ndarray = np.load(str(embeddings_path), mmap_mode="r")
+    embed_dim = int(embeddings_mmap.shape[1])
+    logger.info(f"Loaded embeddings memmap: shape={embeddings_mmap.shape}, path={embeddings_path}")
 
-    # Extract embedding indices for positive and negative posts
-    like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
-    neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
-    target_dids = joined["target_did"].to_list()
-    like_uris = joined["like_uri"].to_list()
-    neg_uris = joined["neg_uri"].to_list()
-    like_author_idx = None
-    neg_author_idx = None
+    log_operation_start("Locate likes_core", "DATALOADERS", logger)
+    likes_core_df = load_parquet_from_prior(get_data_dir, "likes_core_").collect()
+    logger.info(f"Loaded likes_core: {len(likes_core_df):,} rows")
 
-    # Convert Polars List[UInt32] column to Python list of numpy arrays
-    # This allows each user to have a different history length (variable-length)
-    # while still supporting fast numpy indexing into the embeddings memmap
-    prior_col = joined["prior_emb_indices"]
-    prior_emb_indices_list: List[np.ndarray] = []
-    prior_author_indices_list: Optional[List[np.ndarray]] = [] if use_author_embedding_table else None
-    prior_author_col = joined["prior_author_indices"].to_list() if use_author_embedding_table else None
+    log_operation_start("Locate posts_core", "DATALOADERS", logger)
+    posts_core_df = load_parquet_from_prior(get_data_dir, "posts_core_").collect()
+    logger.info(f"Loaded posts_core: {len(posts_core_df):,} rows")
 
-    if use_author_embedding_table and author_idx_to_table_row is None:
-        raise ValueError("author_idx_to_table_row must be provided when author embeddings are enabled")
+    try:
+        author_idx_mapping_df = load_parquet_from_prior(get_data_dir, "author_idx_").collect()
+        logger.info(f"Loaded author_idx: {len(author_idx_mapping_df):,} rows")
+    except FileNotFoundError:
+        author_idx_mapping_df = None
+        logger.info("No author_idx artifact found in get_data output")
 
-    if use_author_embedding_table:
-        missing_author_cols = [
-            col for col in ("like_author_idx", "neg_author_idx")
-            if col not in joined.columns
-        ]
-        if missing_author_cols:
-            missing = ", ".join(missing_author_cols)
-            raise ValueError(f"target_posts_df must contain author index columns when author embeddings are enabled: {missing}")
-        assert author_idx_to_table_row is not None
-        like_author_idx = np.array([
-            _map_raw_author_idx_to_table_row(raw_idx, author_idx_to_table_row)
-            for raw_idx in joined["like_author_idx"].to_list()
-        ], dtype=np.uint32)
-        neg_author_idx = np.array([
-            _map_raw_author_idx_to_table_row(raw_idx, author_idx_to_table_row)
-            for raw_idx in joined["neg_author_idx"].to_list()
-        ], dtype=np.uint32)
+    log_operation_start("Locate user_history", "DATALOADERS", logger)
+    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
+    history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
+    logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
-    for row_val in prior_col.to_list():
-        idx = len(prior_emb_indices_list)
-        if row_val is None or len(row_val) == 0:
-            # Users with no history get an empty array (will become zero vector
-            # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
-            prior_emb_indices_list.append(np.array([], dtype=np.uint32))
-            if use_author_embedding_table and prior_author_indices_list is not None:
-                prior_author_indices_list.append(np.array([], dtype=np.uint32))
-        else:
-            prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
-            if use_author_embedding_table and prior_author_indices_list is not None and prior_author_col is not None:
-                raw_author_indices = prior_author_col[idx]
-                if raw_author_indices is None:
-                    raw_author_indices = [None] * len(row_val)
-                if len(raw_author_indices) != len(row_val):
-                    raise ValueError("prior_author_indices must be position-aligned with prior_emb_indices")
-                mapped_author_indices = []
-                for raw_author_idx in raw_author_indices:
-                    mapped_author_indices.append(
-                        _map_raw_author_idx_to_table_row(raw_author_idx, author_idx_to_table_row)
-                    )
-                prior_author_indices_list.append(np.array(mapped_author_indices, dtype=np.uint32))
-
-    return (
-        like_emb_idx,
-        neg_emb_idx,
-        prior_emb_indices_list,
-        target_dids,
-        like_uris,
-        neg_uris,
-        prior_author_indices_list,
-        like_author_idx,
-        neg_author_idx,
-    )
+    return embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim
 
 
-# ---------------------------------------------------------------------------
-# SummarizedEngagementDataset
-# ---------------------------------------------------------------------------
+def _post_split_window_for_like_split(split: str) -> str:
+    if split == "val_unseen_users":
+        return "val"
+    if split.startswith("holdout"):
+        return "holdout"
+    return split
 
-class SummarizedEngagementDataset(Dataset):
-    """Fixed-size feature vector dataset: [user_summary || post_embedding].
-    
-    This dataset represents user engagement history as FIXED-SIZE summary vectors
-    computed by pluggable UserSummarizer strategies. It's designed for models that
-    require consistent input dimensionality.
-    
-    ═══════════════════════════════════════════════════════════════════════════
-    DATASET STRUCTURE
-    ═══════════════════════════════════════════════════════════════════════════
-    
-    Each target post generates TWO training samples:
-        - Positive sample (index 2*k):   [user_summary || liked_post_embedding] -> label=1
-        - Negative sample (index 2*k+1): [user_summary || random_post_embedding] -> label=0
-    
-    This paired structure ensures balanced training and allows the model to learn
-    discriminative features between engaged and non-engaged content.
-    
-    Sample indexing:
-        len(dataset) = 2 * num_target_posts
-        dataset[0]   = positive sample for target post 0
-        dataset[1]   = negative sample for target post 0
-        dataset[2]   = positive sample for target post 1
-        ...
-    
-    ═══════════════════════════════════════════════════════════════════════════
-    MEMORY & PERFORMANCE
-    ═══════════════════════════════════════════════════════════════════════════
-    
-    **Pre-computation strategy**: All user summaries and post embeddings are
-    materialized into contiguous float32 tensors at init time. This makes
-    __getitem__ a pure in-memory index lookup with ZERO memmap I/O during
-    training.
-    
-    Memory scales as ~3 * N * D * 4 bytes for float32 (user summaries + pos post
-    embs + neg post embs). For example, N=178K and D=384 is ~0.8 GB.
-    
-    ═══════════════════════════════════════════════════════════════════════════
-    
-    Args:
-        embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
-        target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
-        history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
-        summarizer: UserSummarizer instance for aggregating engagement history
-        embed_dim: Embedding dimensionality D
-        logger: Optional logger for progress reporting
-    
-    Attributes:
-        embed_dim: Embedding dimensionality
-        target_dids: User IDs for each target post [N]
-        like_uris: Post URIs for each target post [N]
-    
-    Returns (from __getitem__):
-        Dictionary with keys:
-            - "features": Concatenated [user_summary || post_emb] tensor [2*D]
-            - "label": Binary label (1.0 for positive, 0.0 for negative)
-            - "user_id": User ID string
-            - "post_id": Post URI string (or "neg_uri" for negatives)
-    """
+
+def _list_to_int_array(value: Any) -> np.ndarray:
+    if value is None or len(value) == 0:
+        return np.array([], dtype=np.int64)
+    return np.array(value, dtype=np.int64)
+
+
+def _author_idx_list_to_table_rows(
+    author_indices: Any,
+) -> np.ndarray:
+    if author_indices is None:
+        return np.array([], dtype=np.uint32)
+    return np.array([
+        _author_idx_or_unk(author_idx)
+        for author_idx in author_indices
+    ], dtype=np.uint32)
+
+
+class BucketedEngagementDataset(Dataset):
+    """User-hour positives grouped by hour bucket with same-hour candidate posts."""
 
     def __init__(
         self,
         embeddings_mmap: np.ndarray,
-        target_posts_df: pl.DataFrame,
-        history_df: pl.DataFrame,
-        split: str,
-        summarizer: UserSummarizer,
-        embed_dim: int,
-        logger: Optional[logging.Logger] = None,
-    ):
-        self.embed_dim = embed_dim
-
-        # Prepare aligned arrays for the requested split
-        (
-            like_emb_idx,
-            neg_emb_idx,
-            prior_emb_indices,
-            self.target_dids,
-            self.like_uris,
-            self.neg_uris,
-            _,
-            _,
-            _,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger=logger)
-
-        self._n_rows = len(like_emb_idx)
-
-        # ── Pre-compute user summaries [N, D] ────────────────────────
-        # Apply the summarizer to each user's engagement history. This happens
-        # once at init time so __getitem__ can be a pure lookup.
-        if logger:
-            logger.info(f"  Pre-computing user summaries for '{split}' ({self._n_rows:,} rows)…")
-        user_summaries = np.zeros((self._n_rows, embed_dim), dtype=np.float32)
-        for i, hist_indices in enumerate(prior_emb_indices):
-            if len(hist_indices) > 0:
-                # Fetch history embeddings from memmap and summarize
-                hist_embs = embeddings_mmap[hist_indices]  # [seq, D]
-                user_summaries[i] = summarizer.summarize(hist_embs)
-            # else: Users with no history stay as zero vectors
-        self._user_summaries = torch.from_numpy(user_summaries)
-
-        # ── Pre-fetch post embeddings [N, D] for pos and neg ─────────
-        # Materialize positive and negative post embeddings into contiguous tensors
-        # for fast __getitem__ lookups. This is cheap compared to history sequences.
-        pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
-        neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
-        self._pos_post_embs = torch.from_numpy(pos_embs)
-        self._neg_post_embs = torch.from_numpy(neg_embs)
-
-        if logger:
-            mem_mb = (user_summaries.nbytes + pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
-            logger.info(
-                f"  SummarizedEngagementDataset('{split}'): "
-                f"{self._n_rows:,} rows -> {len(self):,} samples "
-                f"(summarizer={type(summarizer).__name__}, "
-                f"pre-computed {mem_mb:.1f} MB)"
-            )
-
-    def __len__(self) -> int:
-        """Return total number of samples (2 per target post: positive + negative)."""
-        return self._n_rows * 2
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get a single training sample by index.
-        
-        Args:
-            idx: Sample index in [0, 2*N). Even indices are positive samples,
-                 odd indices are negative samples.
-        
-        Returns:
-            Dictionary with:
-                - "features": [2*D] concatenated [user_summary || post_embedding]
-                - "label": 1.0 for positive, 0.0 for negative
-                - "user_id": User identifier string
-                - "post_id": Post URI (or "neg_uri" for negatives)
-        """
-        # Map dataset index to target post row and sample type
-        row_idx = idx // 2  # Which target post
-        is_positive = (idx % 2) == 0  # Even = positive, odd = negative
-
-        # User summary is shared between positive and negative samples
-        user_vec = self._user_summaries[row_idx]  # [D]
-        
-        # Select post embedding based on sample type
-        if is_positive:
-            post_vec = self._pos_post_embs[row_idx]  # [D]
-            label = 1.0
-            post_id = self.like_uris[row_idx]
-        else:
-            post_vec = self._neg_post_embs[row_idx]  # [D]
-            label = 0.0
-            post_id = self.neg_uris[row_idx]
-
-        # Concatenate user summary and post embedding
-        features = torch.cat([user_vec, post_vec])  # [2D]
-        return {
-            "features": features,
-            "label": torch.tensor(label, dtype=torch.float32),
-            "user_id": self.target_dids[row_idx],
-            "post_id": post_id,
-        }
-
-
-# ---------------------------------------------------------------------------
-# SequenceEngagementDataset
-# ---------------------------------------------------------------------------
-
-class SequenceEngagementDataset(Dataset):
-    """Variable-length sequence dataset: padded history + mask + target post embedding.
-    
-    This dataset represents user engagement history as VARIABLE-LENGTH SEQUENCES
-    with padding and masking. It preserves temporal structure and allows learned
-    encoders (attention mechanisms) to discover optimal aggregation strategies.
-    
-    ═══════════════════════════════════════════════════════════════════════════
-    DATASET STRUCTURE
-    ═══════════════════════════════════════════════════════════════════════════
-    
-    Each target post generates TWO training samples:
-        - Positive sample (index 2*k):   (history_seq, mask, liked_post_emb) -> label=1
-        - Negative sample (index 2*k+1): (history_seq, mask, random_post_emb) -> label=0
-    
-    History sequences are:
-        - Padded to max_history_len
-        - Masked (True = valid position, False = padding)
-        - Most-recent-first (index 0 = most recent engagement)
-    
-    Sample indexing:
-        len(dataset) = 2 * num_target_posts
-        dataset[0]   = positive sample for target post 0
-        dataset[1]   = negative sample for target post 0
-        ...
-    
-    ═══════════════════════════════════════════════════════════════════════════
-    MEMORY & PERFORMANCE
-    ═══════════════════════════════════════════════════════════════════════════
-    
-    **Hybrid pre-computation strategy**:
-        ✓ Target post embeddings: Pre-computed into tensors (~560 MB for 178K samples)
-        ✓ History sequences: Constructed on-the-fly from memmap during __getitem__
-    
-    Rationale:
-        A fully materialized [N, max_seq, D] tensor would consume ~13 GB for typical
-        parameters (N=178K, max_seq=50, D=384). By loading sequences on-demand, we
-        keep memory footprint manageable while multi-worker DataLoaders pipeline the
-        I/O to keep GPUs fed.
-    
-    ═══════════════════════════════════════════════════════════════════════════
-    
-    Args:
-        embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
-        target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
-        history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
-        split: Split to load ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
-        max_history_len: Maximum sequence length for padding (truncate if longer)
-        embed_dim: Embedding dimensionality D
-        logger: Optional logger for progress reporting
-    
-    Attributes:
-        embeddings: Reference to memmap for on-the-fly loading
-        max_history_len: Maximum sequence length
-        embed_dim: Embedding dimensionality
-        prior_emb_indices: List of variable-length index arrays per target post
-        target_dids: User IDs [N]
-        like_uris: Post URIs [N]
-    
-    Returns (from __getitem__):
-        Dictionary with keys:
-            - "history_embeddings": Padded sequence [max_seq_len, D]
-            - "history_mask": Boolean mask [max_seq_len], True = valid position
-            - "target_post_embedding": Target post embedding [D]
-            - "history_author_indices": Optional author table rows for history items
-            - "target_post_author_idx": Optional author table row for target post
-            - "label": Binary label (1.0 for positive, 0.0 for negative)
-            - "user_id": User ID string
-            - "post_id": Post URI string (or "neg_uri" for negatives)
-    """
-
-    def __init__(
-        self,
-        embeddings_mmap: np.ndarray,
-        target_posts_df: pl.DataFrame,
+        likes_core_df: pl.DataFrame,
+        posts_core_df: pl.DataFrame,
         history_df: pl.DataFrame,
         split: str,
         max_history_len: int,
         embed_dim: int,
         use_author_embedding_table: bool = False,
-        author_idx_to_table_row: Optional[np.ndarray] = None,
         logger: Optional[logging.Logger] = None,
     ):
-        # Store memmap reference for on-the-fly sequence loading
+        if max_history_len <= 0:
+            raise ValueError("max_history_len must be positive")
         self.embeddings = embeddings_mmap
-        self.max_history_len = max_history_len
-        self.embed_dim = embed_dim
+        self.split = str(split)
+        self.max_history_len = int(max_history_len)
+        self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
 
-        # Prepare aligned arrays for the requested split
-        (
-            like_emb_idx,
-            neg_emb_idx,
-            self.prior_emb_indices,
-            self.target_dids,
-            self.like_uris,
-            self.neg_uris,
-            self.prior_author_indices,
-            self._pos_author_indices,
-            self._neg_author_indices,
-        ) = _prepare_split_data(
-            target_posts_df,
+        likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
+        posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
+        history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
+        if self.use_author_embedding_table:
+            likes_columns.append("author_idx")
+            posts_columns.append("author_idx")
+            history_columns.append("prior_author_indices")
+
+        validate_dataframe_schema(
+            likes_core_df,
+            dict.fromkeys(likes_columns, None),
+        )
+        validate_dataframe_schema(
+            posts_core_df,
+            dict.fromkeys(posts_columns, None),
+        )
+        validate_dataframe_schema(
             history_df,
-            split,
-            use_author_embedding_table=self.use_author_embedding_table,
-            author_idx_to_table_row=author_idx_to_table_row,
-            logger=logger,
+            dict.fromkeys(history_columns, None),
         )
 
-        self._n_rows = len(like_emb_idx)
+        like_ordered_df = (
+            likes_core_df
+            .filter(pl.col("split") == self.split)
+            .with_row_index(name="_like_order")
+        )
+        agg_exprs = [
+            pl.col("subject_uri").sort_by("_like_order").alias("liked_post_ids"),
+            pl.col("emb_idx").sort_by("_like_order").alias("liked_post_emb_indices"),
+            pl.col("_like_order").min().alias("_first_like_order"),
+        ]
+        if self.use_author_embedding_table:
+            agg_exprs.append(pl.col("author_idx").sort_by("_like_order").alias("liked_post_author_indices"))
+        
+        user_hour_df = (
+            like_ordered_df
+            .group_by(["did", "like_hour_bucket"])
+            .agg(agg_exprs)
+            .sort("_first_like_order")
+        )
 
-        # ── Pre-fetch post embeddings [N, D] for pos and neg (cheap: ~560 MB) ──
-        # Target post embeddings are small enough to pre-compute, avoiding repeated
-        # memmap lookups for the same posts during training
-        pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
-        neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
-        self._pos_post_embs = torch.from_numpy(pos_embs)
-        self._neg_post_embs = torch.from_numpy(neg_embs)
-
-        if logger:
-            mem_mb = (pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
-            # Estimate what the full pre-compute would have cost
-            full_gb = (self._n_rows * max_history_len * embed_dim * 4) / (1024 ** 3)
-            logger.info(
-                f"  SequenceEngagementDataset('{split}'): "
-                f"{self._n_rows:,} rows -> {len(self):,} samples "
-                f"(max_history_len={max_history_len}, "
-                f"post embs pre-computed {mem_mb:.1f} MB, "
-                f"history sequences on-the-fly via workers "
-                f"[would be {full_gb:.1f} GB if materialized])"
+        joined = (
+            user_hour_df
+            .join(
+                history_df.select(history_columns),
+                on=["did", "like_hour_bucket"],
+                how="left",
+                maintain_order="left",
             )
+        )
+        if logger:
+            logger.info(f"  BucketedEngagementDataset('{self.split}'): {len(joined):,} user-hour rows")
+
+        self.user_ids = joined["did"].to_list()
+        self.like_hour_buckets = joined["like_hour_bucket"].to_list()
+        self.liked_post_ids = joined["liked_post_ids"].to_list()
+        self.liked_post_emb_indices = [
+            _list_to_int_array(value)
+            for value in joined["liked_post_emb_indices"].to_list()
+        ]
+        self.prior_emb_indices = [
+            _list_to_int_array(value)
+            for value in joined["prior_emb_indices"].to_list()
+        ]
+
+        self.liked_post_author_indices: Optional[List[np.ndarray]] = None
+        self.prior_author_indices: Optional[List[np.ndarray]] = None
+        if self.use_author_embedding_table:
+            self.liked_post_author_indices = [
+                _author_idx_list_to_table_rows(value)
+                for value in joined["liked_post_author_indices"].to_list()
+            ]
+            self.prior_author_indices = [
+                _author_idx_list_to_table_rows(value)
+                for value in joined["prior_author_indices"].to_list()
+            ]
+
+        self.row_indices_by_bucket: Dict[Any, List[int]] = {}
+        for row_idx, bucket in enumerate(self.like_hour_buckets):
+            self.row_indices_by_bucket.setdefault(bucket, []).append(row_idx)
+
+        post_split_window = _post_split_window_for_like_split(self.split)
+        sampled_posts_df = posts_core_df.filter(
+            (pl.col("split_window") == post_split_window)
+            & pl.col("in_random_sample")
+            & pl.col("negative_hour_bucket").is_not_null()
+        )
+        self.sampled_posts_by_bucket: Dict[Any, List[Dict[str, Any]]] = {}
+        for row in sampled_posts_df.iter_rows(named=True):
+            author_idx = _author_idx_or_unk(row.get("author_idx")) if self.use_author_embedding_table else None
+            self.sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append({
+                "post_id": row["at_uri"],
+                "emb_idx": int(row["emb_idx"]),
+                "author_idx": author_idx,
+            })
 
     def __len__(self) -> int:
-        """Return total number of samples (2 per target post: positive + negative)."""
-        return self._n_rows * 2
+        return len(self.user_ids)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get a single training sample by index.
-        
-        This method performs on-the-fly loading of history sequences from the
-        memmap. When using multi-worker DataLoaders, this I/O happens in parallel
-        worker processes, keeping the main training loop fed.
-        
-        Args:
-            idx: Sample index in [0, 2*N). Even indices are positive samples,
-                 odd indices are negative samples.
-        
-        Returns:
-            Dictionary with:
-                - "history_embeddings": [max_seq_len, D] padded/truncated history
-                - "history_mask": [max_seq_len] boolean, True = valid position
-                - "target_post_embedding": [D] target post embedding
-                - "history_author_indices": [max_seq_len] author table rows, when enabled
-                - "target_post_author_idx": scalar author table row, when enabled
-                - "label": 1.0 for positive, 0.0 for negative
-                - "user_id": User identifier string
-                - "post_id": Post URI (or "neg_uri" for negatives)
-        """
-        # Map dataset index to target post row and sample type
-        row_idx = idx // 2
-        is_positive = (idx % 2) == 0
+        return {
+            "row_idx": int(idx),
+            "bucket": self.like_hour_buckets[idx],
+            "user_id": self.user_ids[idx],
+        }
 
-        # --- Load and pad/truncate history sequence from memmap ---
-        # This is the key difference from SummarizedEngagementDataset: we load
-        # the raw sequence here rather than using a pre-computed summary
+    def _padded_history_for_row(self, row_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         hist_indices = self.prior_emb_indices[row_idx]
         hist_embeddings = self.embeddings[hist_indices]
         padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
-        history_author_indices = None
-        if self.use_author_embedding_table:
-            if self.prior_author_indices is None:
-                raise ValueError("prior_author_indices must be available when author embeddings are enabled")
-            mapped_author_indices = self.prior_author_indices[row_idx]
-            padded_author_indices = np.full(self.max_history_len, AUTHOR_PAD_IDX, dtype=np.int64)
-            if len(mapped_author_indices) > 0:
-                truncated_len = min(len(mapped_author_indices), self.max_history_len)
-                padded_author_indices[:truncated_len] = mapped_author_indices[:truncated_len]
-            history_author_indices = torch.from_numpy(padded_author_indices)
+        return torch.from_numpy(padded), torch.from_numpy(mask)
 
-        # --- Select target post embedding (pre-computed) ---
-        if is_positive:
-            post_vec = self._pos_post_embs[row_idx]  # [D]
-            label = 1.0
-            post_id = self.like_uris[row_idx]
-            target_post_author_idx = (
-                self._pos_author_indices[row_idx]
-                if self._pos_author_indices is not None
-                else None
-            )
-        else:
-            post_vec = self._neg_post_embs[row_idx]  # [D]
-            label = 0.0
-            post_id = self.neg_uris[row_idx]
-            target_post_author_idx = (
-                self._neg_author_indices[row_idx]
-                if self._neg_author_indices is not None
-                else None
-            )
+    def _padded_author_history_for_row(self, row_idx: int) -> torch.Tensor:
+        if self.prior_author_indices is None:
+            raise ValueError("prior_author_indices must be available when author embeddings are enabled")
+        mapped_author_indices = self.prior_author_indices[row_idx]
+        padded = get_padded_author_indices(mapped_author_indices, self.max_history_len)
+        return torch.from_numpy(padded)
 
-        output = {
-            "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
-            "history_mask": torch.from_numpy(mask),  # [max_seq]
-            "target_post_embedding": post_vec,
-            "label": torch.tensor(label, dtype=torch.float32),
-            "user_id": self.target_dids[row_idx],
-            "post_id": post_id,
+    def collate_batch(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not items:
+            raise ValueError("BucketedEngagementDataset.collate_batch received an empty batch")
+
+        row_indices = [int(item["row_idx"]) for item in items]
+        bucket = self.like_hour_buckets[row_indices[0]]
+        if any(self.like_hour_buckets[row_idx] != bucket for row_idx in row_indices):
+            raise ValueError("Bucketed batches must contain rows from exactly one hour bucket")
+
+        user_ids = [self.user_ids[row_idx] for row_idx in row_indices]
+        user_to_batch_idx = {
+            user_id: user_idx
+            for user_idx, user_id in enumerate(user_ids)
         }
-        if history_author_indices is not None:
-            output["history_author_indices"] = history_author_indices
-        if target_post_author_idx is not None:
-            output["target_post_author_idx"] = torch.tensor(
-                int(target_post_author_idx),
-                dtype=torch.long,
+
+        history_tensors = []
+        mask_tensors = []
+        for row_idx in row_indices:
+            history, mask = self._padded_history_for_row(row_idx)
+            history_tensors.append(history)
+            mask_tensors.append(mask)
+
+        candidate_post_ids: List[str] = []
+        candidate_emb_indices: List[int] = []
+        candidate_author_indices: List[int] = []
+        candidate_to_idx: Dict[str, int] = {}
+
+        def add_candidate(post_id: str, emb_idx: int, author_idx: Optional[int]) -> None:
+            if post_id in candidate_to_idx:
+                return
+            candidate_to_idx[post_id] = len(candidate_post_ids)
+            candidate_post_ids.append(post_id)
+            candidate_emb_indices.append(int(emb_idx))
+            if self.use_author_embedding_table:
+                candidate_author_indices.append(
+                    int(author_idx) if author_idx is not None else AUTHOR_UNK_IDX
+                )
+
+        for row_idx in row_indices:
+            author_indices = (
+                self.liked_post_author_indices[row_idx]
+                if self.liked_post_author_indices is not None
+                else [None] * len(self.liked_post_ids[row_idx])
             )
+            for post_id, emb_idx, author_idx in zip(
+                self.liked_post_ids[row_idx],
+                self.liked_post_emb_indices[row_idx],
+                author_indices,
+            ):
+                add_candidate(post_id, int(emb_idx), int(author_idx) if author_idx is not None else None)
+
+        for post in self.sampled_posts_by_bucket.get(bucket, []):
+            add_candidate(post["post_id"], int(post["emb_idx"]), post.get("author_idx"))
+
+        candidate_post_embeddings = torch.from_numpy(
+            np.array(self.embeddings[np.array(candidate_emb_indices, dtype=np.int64)], dtype=np.float32)
+        )
+        label_matrix = torch.zeros((len(user_ids), len(candidate_post_ids)), dtype=torch.float32)
+        for row_idx in row_indices:
+            user_idx = user_to_batch_idx[self.user_ids[row_idx]]
+            for post_id in self.liked_post_ids[row_idx]:
+                candidate_idx = candidate_to_idx.get(post_id)
+                if candidate_idx is not None:
+                    label_matrix[user_idx, candidate_idx] = 1.0
+
+        output: Dict[str, Any] = {
+            "history_embeddings": torch.stack(history_tensors, dim=0),
+            "history_mask": torch.stack(mask_tensors, dim=0),
+            "candidate_post_embeddings": candidate_post_embeddings,
+            "label_matrix": label_matrix,
+            "user_id": user_ids,
+            "candidate_post_id": candidate_post_ids,
+            "bucket": bucket,
+        }
+        if self.use_author_embedding_table:
+            output["history_author_indices"] = torch.stack(
+                [self._padded_author_history_for_row(row_idx) for row_idx in row_indices],
+                dim=0,
+            )
+            output["candidate_post_author_idx"] = torch.tensor(candidate_author_indices, dtype=torch.long)
         return output
 
 
-# ---------------------------------------------------------------------------
-# DataLoader factory
-# ---------------------------------------------------------------------------
+class BucketedBatchSampler(Sampler[List[int]]):
+    """Yield user-hour-row batches where each batch belongs to one hour bucket."""
 
-def create_data_loaders(
-    train_dataset: Dataset,
-    val_dataset: Dataset,
+    def __init__(
+        self,
+        dataset: BucketedEngagementDataset,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+        batches: List[List[int]] = []
+        buckets = list(self.dataset.row_indices_by_bucket.keys())
+        if self.shuffle:
+            rng.shuffle(buckets)
+        for bucket in buckets:
+            row_indices = list(self.dataset.row_indices_by_bucket[bucket])
+            if self.shuffle:
+                rng.shuffle(row_indices)
+            for start in range(0, len(row_indices), self.batch_size):
+                batch = row_indices[start:start + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        yield from batches
+
+    def __len__(self) -> int:
+        total = 0
+        for row_indices in self.dataset.row_indices_by_bucket.values():
+            n_rows = len(row_indices)
+            full_batches = n_rows // self.batch_size
+            total += full_batches
+            if n_rows % self.batch_size and not self.drop_last:
+                total += 1
+        return total
+
+
+def create_bucketed_data_loaders(
+    train_dataset: BucketedEngagementDataset,
+    val_dataset: BucketedEngagementDataset,
+    val_unseen_dataset: BucketedEngagementDataset,
     batch_size: int,
-    holdout_dataset: Optional[Dataset] = None,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    persistent_workers: bool = True,
-    prefetch_factor: int = 2,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+    seed: int,
+    holdout_dataset: Optional[BucketedEngagementDataset] = None,
 ):
-    """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
-    
-    Configures efficient data loading with multi-worker parallelism and GPU pinning.
-    
-    DataLoader configuration rationale:
-        - num_workers > 0: Parallel data loading prevents GPU starvation
-        - pin_memory: Speeds up CPU->GPU transfer by using page-locked memory
-        - persistent_workers: Avoids worker process respawn overhead between epochs
-        - prefetch_factor: Workers pre-load batches to hide data loading latency
-        - drop_last=True for training: Ensures consistent batch sizes for BatchNorm
-        
-    Args:
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-        batch_size: Number of samples per batch
-        holdout_dataset: Optional holdout dataset for final evaluation
-        num_workers: Number of parallel data loading workers (0 = main process only)
-        pin_memory: Use pinned (page-locked) memory for faster GPU transfer
-        persistent_workers: Keep workers alive between epochs
-        prefetch_factor: Number of batches to prefetch per worker
-    
-    Returns:
-        Tuple of (train_loader, val_loader, holdout_loader).
-        holdout_loader is None if holdout_dataset is not provided.
-    
-    Note:
-        With SummarizedEngagementDataset (pre-computed tensors), workers just do
-        index lookups and collation, so even a few workers eliminate CPU bottlenecks.
-        With SequenceEngagementDataset (on-the-fly memmap loading), workers pipeline
-        the I/O to keep GPUs fed during training.
-    """
+    """Create DataLoaders for bucketed two-tower batches."""
     from torch.utils.data import DataLoader
-    
-    # Base worker configuration
+
     worker_kw: Dict[str, Any] = {
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
-    # Add worker-specific options only when using multiple workers
     if num_workers > 0:
         worker_kw.update(
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
         )
 
-    # Create DataLoaders with appropriate settings for each split
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,  # Shuffle for stochastic training
-        drop_last=True,  # Drop incomplete final batch for BatchNorm stability
-        **worker_kw
+        train_dataset,
+        batch_sampler=BucketedBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            seed=seed,
+        ),
+        collate_fn=train_dataset.collate_batch,
+        **worker_kw,
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,  # No shuffle for validation (deterministic evaluation)
-        **worker_kw
+        val_dataset,
+        batch_sampler=BucketedBatchSampler(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            seed=seed,
+        ),
+        collate_fn=val_dataset.collate_batch,
+        **worker_kw,
     )
-    holdout_loader = DataLoader(
-        holdout_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        **worker_kw
-    ) if holdout_dataset else None
-    return train_loader, val_loader, holdout_loader
+    val_unseen_loader = DataLoader(
+        val_unseen_dataset,
+        batch_sampler=BucketedBatchSampler(
+            val_unseen_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            seed=seed,
+        ),
+        collate_fn=val_unseen_dataset.collate_batch,
+        **worker_kw,
+    )
+    holdout_loader = None
+    if holdout_dataset is not None:
+        holdout_loader = DataLoader(
+            holdout_dataset,
+            batch_sampler=BucketedBatchSampler(
+                holdout_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=False,
+                seed=seed,
+            ),
+            collate_fn=holdout_dataset.collate_batch,
+            **worker_kw,
+        )
+    return train_loader, val_loader, val_unseen_loader, holdout_loader

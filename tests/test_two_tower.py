@@ -1,23 +1,253 @@
 """Comprehensive tests for Two Tower model architecture."""
 import importlib
+import math
 import polars as pl
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Import from module with numeric prefix
-stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
+stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_tower")
+matrix_ranking = importlib.import_module("utils.matrix_ranking")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
 PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
 AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
 AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
-build_author_serving_mapping = stage_train_two_tower.build_author_serving_mapping
+_rank_metric_sums_for_batch = matrix_ranking.rank_metric_sums_for_batch
+_calc_baseline_rank_metrics_for_batch = matrix_ranking.calc_baseline_rank_metrics_for_batch
+_finalize_rank_metrics = matrix_ranking.finalize_rank_metrics
+run_matrix_epoch = matrix_ranking.run_matrix_epoch
+_evaluate_two_tower_model = matrix_ranking.evaluate_matrix_model
+_ranking_rows_for_batch = matrix_ranking.ranking_rows_for_batch
 
 
 # =============================================================================
 # PostTower Tests
 # =============================================================================
+
+def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
+    ranked_labels = torch.tensor([
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+
+    metric_sums, user_count = _rank_metric_sums_for_batch(ranked_labels, [1, 2])
+    metrics = _finalize_rank_metrics(metric_sums, user_count)
+
+    discount_2 = 1.0 / math.log2(3.0)
+    assert user_count == 2
+    assert metrics["dcg@1"] == pytest.approx(0.5)
+    assert metrics["ndcg@1"] == pytest.approx(0.5)
+    assert metrics["recall@1"] == pytest.approx(0.25)
+    assert metrics["dcg@2"] == pytest.approx((1.0 + discount_2 + discount_2) / 2.0)
+    assert metrics["ndcg@2"] == pytest.approx((1.0 + discount_2) / 2.0)
+    assert metrics["recall@2"] == pytest.approx(1.0)
+
+
+def test_baseline_rank_metrics_use_expected_random_order_value():
+    labels = torch.tensor([
+        [1.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+    ])
+
+    metric_sums, user_count = _calc_baseline_rank_metrics_for_batch(labels, [1, 3])
+    metrics = _finalize_rank_metrics(metric_sums, user_count)
+
+    discount_2 = 1.0 / math.log2(3.0)
+    discount_3 = 1.0 / math.log2(4.0)
+    discount_sum_3 = 1.0 + discount_2 + discount_3
+    row_1_ndcg_3 = (0.5 * discount_sum_3) / (1.0 + discount_2)
+    row_2_ndcg_3 = 0.25 * discount_sum_3
+    assert user_count == 2
+    assert metrics["dcg@1"] == pytest.approx((0.5 + 0.25) / 2.0)
+    assert metrics["ndcg@1"] == pytest.approx((0.5 + 0.25) / 2.0)
+    assert metrics["recall@1"] == pytest.approx(0.25)
+    assert metrics["dcg@3"] == pytest.approx((0.5 * discount_sum_3 + 0.25 * discount_sum_3) / 2.0)
+    assert metrics["ndcg@3"] == pytest.approx((row_1_ndcg_3 + row_2_ndcg_3) / 2.0)
+    assert metrics["recall@3"] == pytest.approx(0.75)
+
+
+class DummyTwoTowerForEpoch(nn.Module):
+    def compute_loss_and_preds(self, batch, device, embed_dim):
+        labels = batch["label_matrix"].to(device, dtype=torch.float32)
+        return torch.zeros((), device=device), labels
+
+
+def test_evaluate_two_tower_model_reports_auc_and_average_precision():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [{
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]),
+    }]
+
+    result = _evaluate_two_tower_model(
+        model=model,
+        data_loader=dataloader,
+        device="cpu",
+        embed_dim=0,
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+    )
+
+    metrics = result["metrics"]
+    assert metrics["auc_roc"] == pytest.approx(1.0)
+    assert metrics["average_precision"] == pytest.approx(1.0)
+    assert metrics["classification_metric_pair_count"] == 6
+    assert metrics["classification_metric_positive_count"] == 3
+    assert metrics["classification_metric_sampled_pair_count"] == 6
+    assert metrics["classification_metric_sampled"] is False
+    assert result["ranking_rows"] == []
+
+
+def test_ranking_rows_for_batch_reports_per_user_matrix_metrics():
+    batch = {
+        "user_id": ["u1", "u2"],
+        "bucket": "2026-05-01T00:00:00Z",
+        "history_mask": torch.tensor([
+            [True, True, False],
+            [True, False, False],
+        ]),
+    }
+    scores = torch.tensor([
+        [0.9, 0.1, 0.8],
+        [0.2, 0.7, 0.1],
+    ])
+    labels = torch.tensor([
+        [1.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ])
+
+    rows = _ranking_rows_for_batch(batch, scores, labels, [1, 2])
+
+    assert len(rows) == 2
+    assert rows[0]["did"] == "u1"
+    assert rows[0]["num_embedding_likes"] == 2
+    assert rows[0]["candidate_count"] == 3
+    assert rows[0]["positive_count"] == 2
+    assert rows[0]["positive_rank_min"] == pytest.approx(1.0)
+    assert rows[0]["positive_rank_mean"] == pytest.approx(1.5)
+    assert rows[0]["ndcg@1"] == pytest.approx(1.0)
+    assert rows[0]["recall@1"] == pytest.approx(0.5)
+    assert rows[0]["ndcg@2"] == pytest.approx(1.0)
+    assert rows[0]["recall@2"] == pytest.approx(1.0)
+    assert rows[0]["average_precision"] == pytest.approx(1.0)
+    assert rows[0]["auc_roc"] == pytest.approx(1.0)
+    assert rows[1]["did"] == "u2"
+    assert rows[1]["num_embedding_likes"] == 1
+    assert rows[1]["positive_count"] == 1
+    assert rows[1]["ndcg@1"] == pytest.approx(1.0)
+    assert rows[1]["average_precision"] == pytest.approx(1.0)
+
+
+def test_evaluate_two_tower_model_collects_ranking_rows_when_requested():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [{
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]),
+        "user_id": ["u1", "u2"],
+        "bucket": "2026-05-01T00:00:00Z",
+        "history_mask": torch.tensor([
+            [True, True, False],
+            [True, False, False],
+        ]),
+    }]
+
+    result = _evaluate_two_tower_model(
+        model=model,
+        data_loader=dataloader,
+        device="cpu",
+        embed_dim=0,
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+        collect_ranking_rows=True,
+    )
+
+    assert len(result["ranking_rows"]) == 2
+    assert result["ranking_rows"][0]["did"] == "u1"
+    assert result["ranking_rows"][0]["average_precision"] == pytest.approx(1.0)
+
+
+def test_run_matrix_epoch_baseline_metrics_do_not_advance_global_torch_rng():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [{
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]),
+    }]
+
+    torch.manual_seed(1234)
+    expected_next_random = torch.rand(5)
+
+    torch.manual_seed(1234)
+    run_matrix_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=dataloader,
+        optimizer=None,
+        disable_progress=True,
+        embed_dim=0,
+        gradient_clip_max_norm=0.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=True,
+    )
+    actual_next_random = torch.rand(5)
+
+    assert actual_next_random == pytest.approx(expected_next_random)
+
+
+def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
+    model = DummyTwoTowerForEpoch()
+    dataloader = [
+        {"label_matrix": torch.ones((2, 3), dtype=torch.float32)},
+        {"label_matrix": torch.ones((3, 3), dtype=torch.float32)},
+    ]
+
+    def fake_baseline_metrics(labels, metrics_top_ks, generator=None):
+        user_count = labels.shape[0]
+        return {
+            f"dcg@{k}": float(user_count)
+            for k in metrics_top_ks
+        } | {
+            f"ndcg@{k}": float(user_count)
+            for k in metrics_top_ks
+        } | {
+            f"recall@{k}": float(user_count)
+            for k in metrics_top_ks
+        }, user_count
+
+    monkeypatch.setattr(matrix_ranking, "calc_baseline_rank_metrics_for_batch", fake_baseline_metrics)
+
+    _, _, baseline_metrics = run_matrix_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=dataloader,
+        optimizer=None,
+        disable_progress=True,
+        embed_dim=0,
+        gradient_clip_max_norm=0.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=True,
+    )
+
+    assert baseline_metrics == {
+        "dcg@1": pytest.approx(1.0),
+        "dcg@2": pytest.approx(1.0),
+        "ndcg@1": pytest.approx(1.0),
+        "ndcg@2": pytest.approx(1.0),
+        "recall@1": pytest.approx(1.0),
+        "recall@2": pytest.approx(1.0),
+    }
 
 def test_post_tower_initialization():
     """Test PostTower initializes correctly."""
@@ -339,9 +569,9 @@ def test_two_tower_empty_history_scores_vary_with_post_full_transformer():
     with torch.no_grad():
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
 
-    assert scores.shape == (batch_size,)
+    assert scores.shape == (batch_size, batch_size)
     assert torch.isfinite(scores).all()
-    assert not torch.allclose(scores[0], scores[1]), "Scores should depend on the post even for empty histories"
+    assert not torch.allclose(scores[:, 0], scores[:, 1]), "Scores should depend on the post even for empty histories"
 
 def test_two_tower_empty_history_scores_vary_with_post_summarized():
     """Cold-start users should not get identical Two-Tower scores in summarized mode."""
@@ -372,9 +602,9 @@ def test_two_tower_empty_history_scores_vary_with_post_summarized():
     with torch.no_grad():
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
 
-    assert scores.shape == (batch_size,)
+    assert scores.shape == (batch_size, batch_size)
     assert torch.isfinite(scores).all()
-    assert not torch.allclose(scores[0], scores[1]), "Scores should depend on the post even for empty summarized histories"
+    assert not torch.allclose(scores[:, 0], scores[:, 1]), "Scores should depend on the post even for empty summarized histories"
 
 
 # =============================================================================
@@ -467,6 +697,7 @@ def test_two_tower_encode_post_can_skip_l2_normalization():
 def test_two_tower_forward_shape():
     """Test TwoTowerModel forward pass produces correct output shape."""
     batch_size = 16
+    num_candidates = 9
     seq_len = 50
     input_dim = 384
     
@@ -487,12 +718,12 @@ def test_two_tower_forward_shape():
     
     history_embeddings = torch.randn(batch_size, seq_len, input_dim)
     history_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-    post_embeddings = torch.randn(batch_size, input_dim)
+    post_embeddings = torch.randn(num_candidates, input_dim)
     
     scores = model.forward(history_embeddings, history_mask, post_embeddings)
     
     # Scores should be raw logits (before sigmoid)
-    assert scores.shape == (batch_size,)
+    assert scores.shape == (batch_size, num_candidates)
     assert scores.dtype == torch.float32
 
 
@@ -515,10 +746,11 @@ def test_two_tower_forward_dot_product():
     
     model.eval()
     with torch.no_grad():
-        batch_size = 4
-        history_embeddings = torch.randn(batch_size, 50, 384)
-        history_mask = torch.ones(batch_size, 50, dtype=torch.bool)
-        post_embeddings = torch.randn(batch_size, 384)
+        num_users = 4
+        num_candidates = 6
+        history_embeddings = torch.randn(num_users, 50, 384)
+        history_mask = torch.ones(num_users, 50, dtype=torch.bool)
+        post_embeddings = torch.randn(num_candidates, 384)
         
         # Get scores via forward
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
@@ -526,7 +758,7 @@ def test_two_tower_forward_dot_product():
         # Compute manually
         user_emb = model.encode_user(history_embeddings, history_mask)
         post_emb = model.encode_post(post_embeddings)
-        manual_scores = (user_emb * post_emb).sum(dim=-1) / model.similarity_temperature
+        manual_scores = torch.matmul(user_emb, post_emb.T) / model.similarity_temperature
         
         # Should match
         assert torch.allclose(scores, manual_scores, rtol=1e-5)
@@ -555,7 +787,7 @@ def test_two_tower_forward_without_l2_normalization_uses_raw_dot_product():
 
     score = model.forward(history_embeddings, history_mask, post_embeddings)
 
-    assert torch.allclose(score, torch.tensor([20.0]))
+    assert torch.allclose(score, torch.tensor([[20.0]]))
 
 
 def test_two_tower_forward_with_l2_normalization_uses_cosine_similarity():
@@ -581,15 +813,16 @@ def test_two_tower_forward_with_l2_normalization_uses_cosine_similarity():
 
     score = model.forward(history_embeddings, history_mask, post_embeddings)
 
-    assert torch.allclose(score, torch.tensor([0.8]))
+    assert torch.allclose(score, torch.tensor([[0.8]]))
 
 
 def test_two_tower_forward_both_encoder_types():
     """Test TwoTowerModel forward works with both encoder types."""
     batch_size = 8
+    num_candidates = 5
     history_embeddings = torch.randn(batch_size, 30, 384)
     history_mask = torch.ones(batch_size, 30, dtype=torch.bool)
-    post_embeddings = torch.randn(batch_size, 384)
+    post_embeddings = torch.randn(num_candidates, 384)
     
     for encoder_type in ["full_transformer", "cross_attention"]:
         model = TwoTowerModel(
@@ -608,7 +841,7 @@ def test_two_tower_forward_both_encoder_types():
         )
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
-        assert scores.shape == (batch_size,)
+        assert scores.shape == (batch_size, num_candidates)
 
 def test_two_tower_summarized_user_tower_torchscript():
     """Test summarized user_tower can be TorchScript scripted (serving artifact)."""
@@ -642,41 +875,47 @@ def test_two_tower_summarized_user_tower_torchscript():
 def test_two_tower_compute_loss_and_preds():
     """Test TwoTowerModel compute_loss_and_preds method."""
     model = TwoTowerModel(
-        post_embedding_dim=384,
-        shared_dim=128,
-        user_hidden_dim=256,
-        post_hidden_dim=256,
+        post_embedding_dim=32,
+        shared_dim=16,
+        user_hidden_dim=32,
+        post_hidden_dim=32,
         num_attention_heads=4,
-        num_attention_layers=2,
-        max_history_len=50,
-        dropout_rate=0.3,
+        num_attention_layers=1,
+        max_history_len=8,
+        dropout_rate=0.0,
         similarity_temperature=0.2,
-        user_encoder_type="full_transformer",
+        user_encoder_type="cross_attention",
         use_post_encoder=True,
         l2_normalize_embeddings=True,
     )
     
-    batch_size = 16
-    history_embeddings = torch.randn(batch_size, 50, 384)
-    history_mask = torch.ones(batch_size, 50, dtype=torch.bool)
-    post_embeddings = torch.randn(batch_size, 384)
-    labels = torch.randint(0, 2, (batch_size,)).float()
+    num_users = 4
+    num_candidates = 6
+    history_embeddings = torch.randn(num_users, 8, 32)
+    history_mask = torch.ones(num_users, 8, dtype=torch.bool)
+    post_embeddings = torch.randn(num_candidates, 32)
+    label_matrix = torch.tensor([
+        [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    ])
     
     batch = {
         "history_embeddings": history_embeddings,
         "history_mask": history_mask,
-        "target_post_embedding": post_embeddings,
-        "label": labels,
+        "candidate_post_embeddings": post_embeddings,
+        "label_matrix": label_matrix,
     }
-    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=384)
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=32)
     
     # Check loss
     assert loss.shape == ()
     assert loss.dtype == torch.float32
-    assert loss.item() >= 0, "BCE loss should be non-negative"
+    assert loss.item() >= 0, "Contrastive loss should be non-negative"
     
     # Check scores (raw logits)
-    assert scores.shape == (batch_size,)
+    assert scores.shape == (num_users, num_candidates)
     assert scores.dtype == torch.float32
     
     # Verify sigmoid(scores) is in [0, 1]
@@ -684,43 +923,49 @@ def test_two_tower_compute_loss_and_preds():
     assert (probs >= 0).all() and (probs <= 1).all()
 
 
-def test_two_tower_compute_loss_and_preds_summarized_empty_history_uses_empty_embedding():
-    """Summarized compute_loss_and_preds should use cold-start embedding for empty histories."""
-    torch.manual_seed(0)
-    embed_dim = 16
+def test_two_tower_multi_positive_loss_averages_per_user():
+    """Rows should contribute equally even when they have different positive counts."""
     model = TwoTowerModel(
-        post_embedding_dim=embed_dim,
-        shared_dim=embed_dim,
-        user_hidden_dim=32,
-        post_hidden_dim=32,
-        num_attention_heads=2,
+        post_embedding_dim=3,
+        shared_dim=2,
+        user_hidden_dim=4,
+        post_hidden_dim=4,
+        num_attention_heads=1,
         num_attention_layers=1,
-        max_history_len=10,
+        max_history_len=1,
         dropout_rate=0.0,
-        similarity_temperature=0.2,
-        user_encoder_type="summarized",
-        use_post_encoder=False,
-        l2_normalize_embeddings=True,
+        similarity_temperature=1.0,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
     )
-    model.eval()
 
-    batch_size = 8
-    user_summary = torch.zeros(batch_size, embed_dim)
-    post_embeddings = torch.arange(embed_dim, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
-    features = torch.cat([user_summary, post_embeddings], dim=1)
-    batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
+    fixed_scores = torch.tensor([
+        [3.0, 1.0, 0.0],
+        [0.0, 2.0, 1.0],
+    ])
+    label_matrix = torch.tensor([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 1.0],
+    ])
 
-    with torch.no_grad():
-        model.user_tower.tower.empty_user_embedding.zero_()
-        model.user_tower.tower.empty_user_embedding[0] = 1.0
-    _, scores1 = model.compute_loss_and_preds(batch, device="cpu", embed_dim=embed_dim)
+    def fake_forward(history_embeddings, history_mask, post_embeddings, history_author_indices=None, target_author_indices=None):
+        return fixed_scores
 
-    with torch.no_grad():
-        model.user_tower.tower.empty_user_embedding.zero_()
-        model.user_tower.tower.empty_user_embedding[1] = 1.0
-    _, scores2 = model.compute_loss_and_preds(batch, device="cpu", embed_dim=embed_dim)
+    model.forward = fake_forward
+    batch = {
+        "history_embeddings": torch.randn(2, 1, 3),
+        "history_mask": torch.ones(2, 1, dtype=torch.bool),
+        "candidate_post_embeddings": torch.randn(3, 3),
+        "label_matrix": label_matrix,
+    }
 
-    assert not torch.allclose(scores1, scores2), "Scores should depend on the cold-start embedding for empty histories"
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=3)
+
+    targets = label_matrix / label_matrix.sum(dim=1, keepdim=True)
+    expected = -(targets * F.log_softmax(fixed_scores, dim=1)).sum(dim=1).mean()
+    assert torch.allclose(scores, fixed_scores)
+    assert torch.allclose(loss, expected)
 
 
 def test_two_tower_compute_loss_all_positive():
@@ -740,26 +985,28 @@ def test_two_tower_compute_loss_all_positive():
         l2_normalize_embeddings=True,
     )
     
-    batch_size = 8
-    history_embeddings = torch.randn(batch_size, 20, 128)
-    history_mask = torch.ones(batch_size, 20, dtype=torch.bool)
-    post_embeddings = torch.randn(batch_size, 128)
-    labels = torch.ones(batch_size)  # All positive
+    num_users = 4
+    num_candidates = 5
+    history_embeddings = torch.randn(num_users, 20, 128)
+    history_mask = torch.ones(num_users, 20, dtype=torch.bool)
+    post_embeddings = torch.randn(num_candidates, 128)
+    label_matrix = torch.ones(num_users, num_candidates)
     
     batch = {
         "history_embeddings": history_embeddings,
         "history_mask": history_mask,
-        "target_post_embedding": post_embeddings,
-        "label": labels,
+        "candidate_post_embeddings": post_embeddings,
+        "label_matrix": label_matrix,
     }
     loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
     
     assert torch.isfinite(loss)
     assert loss.item() >= 0
+    assert scores.shape == (num_users, num_candidates)
 
 
-def test_two_tower_compute_loss_all_negative():
-    """Test TwoTowerModel compute_loss with all negative labels."""
+def test_two_tower_compute_loss_rejects_rows_without_positives():
+    """Each user row needs at least one positive candidate for contrastive loss."""
     model = TwoTowerModel(
         post_embedding_dim=128,
         shared_dim=64,
@@ -775,22 +1022,26 @@ def test_two_tower_compute_loss_all_negative():
         l2_normalize_embeddings=True,
     )
     
-    batch_size = 8
-    history_embeddings = torch.randn(batch_size, 20, 128)
-    history_mask = torch.ones(batch_size, 20, dtype=torch.bool)
-    post_embeddings = torch.randn(batch_size, 128)
-    labels = torch.zeros(batch_size)  # All negative
+    num_users = 3
+    num_candidates = 4
+    history_embeddings = torch.randn(num_users, 20, 128)
+    history_mask = torch.ones(num_users, 20, dtype=torch.bool)
+    post_embeddings = torch.randn(num_candidates, 128)
+    label_matrix = torch.tensor([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ])
     
     batch = {
         "history_embeddings": history_embeddings,
         "history_mask": history_mask,
-        "target_post_embedding": post_embeddings,
-        "label": labels,
+        "candidate_post_embeddings": post_embeddings,
+        "label_matrix": label_matrix,
     }
-    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
     
-    assert torch.isfinite(loss)
-    assert loss.item() >= 0
+    with pytest.raises(RuntimeError, match="at least one positive"):
+        model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
 
 
 # =============================================================================
@@ -814,17 +1065,23 @@ def test_two_tower_backward_pass():
         l2_normalize_embeddings=True,
     )
     
-    batch_size = 8
-    history_embeddings = torch.randn(batch_size, 50, 384)
-    history_mask = torch.ones(batch_size, 50, dtype=torch.bool)
-    post_embeddings = torch.randn(batch_size, 384)
-    labels = torch.randint(0, 2, (batch_size,)).float()
+    num_users = 4
+    num_candidates = 6
+    history_embeddings = torch.randn(num_users, 50, 384)
+    history_mask = torch.ones(num_users, 50, dtype=torch.bool)
+    post_embeddings = torch.randn(num_candidates, 384)
+    label_matrix = torch.tensor([
+        [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    ])
     
     batch = {
         "history_embeddings": history_embeddings,
         "history_mask": history_mask,
-        "target_post_embedding": post_embeddings,
-        "label": labels,
+        "candidate_post_embeddings": post_embeddings,
+        "label_matrix": label_matrix,
     }
     loss, _ = model.compute_loss_and_preds(batch, device="cpu", embed_dim=384)
     
@@ -978,12 +1235,13 @@ def test_two_tower_different_shared_dims():
         )
         
         batch_size = 4
+        num_candidates = 3
         history_embeddings = torch.randn(batch_size, 50, 384)
         history_mask = torch.ones(batch_size, 50, dtype=torch.bool)
-        post_embeddings = torch.randn(batch_size, 384)
+        post_embeddings = torch.randn(num_candidates, 384)
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
-        assert scores.shape == (batch_size,)
+        assert scores.shape == (batch_size, num_candidates)
 
 
 def test_two_tower_different_num_heads():
@@ -1008,12 +1266,13 @@ def test_two_tower_different_num_heads():
         )
         
         batch_size = 4
+        num_candidates = 3
         history_embeddings = torch.randn(batch_size, 50, 384)
         history_mask = torch.ones(batch_size, 50, dtype=torch.bool)
-        post_embeddings = torch.randn(batch_size, 384)
+        post_embeddings = torch.randn(num_candidates, 384)
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
-        assert scores.shape == (batch_size,)
+        assert scores.shape == (batch_size, num_candidates)
 
 
 def test_post_author_feature_encoder_zeroes_padding_row():
@@ -1026,58 +1285,6 @@ def test_post_author_feature_encoder_zeroes_padding_row():
 
     assert torch.all(encoder.author_embedding.weight[0] == 0)
     assert torch.any(encoder.author_embedding.weight[1] != 0)
-
-
-def test_build_author_serving_mapping_exports_final_table_rows():
-    author_idx_mapping_df = pl.DataFrame({
-        "emb_idx": [10, 11, 20, 30],
-        "author_did": ["author_a", "author_a", "author_b", "author_c"],
-        "author_idx": pl.Series([1, 1, 2, 3], dtype=pl.UInt32),
-        "author_train_count": [5, 5, 2, 7],
-    })
-    author_idx_to_table_row = torch.tensor([1, 2, 1, 4], dtype=torch.int64).numpy()
-
-    result = build_author_serving_mapping(
-        author_idx_mapping_df=author_idx_mapping_df,
-        author_idx_to_table_row=author_idx_to_table_row,
-    )
-
-    assert result.columns == [
-        "author_did",
-        "author_idx",
-        "author_train_count",
-        "author_table_row",
-    ]
-    assert result.to_dicts() == [
-        {
-            "author_did": "author_a",
-            "author_idx": 1,
-            "author_train_count": 5,
-            "author_table_row": 2,
-        },
-        {
-            "author_did": "author_c",
-            "author_idx": 3,
-            "author_train_count": 7,
-            "author_table_row": 4,
-        },
-    ]
-
-
-def test_build_author_serving_mapping_omits_out_of_range_author():
-    author_idx_mapping_df = pl.DataFrame({
-        "author_did": ["author_missing"],
-        "author_idx": pl.Series([9], dtype=pl.UInt32),
-        "author_train_count": [10],
-    })
-    author_idx_to_table_row = torch.tensor([1, 2], dtype=torch.int64).numpy()
-
-    result = build_author_serving_mapping(
-        author_idx_mapping_df=author_idx_mapping_df,
-        author_idx_to_table_row=author_idx_to_table_row,
-    )
-
-    assert result.is_empty()
 
 
 def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
@@ -1203,24 +1410,29 @@ def test_two_tower_compute_loss_and_preds_with_author_embeddings():
         author_unknown_dropout_rate=0.0,
     )
 
-    batch_size = 3
+    num_users = 3
+    num_candidates = 4
     batch = {
-        "history_embeddings": torch.randn(batch_size, 4, 8),
-        "history_mask": torch.ones(batch_size, 4, dtype=torch.bool),
-        "target_post_embedding": torch.randn(batch_size, 8),
+        "history_embeddings": torch.randn(num_users, 4, 8),
+        "history_mask": torch.ones(num_users, 4, dtype=torch.bool),
+        "candidate_post_embeddings": torch.randn(num_candidates, 8),
         "history_author_indices": torch.tensor(
             [[2, 3, 0, 0], [4, 1, 5, 0], [1, 1, 1, 1]],
             dtype=torch.long,
         ),
-        "target_post_author_idx": torch.tensor([2, 5, 1], dtype=torch.long),
-        "label": torch.tensor([1.0, 0.0, 1.0]),
+        "candidate_post_author_idx": torch.tensor([2, 5, 1, 3], dtype=torch.long),
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]),
     }
 
     loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=8)
 
     assert loss.shape == ()
     assert torch.isfinite(loss)
-    assert scores.shape == (batch_size,)
+    assert scores.shape == (num_users, num_candidates)
 
 
 def test_author_enabled_towers_are_torchscriptable():

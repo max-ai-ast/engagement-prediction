@@ -1,770 +1,235 @@
-"""Comprehensive tests for dataloader classes and functions."""
+"""Tests for bucketed two-tower dataloaders."""
+from datetime import datetime, timezone
+
 import numpy as np
 import polars as pl
 import pytest
-import torch
 from torch.utils.data import DataLoader
 
 from utils.dataloaders import (
     AUTHOR_PAD_IDX,
     AUTHOR_UNK_IDX,
-    SummarizedEngagementDataset,
-    SequenceEngagementDataset,
-    SummarizedUserTower,
-    TransformerDualPoolingEncoder,
-    CrossAttentionPoolingEncoder,
-    build_author_table_lookup,
-    create_data_loaders,
-    MeanSummarizer,
+    BucketedBatchSampler,
+    BucketedEngagementDataset,
+    create_bucketed_data_loaders,
+    get_author_table_num_rows,
 )
 
 
-# =============================================================================
-# Fixtures for test data
-# =============================================================================
+def _dt(hour: int) -> datetime:
+    return datetime(2024, 1, 1, hour, tzinfo=timezone.utc)
+
 
 @pytest.fixture
 def mock_embeddings_mmap():
-    """Create a mock embeddings memmap with 100 posts, each with 64-dim embeddings."""
-    np.random.seed(42)
-    return np.random.randn(100, 64).astype(np.float32)
+    values = np.arange(40 * 4, dtype=np.float32).reshape(40, 4)
+    return values / 10.0
 
 
 @pytest.fixture
-def mock_target_posts_df():
-    """Create a mock target_posts DataFrame with train/val splits."""
+def mock_likes_core_df():
     return pl.DataFrame({
-        "split": ["train"] * 8 + ["val"] * 4,
-        "target_did": [f"user{i}" for i in range(12)],
-        "like_uri": [f"post{i}" for i in range(12)],
-        "neg_uri": [f"neg{i}" for i in range(12)],
-        "like_emb_idx": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-        "neg_emb_idx": [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
-        "like_author_idx": [1, 2, 3, None, 99, 1, 2, 3, 1, 2, 3, 99],
-        "neg_author_idx": [3, 2, 1, 99, None, 3, 2, 1, 3, 2, 1, None],
+        "did": ["u1", "u2", "u1", "u1", "u3", "u4", "u5"],
+        "subject_uri": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        "split": ["train", "train", "train", "train", "train", "val", "val_unseen_users"],
+        "like_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
+        "emb_idx": [0, 1, 2, 3, 4, 5, 6],
+        "author_idx": pl.Series([2, 3, 4, None, 2, 2, 4], dtype=pl.UInt32),
+    })
+
+
+@pytest.fixture
+def mock_posts_core_df():
+    return pl.DataFrame({
+        "at_uri": ["n1", "p2", "p3", "p4", "n2", "n_val", "n_holdout"],
+        "in_random_sample": [True, True, True, True, True, True, True],
+        "negative_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(10), _dt(11), _dt(13), _dt(14)],
+        "split_window": ["train", "train", "train", "train", "train", "val", "holdout"],
+        "emb_idx": [20, 1, 2, 3, 21, 22, 23],
+        "author_idx": pl.Series([2, 3, 4, None, 2, 4, 2], dtype=pl.UInt32),
     })
 
 
 @pytest.fixture
 def mock_history_df():
-    """Create a mock history DataFrame with variable-length user histories."""
-    # Create some users with different history lengths
     return pl.DataFrame({
-        "target_did": [f"user{i}" for i in range(12)],
-        "like_uri": [f"post{i}" for i in range(12)],
-        "prior_emb_indices": [
-            [40, 41, 42],  # user0: 3 items
-            [43, 44],      # user1: 2 items
-            [],            # user2: empty history
-            [45, 46, 47, 48, 49],  # user3: 5 items
-            [50],          # user4: 1 item
-            [51, 52, 53, 54],  # user5: 4 items
-            [55, 56],      # user6: 2 items
-            [57],          # user7: 1 item
-            [58, 59, 60],  # user8: 3 items (val split starts here)
-            [],            # user9: empty history
-            [61, 62, 63, 64, 65, 66],  # user10: 6 items
-            [67, 68],      # user11: 2 items
-        ],
+        "did": ["u1", "u2", "u1", "u3", "u4", "u5"],
+        "like_hour_bucket": [_dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
+        "prior_emb_indices": [[5, 6, 7], [], [8], [], [9], [10]],
+        "prior_author_indices": [[2, None, 4], [], [3], [], [2], [4]],
     })
 
 
-# =============================================================================
-# SummarizedEngagementDataset Tests
-# =============================================================================
-
-def test_summarized_dataset_initialization(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SummarizedEngagementDataset initializes correctly."""
-    summarizer = MeanSummarizer()
-    dataset = SummarizedEngagementDataset(
+@pytest.fixture
+def bucketed_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_df, mock_history_df):
+    return BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
         history_df=mock_history_df,
         split="train",
-        summarizer=summarizer,
-        embed_dim=64,
+        max_history_len=3,
+        embed_dim=4,
     )
-    
-    # Should have 2 samples per target post (positive + negative)
-    assert len(dataset) == 8 * 2  # 8 training posts
-    assert dataset.embed_dim == 64
 
 
-def test_summarized_dataset_item_shape(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SummarizedEngagementDataset returns correctly shaped items."""
-    summarizer = MeanSummarizer()
-    dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    # Test positive sample (even index)
-    pos_sample = dataset[0]
-    assert "features" in pos_sample
-    assert "label" in pos_sample
-    assert "user_id" in pos_sample
-    assert "post_id" in pos_sample
-    
-    # Features should be [user_summary || post_embedding] = 2 * embed_dim
-    assert pos_sample["features"].shape == (128,)
-    assert pos_sample["features"].dtype == torch.float32
-    assert pos_sample["label"].item() == 1.0
-    assert pos_sample["user_id"] == "user0"
-    assert pos_sample["post_id"] == "post0"
-    
-    # Test negative sample (odd index)
-    neg_sample = dataset[1]
-    assert neg_sample["features"].shape == (128,)
-    assert neg_sample["label"].item() == 0.0
-    assert neg_sample["user_id"] == "user0"
-    assert neg_sample["post_id"] == "neg0"
-
-
-def test_summarized_dataset_indexing_pattern(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SummarizedEngagementDataset indexing follows positive/negative pattern."""
-    summarizer = MeanSummarizer()
-    dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    # Check first few samples follow the pattern
-    for i in range(0, min(8, len(dataset)), 2):
-        pos = dataset[i]
-        neg = dataset[i + 1]
-        
-        # Positive and negative samples for same user should have same user_id
-        assert pos["user_id"] == neg["user_id"]
-        
-        # Labels should be correct
-        assert pos["label"].item() == 1.0
-        assert neg["label"].item() == 0.0
-        
-        # Post IDs should differ
-        assert pos["post_id"] != neg["post_id"]
-
-
-def test_summarized_dataset_empty_history(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SummarizedEngagementDataset handles users with empty history."""
-    summarizer = MeanSummarizer()
-    dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    # Find a sample for user2 (which has empty history)
-    # user2 is at index 2, so samples are at indices 4 and 5
-    sample = dataset[4]
-    
-    # User summary should be zero vector (first 64 dims)
-    user_summary = sample["features"][:64]
-    assert torch.allclose(user_summary, torch.zeros(64)), "Empty history should produce zero user summary"
-
-
-def test_summarized_dataset_split_filtering(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SummarizedEngagementDataset correctly filters by split."""
-    summarizer = MeanSummarizer()
-    
-    train_dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    val_dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="val",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    # Train has 8 posts, val has 4 posts
-    assert len(train_dataset) == 16  # 8 * 2
-    assert len(val_dataset) == 8     # 4 * 2
-
-
-# =============================================================================
-# SequenceEngagementDataset Tests
-# =============================================================================
-
-def test_sequence_dataset_initialization(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SequenceEngagementDataset initializes correctly."""
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=10,
-        embed_dim=64,
-    )
-    
-    assert len(dataset) == 8 * 2  # 8 training posts, 2 samples each
-    assert dataset.max_history_len == 10
-    assert dataset.embed_dim == 64
-
-
-def test_sequence_dataset_item_shape(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SequenceEngagementDataset returns correctly shaped items."""
-    max_history_len = 10
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=max_history_len,
-        embed_dim=64,
-    )
-    
-    sample = dataset[0]
-    
-    assert "history_embeddings" in sample
-    assert "history_mask" in sample
-    assert "target_post_embedding" in sample
-    assert "label" in sample
-    assert "user_id" in sample
-    assert "post_id" in sample
-    
-    # Check shapes
-    assert sample["history_embeddings"].shape == (max_history_len, 64)
-    assert sample["history_mask"].shape == (max_history_len,)
-    assert sample["target_post_embedding"].shape == (64,)
-    assert sample["label"].shape == ()  # scalar
-    
-    # Check types
-    assert sample["history_embeddings"].dtype == torch.float32
-    assert sample["history_mask"].dtype == torch.bool
-    assert sample["target_post_embedding"].dtype == torch.float32
-    assert sample["label"].dtype == torch.float32
-
-
-def test_sequence_dataset_padding_and_mask(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SequenceEngagementDataset correctly pads and masks sequences."""
-    max_history_len = 10
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=max_history_len,
-        embed_dim=64,
-    )
-    
-    # user0 has 3 history items
-    sample = dataset[0]
-    mask = sample["history_mask"]
-    
-    # First 3 positions should be True, rest False
-    assert mask[:3].all(), "First 3 positions should be valid"
-    assert not mask[3:].any(), "Remaining positions should be padding"
-    
-    # Padded positions should be zero
-    padded_embeddings = sample["history_embeddings"][3:]
-    assert torch.allclose(padded_embeddings, torch.zeros_like(padded_embeddings))
-
-
-def test_sequence_dataset_empty_history(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SequenceEngagementDataset handles empty history correctly."""
-    max_history_len = 10
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=max_history_len,
-        embed_dim=64,
-    )
-    
-    # user2 has empty history (index 4 and 5)
-    sample = dataset[4]
-    
-    # All mask should be False
-    assert not sample["history_mask"].any(), "Empty history should have all-False mask"
-    
-    # All embeddings should be zero
-    assert torch.allclose(sample["history_embeddings"], torch.zeros_like(sample["history_embeddings"]))
-
-
-def test_sequence_dataset_truncation(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SequenceEngagementDataset truncates long sequences."""
-    max_history_len = 3  # Shorter than some histories
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=max_history_len,
-        embed_dim=64,
-    )
-    
-    # user3 has 5 history items, but should be truncated to 3
-    sample = dataset[6]  # user3 is at index 3, samples at 6 and 7
-    mask = sample["history_mask"]
-    
-    # All positions should be valid (truncated)
-    assert mask.all(), "Truncated sequence should have all valid positions"
-
-
-def test_sequence_dataset_positive_negative_labeling(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test SequenceEngagementDataset correctly labels positive and negative samples."""
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=10,
-        embed_dim=64,
-    )
-    
-    # Check pattern for several users
-    for i in range(0, 8, 2):
-        pos = dataset[i]
-        neg = dataset[i + 1]
-        
-        assert pos["label"].item() == 1.0, f"Even index {i} should be positive"
-        assert neg["label"].item() == 0.0, f"Odd index {i+1} should be negative"
-        
-        # Same user, same history
-        assert pos["user_id"] == neg["user_id"]
-        assert torch.equal(pos["history_embeddings"], neg["history_embeddings"])
-        assert torch.equal(pos["history_mask"], neg["history_mask"])
-        
-        # Different target posts
-        assert not torch.equal(pos["target_post_embedding"], neg["target_post_embedding"])
-
-
-def test_build_author_table_lookup_applies_support_threshold():
+def test_get_author_table_num_rows_uses_stage_one_author_indices_directly():
     author_idx_mapping_df = pl.DataFrame({
-        "author_idx": pl.Series([1, 2, 3], dtype=pl.UInt32),
+        "author_idx": pl.Series([2, 3, 4], dtype=pl.UInt32),
         "author_train_count": [10, 3, 5],
     })
 
-    author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
-        author_idx_mapping_df=author_idx_mapping_df,
-        min_author_support=5,
-    )
-
-    assert author_idx_to_table_row.tolist() == [AUTHOR_UNK_IDX, 2, AUTHOR_UNK_IDX, 4]
-    assert author_table_num_rows == 5
+    assert get_author_table_num_rows(author_idx_mapping_df) == 5
 
 
-def test_build_author_table_lookup_empty_mapping_still_reserves_pad_and_unk_rows():
+def test_get_author_table_num_rows_empty_mapping_still_reserves_pad_and_unk_rows():
     author_idx_mapping_df = pl.DataFrame({
         "author_idx": pl.Series([], dtype=pl.UInt32),
         "author_train_count": pl.Series([], dtype=pl.UInt32),
     })
 
-    author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
-        author_idx_mapping_df=author_idx_mapping_df,
-        min_author_support=5,
+    assert get_author_table_num_rows(author_idx_mapping_df) == 2
+
+
+def test_bucketed_dataset_groups_user_hours_and_joins_history(bucketed_dataset):
+    assert len(bucketed_dataset) == 4
+    assert bucketed_dataset.row_indices_by_bucket == {
+        _dt(10): [0, 1],
+        _dt(11): [2],
+        _dt(12): [3],
+    }
+    assert bucketed_dataset.user_ids == ["u1", "u2", "u1", "u3"]
+    assert bucketed_dataset.liked_post_ids == [["p1", "p3"], ["p2"], ["p4"], ["p5"]]
+    assert bucketed_dataset.prior_emb_indices[0].tolist() == [5, 6, 7]
+    assert bucketed_dataset.prior_emb_indices[1].tolist() == []
+
+
+def test_bucketed_batch_sampler_keeps_each_batch_in_one_bucket(bucketed_dataset):
+    sampler = BucketedBatchSampler(
+        dataset=bucketed_dataset,
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+        seed=0,
     )
 
-    # No raw Stage 2 author_idx values exist, so the lookup only needs a dummy
-    # slot. The actual embedding table still needs PAD=0 and UNK=1 rows.
-    assert author_idx_to_table_row.tolist() == [AUTHOR_UNK_IDX]
-    assert author_table_num_rows == 2
+    batches = list(sampler)
+
+    assert batches == [[0, 1], [2], [3]]
+    for batch in batches:
+        buckets = {bucketed_dataset.like_hour_buckets[row_idx] for row_idx in batch}
+        assert len(buckets) == 1
+        assert len(batch) <= 2
 
 
-def test_build_author_table_lookup_all_unsupported_authors_map_to_unk():
-    author_idx_mapping_df = pl.DataFrame({
-        "author_idx": pl.Series([1, 2, 3], dtype=pl.UInt32),
-        "author_train_count": [1, 2, 3],
-    })
+def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_dataset):
+    batch = bucketed_dataset.collate_batch([bucketed_dataset[0], bucketed_dataset[1]])
 
-    author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
-        author_idx_mapping_df=author_idx_mapping_df,
-        min_author_support=5,
-    )
+    assert batch["bucket"] == _dt(10)
+    assert batch["user_id"] == ["u1", "u2"]
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert batch["history_embeddings"].shape == (2, 3, 4)
+    assert batch["history_mask"].tolist() == [[True, True, True], [False, False, False]]
+    assert batch["candidate_post_embeddings"].shape == (5, 4)
 
-    assert author_idx_to_table_row.tolist() == [AUTHOR_UNK_IDX, AUTHOR_UNK_IDX, AUTHOR_UNK_IDX, AUTHOR_UNK_IDX]
-    assert author_table_num_rows == 2
-
-
-def test_sequence_dataset_returns_history_author_indices_when_enabled(mock_embeddings_mmap, mock_target_posts_df):
-    history_df = pl.DataFrame({
-        "target_did": [f"user{i}" for i in range(12)],
-        "like_uri": [f"post{i}" for i in range(12)],
-        "prior_emb_indices": [
-            [40, 41, 42],
-            [43, 44],
-            [],
-            [45, 46, 47, 48, 49],
-            [50],
-            [51, 52, 53, 54],
-            [55, 56],
-            [57],
-            [58, 59, 60],
-            [],
-            [61, 62, 63, 64, 65, 66],
-            [67, 68],
-        ],
-        "prior_author_indices": [
-            [1, 2, None],
-            [2, 1],
-            [],
-            [3, 3, 2, 99, None],
-            [1],
-            [2, 2, 2, 2],
-            [1, 1],
-            [2],
-            [3, 3, 3],
-            [],
-            [1, 2, 3, None, 99, 1],
-            [2, 2],
-        ],
-    })
-    author_idx_mapping_df = pl.DataFrame({
-        "author_idx": pl.Series([1, 2, 3], dtype=pl.UInt32),
-        "author_train_count": [8, 2, 5],
-    })
-    author_idx_to_table_row, _ = build_author_table_lookup(
-        author_idx_mapping_df=author_idx_mapping_df,
-        min_author_support=5,
-    )
-
-    dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=history_df,
-        split="train",
-        max_history_len=5,
-        embed_dim=64,
-        use_author_embedding_table=True,
-        author_idx_to_table_row=author_idx_to_table_row,
-    )
-
-    sample = dataset[0]
-    assert "history_author_indices" in sample
-    assert sample["history_author_indices"].shape == (5,)
-    assert sample["history_author_indices"].dtype == torch.int64
-    assert sample["history_author_indices"][:3].tolist() == [2, AUTHOR_UNK_IDX, AUTHOR_UNK_IDX]
-    assert sample["history_author_indices"][3:].tolist() == [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]
-    assert sample["target_post_author_idx"].item() == 2
-
-    neg_sample = dataset[1]
-    assert neg_sample["target_post_author_idx"].item() == 4
-
-    unsupported_pos_author = dataset[2]
-    assert unsupported_pos_author["target_post_author_idx"].item() == AUTHOR_UNK_IDX
-
-    missing_pos_author = dataset[6]
-    assert missing_pos_author["target_post_author_idx"].item() == AUTHOR_UNK_IDX
+    labels_by_user = {
+        user_id: batch["label_matrix"][idx].tolist()
+        for idx, user_id in enumerate(batch["user_id"])
+    }
+    assert labels_by_user["u1"] == [1.0, 1.0, 0.0, 0.0, 0.0]
+    assert labels_by_user["u2"] == [0.0, 0.0, 1.0, 0.0, 0.0]
 
 
-def test_sequence_dataset_requires_target_author_columns_when_author_table_enabled(
+def test_bucketed_collate_dedupes_candidates(bucketed_dataset):
+    batch = bucketed_dataset.collate_batch([bucketed_dataset[0]])
+
+    assert batch["user_id"] == ["u1"]
+    assert batch["candidate_post_id"] == ["p1", "p3", "n1", "p2", "p4"]
+    assert batch["label_matrix"].shape == (1, 5)
+    assert batch["label_matrix"][0].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+
+
+def test_bucketed_collate_handles_empty_sampled_negative_bucket(bucketed_dataset):
+    batch = bucketed_dataset.collate_batch([bucketed_dataset[3]])
+
+    assert batch["bucket"] == _dt(12)
+    assert batch["user_id"] == ["u3"]
+    assert batch["candidate_post_id"] == ["p5"]
+    assert batch["label_matrix"].tolist() == [[1.0]]
+
+
+def test_bucketed_collate_returns_author_tensors_when_enabled(
     mock_embeddings_mmap,
-    mock_target_posts_df,
+    mock_likes_core_df,
+    mock_posts_core_df,
     mock_history_df,
 ):
-    author_idx_to_table_row = np.array([AUTHOR_UNK_IDX, 2], dtype=np.uint32)
-    target_posts_without_author_cols = mock_target_posts_df.drop(["like_author_idx", "neg_author_idx"])
-
-    with pytest.raises(ValueError, match="like_author_idx"):
-        SequenceEngagementDataset(
-            embeddings_mmap=mock_embeddings_mmap,
-            target_posts_df=target_posts_without_author_cols,
-            history_df=mock_history_df.with_columns(pl.col("prior_emb_indices").alias("prior_author_indices")),
-            split="train",
-            max_history_len=5,
-            embed_dim=64,
-            use_author_embedding_table=True,
-            author_idx_to_table_row=author_idx_to_table_row,
-        )
-
-
-# =============================================================================
-# create_data_loaders Tests
-# =============================================================================
-
-def test_create_data_loaders_returns_correct_loaders(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test create_data_loaders creates loaders with correct configuration."""
-    summarizer = MeanSummarizer()
-    
-    train_dataset = SummarizedEngagementDataset(
+    dataset = BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
         history_df=mock_history_df,
         split="train",
-        summarizer=summarizer,
-        embed_dim=64,
+        max_history_len=4,
+        embed_dim=4,
+        use_author_embedding_table=True,
     )
-    
-    val_dataset = SummarizedEngagementDataset(
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["history_author_indices"].shape == (2, 4)
+    assert batch["history_author_indices"][0].tolist() == [2, AUTHOR_UNK_IDX, 4, AUTHOR_PAD_IDX]
+    assert batch["history_author_indices"][1].tolist() == [AUTHOR_PAD_IDX] * 4
+    assert batch["candidate_post_author_idx"].tolist() == [
+        2,
+        4,
+        3,
+        2,
+        AUTHOR_UNK_IDX,
+    ]
+
+
+def test_create_bucketed_data_loaders_returns_iterable_loaders(
+    bucketed_dataset,
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    val_dataset = BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
         history_df=mock_history_df,
         split="val",
-        summarizer=summarizer,
-        embed_dim=64,
+        max_history_len=3,
+        embed_dim=4,
     )
-    
-    train_loader, val_loader, holdout_loader = create_data_loaders(
-        train_dataset=train_dataset,
+    val_unseen_dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="val_unseen_users",
+        max_history_len=3,
+        embed_dim=4,
+    )
+
+    train_loader, val_loader, val_unseen_loader, holdout_loader = create_bucketed_data_loaders(
+        train_dataset=bucketed_dataset,
         val_dataset=val_dataset,
-        batch_size=4,
-        num_workers=0,  # No multiprocessing for tests
+        val_unseen_dataset=val_unseen_dataset,
+        batch_size=2,
+        num_workers=0,
         pin_memory=False,
+        persistent_workers=True,
+        prefetch_factor=2,
+        seed=0,
     )
-    
-    # Check loaders are DataLoader instances
+
     assert isinstance(train_loader, DataLoader)
     assert isinstance(val_loader, DataLoader)
-    assert holdout_loader is None  # No holdout dataset provided
-    
-    # Check batch sizes
-    assert train_loader.batch_size == 4
-    assert val_loader.batch_size == 4
-
-
-def test_create_data_loaders_with_collate_fn(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test create_data_loaders works with custom collate function."""
-    train_dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        max_history_len=10,
-        embed_dim=64,
-    )
-    
-    val_dataset = SequenceEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="val",
-        max_history_len=10,
-        embed_dim=64,
-    )
-    
-    train_loader, val_loader, _ = create_data_loaders(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=4,
-        num_workers=0,
-        pin_memory=False,
-    )
-    
-    # Get a batch and verify it's properly collated
+    assert isinstance(val_unseen_loader, DataLoader)
+    assert holdout_loader is None
     batch = next(iter(train_loader))
-    
-    assert "history_embeddings" in batch
-    assert "history_mask" in batch
-    assert batch["history_embeddings"].ndim == 3  # [batch, seq, dim]
-    assert batch["history_mask"].ndim == 2  # [batch, seq]
-
-
-def test_create_data_loaders_with_holdout(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test create_data_loaders creates holdout loader when provided."""
-    summarizer = MeanSummarizer()
-    
-    train_dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    val_dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="val",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    holdout_dataset = val_dataset  # Reuse val for testing
-    
-    train_loader, val_loader, holdout_loader = create_data_loaders(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        holdout_dataset=holdout_dataset,
-        batch_size=4,
-        num_workers=0,
-        pin_memory=False,
-    )
-    
-    assert holdout_loader is not None
-    assert isinstance(holdout_loader, DataLoader)
-    assert holdout_loader.batch_size == 4
-
-
-def test_create_data_loaders_iteration(mock_embeddings_mmap, mock_target_posts_df, mock_history_df):
-    """Test that created data loaders can be iterated."""
-    summarizer = MeanSummarizer()
-    
-    train_dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="train",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    val_dataset = SummarizedEngagementDataset(
-        embeddings_mmap=mock_embeddings_mmap,
-        target_posts_df=mock_target_posts_df,
-        history_df=mock_history_df,
-        split="val",
-        summarizer=summarizer,
-        embed_dim=64,
-    )
-    
-    train_loader, val_loader, _ = create_data_loaders(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=4,
-        num_workers=0,
-        pin_memory=False,
-    )
-    
-    # Should be able to iterate through loaders
-    train_batches = list(train_loader)
-    assert len(train_batches) > 0
-    
-    val_batches = list(val_loader)
-    assert len(val_batches) > 0
-    
-    # Check batch contents
-    batch = train_batches[0]
-    assert "features" in batch
-    assert "label" in batch
-
-
-# =============================================================================
-# Cold-start embedding behavior Tests
-# =============================================================================
-
-def test_summarized_user_tower_uses_empty_embedding_when_no_history():
-    """SummarizedUserTower should swap in a learnable embedding for empty histories."""
-    torch.manual_seed(0)
-    embed_dim = 8
-    tower = SummarizedUserTower(embed_dim=embed_dim)
-    tower.eval()
-
-    with torch.no_grad():
-        tower.empty_user_embedding.copy_(torch.arange(embed_dim, dtype=torch.float32))
-
-    history_embeddings = torch.stack(
-        [
-            torch.full((1, embed_dim), 2.0),  # summary token
-            torch.full((1, embed_dim), 3.0),  # summary token (ignored when mask=False)
-        ],
-        dim=0,
-    )  # [B=2, T=1, D]
-    history_mask = torch.tensor([[True], [False]], dtype=torch.bool)  # [B, T]
-
-    out = tower(history_embeddings, history_mask)
-    assert out.shape == (2, embed_dim)
-    assert torch.allclose(out[0], history_embeddings[0, 0, :])
-    assert torch.allclose(out[1], tower.empty_user_embedding)
-
-    out_no_mask = tower(history_embeddings, None)
-    assert torch.allclose(out_no_mask[0], history_embeddings[0, 0, :])
-    assert torch.allclose(out_no_mask[1], history_embeddings[1, 0, :])
-
-
-@pytest.mark.parametrize(
-    "encoder_factory",
-    [
-        lambda input_dim, hidden_dim, output_dim, max_seq_len: TransformerDualPoolingEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            num_attention_heads=4,
-            num_attention_layers=1,
-            max_seq_len=max_seq_len,
-            dropout_rate=0.0,
-        ),
-        lambda input_dim, hidden_dim, output_dim, max_seq_len: CrossAttentionPoolingEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            max_seq_len=max_seq_len,
-            dropout_rate=0.0,
-        ),
-    ],
-)
-def test_attention_encoders_empty_history_depends_on_learnable_token(encoder_factory):
-    """Empty-history outputs should depend on the encoder's learnable cold-start token."""
-    torch.manual_seed(0)
-    batch_size = 3
-    seq_len = 5
-    input_dim = 8
-    hidden_dim = 16
-    output_dim = 12
-
-    encoder = encoder_factory(input_dim, hidden_dim, output_dim, max_seq_len=seq_len)
-    encoder.eval()
-
-    history_embeddings = torch.zeros(batch_size, seq_len, input_dim)
-    history_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-
-    with torch.no_grad():
-        encoder.empty_history_embedding.fill_(0.1)
-    out1 = encoder(history_embeddings, history_mask)
-
-    with torch.no_grad():
-        encoder.empty_history_embedding.fill_(0.2)
-    out2 = encoder(history_embeddings, history_mask)
-
-    assert out1.shape == (batch_size, output_dim)
-    assert torch.isfinite(out1).all()
-    assert not torch.allclose(out1, out2), "Output should change when the cold-start token changes"
-
-
-def test_attention_encoder_raises_on_zero_sequence_length():
-    """Attention encoders should reject degenerate seq_len==0 inputs."""
-    encoder = CrossAttentionPoolingEncoder(
-        input_dim=8,
-        hidden_dim=16,
-        output_dim=12,
-        max_seq_len=5,
-        dropout_rate=0.0,
-    )
-
-    with pytest.raises(RuntimeError, match="non-zero sequence length"):
-        encoder(
-            history_embeddings=torch.zeros(2, 0, 8),
-            history_mask=torch.zeros(2, 0, dtype=torch.bool),
-        )
-
-
-def test_attention_encoder_empty_history_embedding_receives_grad():
-    """When history is empty, the cold-start token should participate in backprop."""
-    encoder = CrossAttentionPoolingEncoder(
-        input_dim=8,
-        hidden_dim=16,
-        output_dim=12,
-        max_seq_len=5,
-        dropout_rate=0.0,
-    )
-
-    history_embeddings = torch.zeros(2, 5, 8)
-    history_mask = torch.zeros(2, 5, dtype=torch.bool)  # all-masked => inject token
-
-    out = encoder(history_embeddings, history_mask)
-    loss = out.sum()
-    loss.backward()
-
-    assert encoder.empty_history_embedding.grad is not None
-    assert torch.isfinite(encoder.empty_history_embedding.grad).all()
+    assert {"history_embeddings", "history_mask", "candidate_post_embeddings", "label_matrix"} <= set(batch)

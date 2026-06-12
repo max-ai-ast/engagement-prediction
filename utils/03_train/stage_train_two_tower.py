@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Stage 4 (Two-Tower): Train two-tower engagement prediction models with flexible user encoders.
+Stage 3 (Two-Tower): Train two-tower engagement prediction models with flexible user encoders.
 
 This stage trains Two-Tower models, a popular architecture for large-scale recommendation
 systems that separates user and item (post) representations into independent "towers",
@@ -18,7 +18,7 @@ engagement is predicted by computing similarity (dot product) between representa
                 (or "summarized": user_vector is provided by the dataset)
     Post Tower:  post_embedding -> (optional) PostTower -> post_vector [shared_dim]
                 (or identity when use_post_encoder=False)
-    Prediction:  sigmoid(user_vector · post_vector) -> engagement_probability
+    Scoring:     user_matrix · candidate_matrix.T -> ranking scores
 
 Benefits:
     ✓ Decoupled representations: User and post towers can be independently cached
@@ -61,34 +61,29 @@ This stage supports THREE user-history encoders, selected via `--user-encoder`:
 TRAINING DETAILS
 ═══════════════════════════════════════════════════════════════════════════════
 
-Loss:       Binary cross-entropy on sigmoid(dot_product)
-Sampling:   Balanced positive/negative pairs (1:1 ratio)
+Loss:       Row-wise multi-positive softmax over same-hour candidate posts
+Sampling:   Bucketed user-hour positives plus same-hour random candidate posts
 Optimizer:  AdamW with weight decay for regularization
-Scheduling: ReduceLROnPlateau based on validation AUC
+Scheduling: ReduceLROnPlateau based on validation NDCG@metrics_top_ks[0]
 Regularization: Gradient clipping, dropout, early stopping
 
-The model is trained to maximize dot product for engaged pairs and minimize for
-non-engaged pairs, learning a metric space where similar preferences cluster.
+The model is trained to rank each user's engaged posts above other same-hour
+candidate posts, learning a metric space where similar preferences cluster.
 
 ═══════════════════════════════════════════════════════════════════════════════
 
 Inputs (from prior pipeline stages):
-    - embeddings_*.npy memmap from 01_get_data
-    - target_posts_*.parquet from 02_target_posts
-    - history_posts_*.parquet from 03_user_history
+    - embeddings_*.npy, likes_core_*.parquet, posts_core_*.parquet from 01_get_data
+    - history_posts_*.parquet from 02_user_history
 
-Outputs under <run_dir>/04_train/<timestamp>/:
+Outputs under <run_dir>/03_train/<timestamp>/:
     - checkpoints/two_tower_best.pth (best-by-validation checkpoint during training)
     - checkpoints/two_tower_<timestamp>.pth (final model checkpoint)
-    - plots/training_history_*.png (loss and AUC curves)
-    - plots/{train,val,holdout}_performance_*.png (precision-recall, ROC curves)
     - logs/ (training logs)
     - training_config.json (hyperparameters and configuration)
     - stage_info.txt (pipeline metadata)
-    - predictions/train.parquet (per-row predictions on the training set)
-    - predictions/val.parquet (per-row predictions on the validation set)
-    - predictions/holdout_unseen_users.parquet (predictions for user-split holdout)
-    - predictions/holdout_seen_users.parquet (predictions for temporal holdout, if configured)
+    - predictions/ (currently disabled for bucketed training to avoid materializing
+      all user-candidate pairs)
 """
 
 from __future__ import annotations
@@ -97,14 +92,13 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from tqdm import tqdm
 
-import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from utils.pipeline.core import Context
 from utils.helpers import (
@@ -112,26 +106,32 @@ from utils.helpers import (
     log_operation_start,
     log_prior_stage_inputs,
     get_device,
-    plot_model_performance,
     plot_training_history,
     clear_cuda_memory,
     set_random_seeds,
+    find_author_idx_artifact_path,
 )
 from utils.dataloaders import (
     AUTHOR_PAD_IDX,
     AUTHOR_UNK_IDX,
-    build_author_table_lookup,
-    load_training_data,
-    SequenceEngagementDataset,
-    SummarizedEngagementDataset,
+    BucketedEngagementDataset,
+    create_bucketed_data_loaders,
+    get_author_table_num_rows,
+    load_bucketed_training_data,
     SummarizedUserTower,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
-    create_data_loaders,
-    get_summarizer,
+)
+from utils.author_features import PostAuthorFeatureEncoder
+from utils.matrix_ranking import (
+    evaluate_matrix_model,
+    log_final_classification_metrics,
+    run_matrix_epoch,
+    stage_info_metric_lines,
+    write_ranking_rows,
 )
 
-STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
+STAGE_LOG_NAME = "STAGE_03_TRAIN_TWO_TOWER"
 
 
 # =============================================================================
@@ -233,67 +233,6 @@ class L2NormalizedPostTower(nn.Module):
         return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
 
 
-class PostAuthorFeatureEncoder(nn.Module):
-    """Fuse post content embeddings with per-author embeddings."""
-
-    def __init__(
-        self,
-        post_embedding_dim: int,
-        author_table_num_rows: int,
-        author_embedding_dim: int,
-        author_unknown_dropout_rate: float,
-    ):
-        super().__init__()
-        if author_table_num_rows < 2:
-            raise ValueError("author_table_num_rows must be at least 2")
-        if author_embedding_dim <= 0:
-            raise ValueError("author_embedding_dim must be positive")
-        if not 0.0 <= author_unknown_dropout_rate <= 1.0:
-            raise ValueError("author_unknown_dropout_rate must be in [0, 1]")
-
-        self.author_pad_idx = AUTHOR_PAD_IDX
-        self.author_unk_idx = AUTHOR_UNK_IDX
-        self.author_unknown_dropout_rate = float(author_unknown_dropout_rate)
-        self.author_embedding = nn.Embedding(
-            num_embeddings=author_table_num_rows,
-            embedding_dim=author_embedding_dim,
-            padding_idx=self.author_pad_idx,
-        )
-        nn.init.xavier_uniform_(self.author_embedding.weight)
-        with torch.no_grad():
-            self.author_embedding.weight[self.author_pad_idx].zero_()
-
-        self.fusion_layer = nn.Linear(
-            post_embedding_dim + author_embedding_dim,
-            post_embedding_dim,
-        )
-        nn.init.xavier_uniform_(self.fusion_layer.weight)
-        if self.fusion_layer.bias is not None:
-            nn.init.zeros_(self.fusion_layer.bias)
-
-    def forward(
-        self,
-        post_embeddings: torch.Tensor,
-        author_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.training and self.author_unknown_dropout_rate > 0.0:
-            eligible = author_indices > self.author_unk_idx
-            if torch.any(eligible):
-                dropout_mask = torch.rand(
-                    author_indices.shape,
-                    device=author_indices.device,
-                ) < self.author_unknown_dropout_rate
-                author_indices = torch.where(
-                    eligible & dropout_mask,
-                    torch.full_like(author_indices, self.author_unk_idx),
-                    author_indices,
-                )
-
-        author_embeddings = self.author_embedding(author_indices)
-        fused_inputs = torch.cat([post_embeddings, author_embeddings], dim=-1)
-        return self.fusion_layer(fused_inputs)
-
-
 class AuthorAwareUserTower(nn.Module):
     """User tower that fuses history post embeddings with author embeddings."""
 
@@ -347,44 +286,6 @@ class AuthorAwarePostTower(nn.Module):
         return self.post_tower(fused_post_embeddings)
 
 
-def build_author_serving_mapping(
-    author_idx_mapping_df: pl.DataFrame,
-    author_idx_to_table_row: np.ndarray,
-) -> pl.DataFrame:
-    """Build the supported author DID -> embedding-table row artifact for serving."""
-    required_cols = {"author_did", "author_idx", "author_train_count"}
-    missing_cols = required_cols.difference(author_idx_mapping_df.columns)
-    if missing_cols:
-        missing = ", ".join(sorted(missing_cols))
-        raise ValueError(f"author_idx_mapping_df is missing required columns: {missing}")
-
-    mapping_df = (
-        author_idx_mapping_df
-        .select(["author_did", "author_idx", "author_train_count"])
-        .unique()
-        .sort("author_idx")
-    )
-    author_table_rows: List[int] = []
-    for raw_author_idx in mapping_df["author_idx"].to_list():
-        if raw_author_idx is None:
-            author_table_rows.append(AUTHOR_UNK_IDX)
-            continue
-        raw_author_idx_int = int(raw_author_idx)
-        if 0 <= raw_author_idx_int < len(author_idx_to_table_row):
-            author_table_rows.append(int(author_idx_to_table_row[raw_author_idx_int]))
-        else:
-            author_table_rows.append(AUTHOR_UNK_IDX)
-
-    return (
-        mapping_df
-        .with_columns(
-            pl.Series("author_table_row", author_table_rows, dtype=pl.UInt32),
-        )
-        .filter(pl.col("author_table_row") > AUTHOR_UNK_IDX)
-        .select(["author_did", "author_idx", "author_train_count", "author_table_row"])
-    )
-
-
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
@@ -407,8 +308,7 @@ class TwoTowerModel(nn.Module):
             - use_post_encoder=True:  PostTower(post_embedding) -> post_vector [shared_dim]
             - use_post_encoder=False: post_vector is the raw post embedding (identity)
         
-        Scoring: similarity(user_vector, post_vector) / temperature -> raw logit
-                 sigmoid(raw_logit) -> engagement_probability
+        Scoring: user_matrix @ candidate_matrix.T / temperature -> raw rank scores
     
     Key characteristics:
         - Shared embedding space: Both towers output the same dimensionality for dot product
@@ -586,7 +486,7 @@ class TwoTowerModel(nn.Module):
         
         Args:
             post_embeddings: Raw post embeddings [batch, input_dim]
-            target_author_indices: Author embedding table rows [batch], required
+            target_author_indices: author_idx values [batch], required
                 when author embeddings are enabled.
         
         Returns:
@@ -609,11 +509,12 @@ class TwoTowerModel(nn.Module):
         history_author_indices: Optional[torch.Tensor] = None,
         target_author_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute engagement scores via dot product in shared space.
+        """Compute user-by-candidate engagement scores via dot product.
         
-        This is the core two-tower computation: encode user and post independently,
-        then measure similarity via dot product. Higher dot product = higher
-        predicted engagement probability.
+        This is the core bucketed two-tower computation: encode users and
+        candidate posts independently, then score every user against every
+        candidate post in the batch. Higher dot product = higher predicted
+        engagement affinity.
         
         Args:
             history_embeddings: User history input.
@@ -621,19 +522,19 @@ class TwoTowerModel(nn.Module):
                   In "summarized" mode, the user summary is expected to be placed
                   at position 0 (and optionally padded to seq_len > 1).
             history_mask: History validity mask [batch, seq_len] (optional in summarized mode)
-            post_embeddings: Target post embeddings [batch, input_dim]
-            history_author_indices: Author table rows aligned with history items,
+            post_embeddings: Candidate post embeddings [num_candidates, input_dim]
+            history_author_indices: author_idx values aligned with history items,
                 required when author embeddings are enabled.
-            target_author_indices: Author table rows for target posts, required
+            target_author_indices: author_idx values for candidate posts, required
                 when author embeddings are enabled.
         
         Returns:
-            Raw engagement scores [batch] (logits before sigmoid)
+            Raw engagement scores [num_users, num_candidates].
         """
         user_emb = self.encode_user(history_embeddings, history_mask, history_author_indices)
         post_emb = self.encode_post(post_embeddings, target_author_indices)
         
-        similarity_score = (user_emb * post_emb).sum(dim=-1)
+        similarity_score = torch.matmul(user_emb, post_emb.T)
         return similarity_score / self.similarity_temperature
 
     def compute_loss_and_preds(
@@ -642,54 +543,33 @@ class TwoTowerModel(nn.Module):
         device: str,
         embed_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute loss and predictions for a batch.
+        """Compute per-user multi-positive contrastive loss and score matrix.
         
         This method provides a unified interface for training, validation, and
-        inference loops. It computes raw similarity scores (optionally cosine
-        similarities when tower-level L2 normalization is enabled) and
-        calculates binary cross-entropy loss directly from the logits for
-        numerical stability.
+        inference loops. It scores every user against every candidate post in a
+        bucketed batch, then applies a row-wise softmax loss so each user
+        contributes equally regardless of how many positives they have.
         
         Args:
-            batch: Batch dictionary. Expected keys depend on `user_encoder_type`:
-                - "summarized": {"features", "label"} where features is
-                  [B, 2*embed_dim] concatenated [user_summary || post_embedding]
-                - otherwise: {"history_embeddings", "history_mask", "target_post_embedding", "label"}
+            batch: Bucketed batch with history tensors, candidate post tensors,
+                and label_matrix shaped [num_users, num_candidates].
             device: Device string (e.g. "cpu" or "cuda")
-            embed_dim: Post embedding dimensionality D (used only to split "features" in summarized mode)
+            embed_dim: Post embedding dimensionality D (kept for caller compatibility)
         
         Returns:
             Tuple of (loss, scores):
-                - loss: Scalar BCE-with-logits loss tensor
-                - scores: Raw similarity scores [batch] (before sigmoid)
-        
-        Note:
-            Returns raw scores (not probabilities) for flexibility in evaluation.
-            Apply sigmoid(scores) to get probabilities.
+                - loss: Scalar row-wise contrastive loss tensor
+                - scores: Raw similarity scores [num_users, num_candidates]
         """
         history_author_indices = None
         target_author_indices = None
-        # unpack inputs
-        if self.user_encoder_type == "summarized":
-            features = batch["features"].to(device, non_blocking=True) # [B, embed_dim*2]
-            user_summary = features[:, :embed_dim] # [B, embed_dim]
-            history_embeddings = user_summary.unsqueeze(1)  # [B, 1, embed_dim] (summary token at position 0)
-            post_embeddings = features[:, embed_dim:] # [B, embed_dim]
-            # Cold-start handling: empty histories have an all-zero summary sentinel.
-            # Use the mask to indicate whether the summary came from at least one
-            # history item so the summarized user tower can inject a learnable
-            # cold-start embedding.
-            has_history = user_summary.abs().sum(dim=1) > 0 # [B]
-            history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
-            assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
-        else:
-            history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
-            history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
-            post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
-            if self.use_author_embedding_table:
-                history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
-                target_author_indices = batch["target_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
+        history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [U, seq_len, embed_dim]
+        history_mask = batch["history_mask"].to(device, non_blocking=True) # [U, seq_len]
+        post_embeddings = batch["candidate_post_embeddings"].to(device, non_blocking=True) # [P, embed_dim]
+        label_matrix = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True) # [U, P]
+        if self.use_author_embedding_table:
+            history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
+            target_author_indices = batch["candidate_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
 
         scores = self.forward(
             history_embeddings,
@@ -698,7 +578,15 @@ class TwoTowerModel(nn.Module):
             history_author_indices,
             target_author_indices,
         )
-        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
+        if scores.shape != label_matrix.shape:
+            raise RuntimeError("Expected scores and label_matrix to have matching [num_users, num_candidates] shapes")
+        positive_counts = label_matrix.sum(dim=1, keepdim=True)
+        if torch.any(positive_counts <= 0):
+            raise RuntimeError("Each user row in label_matrix must contain at least one positive candidate")
+
+        targets = label_matrix / positive_counts
+        loss_per_user = -(targets * F.log_softmax(scores, dim=1)).sum(dim=1)
+        loss = loss_per_user.mean()
         return loss, scores
 
 
@@ -710,6 +598,7 @@ def train_two_tower_model(
     model: TwoTowerModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    val_unseen_loader: DataLoader,
     device: str,
     epochs: int,
     learning_rate: float,
@@ -722,9 +611,9 @@ def train_two_tower_model(
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
     embed_dim: int,
+    metrics_top_ks: list[int],
     experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    from tqdm import tqdm
 
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -732,85 +621,75 @@ def train_two_tower_model(
         optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience
     )
 
-    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
-    best_val_auc = 0.0
-    best_reset_val_auc = 0.0
+    if not metrics_top_ks:
+        raise ValueError("metrics_top_ks must contain at least one value")
+    primary_metric_name = f"ndcg@{metrics_top_ks[0]}"
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        f"train_{primary_metric_name}": [],
+        f"val_{primary_metric_name}": [],
+    }
+    best_val_metric = float("-inf")
+    best_reset_val_metric = float("-inf")
     best_val_loss = float("inf")
     patience_counter = 0
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        # --- Training ---
-        model.train()
-        train_loss_sum = torch.zeros((), device=device)
-        train_batches = 0
-        train_scores_chunks: List[torch.Tensor] = []
-        train_labels_chunks: List[torch.Tensor] = []
-
-        for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            labels = batch["label"]
-
-            optimizer.zero_grad()
-            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
-            optimizer.step()
-
-            train_loss_sum += loss.detach()
-            train_batches += 1
-            train_scores_chunks.append(scores.detach())
-            train_labels_chunks.append(labels.detach())
-
-        # --- Validation ---
-        model.eval()
-        val_loss_sum = torch.zeros((), device=device)
-        val_batches = 0
-        val_scores_chunks: List[torch.Tensor] = []
-        val_labels_chunks: List[torch.Tensor] = []
-
-        with torch.inference_mode():
-            for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                labels = batch["label"]
-
-                loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
-
-                val_loss_sum += loss.detach()
-                val_batches += 1
-                val_scores_chunks.append(scores.detach())
-                val_labels_chunks.append(labels.detach())
-
-        train_loss = (train_loss_sum / max(train_batches, 1)).item()
-        val_loss = (val_loss_sum / max(val_batches, 1)).item()
-
-        train_probs = (
-            torch.sigmoid(torch.cat(train_scores_chunks)).float().cpu().numpy()
-            if train_scores_chunks
-            else np.array([])
-        )
-        train_labels_np = (
-            torch.cat(train_labels_chunks).float().cpu().numpy()
-            if train_labels_chunks
-            else np.array([])
+        # only need to calculate the baseline metrics once - at the first epoch
+        calc_baseline_metrics: bool = epoch == 0
+        
+        train_loss, train_metrics_dict, train_baseline_metrics_dict = run_matrix_epoch(
+            train=True,
+            split_name="Train",
+            model=model,
+            device=device,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            disable_progress=disable_progress,
+            embed_dim=embed_dim,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
 
-        val_probs = (
-            torch.sigmoid(torch.cat(val_scores_chunks)).float().cpu().numpy()
-            if val_scores_chunks
-            else np.array([])
-        )
-        val_labels_np = (
-            torch.cat(val_labels_chunks).float().cpu().numpy()
-            if val_labels_chunks
-            else np.array([])
+        val_loss, val_metrics_dict, val_baseline_metrics_dict = run_matrix_epoch(
+            train=False,
+            split_name="Validation",
+            model=model,
+            device=device,
+            dataloader=val_loader,
+            optimizer=optimizer,
+            disable_progress=disable_progress,
+            embed_dim=embed_dim,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
 
-        train_auc = roc_auc_score(train_labels_np, train_probs) if np.unique(train_labels_np).size > 1 else 0.5
-        val_auc = roc_auc_score(val_labels_np, val_probs) if np.unique(val_labels_np).size > 1 else 0.5
+        val_unseen_loss, val_unseen_metrics_dict, val_unseen_baseline_metrics_dict = run_matrix_epoch(
+            train=False,
+            split_name="Validation Unseen Users",
+            model=model,
+            device=device,
+            dataloader=val_unseen_loader,
+            optimizer=optimizer,
+            disable_progress=disable_progress,
+            embed_dim=embed_dim,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
+        )
+
+        train_primary_metric = float(train_metrics_dict[primary_metric_name])
+        val_primary_metric = float(val_metrics_dict[primary_metric_name])
+        val_unseen_primary_metric = float(val_unseen_metrics_dict[primary_metric_name])
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        history["train_auc"].append(float(train_auc))
-        history["val_auc"].append(float(val_auc))
+        history[f"train_{primary_metric_name}"].append(train_primary_metric)
+        history[f"val_{primary_metric_name}"].append(val_primary_metric)
 
         if experiment_tracker is not None:
             iteration = epoch + 1
@@ -827,37 +706,130 @@ def train_two_tower_model(
                 iteration=iteration,
             )
             experiment_tracker.log_scalar(
-                title="Training AUC History",
-                series="Train AUC",
-                value=float(train_auc),
+                title="Training Loss History",
+                series="Validation Unseen Users Loss",
+                value=float(val_unseen_loss),
                 iteration=iteration,
             )
             experiment_tracker.log_scalar(
-                title="Training AUC History",
-                series="Validation AUC",
-                value=float(val_auc),
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Train {primary_metric_name}",
+                value=train_primary_metric,
                 iteration=iteration,
             )
+            experiment_tracker.log_scalar(
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Validation {primary_metric_name}",
+                value=val_primary_metric,
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Validation Unseen Users {primary_metric_name}",
+                value=val_unseen_primary_metric,
+                iteration=iteration,
+            )
+            for k in metrics_top_ks:
+                experiment_tracker.log_scalar(
+                    title=f"NDCG@{k}",
+                    series=f"Train NDCG@{k}",
+                    value=float(train_metrics_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"NDCG@{k}",
+                    series=f"Validation NDCG@{k}",
+                    value=float(val_metrics_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"NDCG@{k}",
+                    series=f"Validation Unseen Users NDCG@{k}",
+                    value=float(val_unseen_metrics_dict[f"ndcg@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"Recall@{k}",
+                    series=f"Train Recall@{k}",
+                    value=float(train_metrics_dict[f"recall@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"Recall@{k}",
+                    series=f"Validation Recall@{k}",
+                    value=float(val_metrics_dict[f"recall@{k}"]),
+                    iteration=iteration,
+                )
+                experiment_tracker.log_scalar(
+                    title=f"Recall@{k}",
+                    series=f"Validation Unseen Users Recall@{k}",
+                    value=float(val_unseen_metrics_dict[f"recall@{k}"]),
+                    iteration=iteration,
+                )
+                if calc_baseline_metrics:
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline NDCG@{k}",
+                        series=f"Train Baseline NDCG@{k}",
+                        value=float(train_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline NDCG@{k}",
+                        series=f"Validation Baseline NDCG@{k}",
+                        value=float(val_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline NDCG@{k}",
+                        series=f"Validation Unseen Users Baseline NDCG@{k}",
+                        value=float(val_unseen_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline Recall@{k}",
+                        series=f"Train Baseline Recall@{k}",
+                        value=float(train_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline Recall@{k}",
+                        series=f"Validation Baseline Recall@{k}",
+                        value=float(val_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline Recall@{k}",
+                        series=f"Validation Unseen Users Baseline Recall@{k}",
+                        value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=iteration,
+                    )
 
-        scheduler.step(val_auc)
+        scheduler.step(val_primary_metric)
 
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
+        if val_primary_metric > best_val_metric:
+            best_val_metric = val_primary_metric
             best_val_loss = val_loss
             best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
             if checkpoints_dir is not None:
                 torch.save(
-                    {"epoch": epoch, "model_state_dict": best_state_dict, "val_loss": val_loss, "val_auc": val_auc, "history": history},
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": best_state_dict,
+                        "val_loss": val_loss,
+                        "primary_metric_name": primary_metric_name,
+                        "val_primary_metric": val_primary_metric,
+                        "history": history,
+                    },
                     checkpoints_dir / "two_tower_best.pth",
                 )
 
         significant_improvement = (
-            val_auc > best_reset_val_auc
-            and (val_auc - best_reset_val_auc) >= early_stopping_min_delta
+            val_primary_metric > best_reset_val_metric
+            and (val_primary_metric - best_reset_val_metric) >= early_stopping_min_delta
         )
         if significant_improvement:
-            best_reset_val_auc = val_auc
+            best_reset_val_metric = val_primary_metric
             patience_counter = 0
         else:
             patience_counter += 1
@@ -873,73 +845,10 @@ def train_two_tower_model(
         "model": model,
         "history": history,
         "best_val_loss": best_val_loss,
-        "best_val_auc": best_val_auc,
+        "best_val_metric": best_val_metric,
+        "primary_metric_name": primary_metric_name,
     }
 
-
-# =============================================================================
-# Evaluation
-# =============================================================================
-
-def _evaluate_two_tower_model(
-    model: TwoTowerModel,
-    data_loader: DataLoader,
-    device: str,
-    embed_dim: int,
-) -> Dict[str, Any]:
-    """Evaluate two-tower model and return metrics + predictions."""
-    model = model.to(device)
-    model.eval()
-
-    labels_chunks: List[torch.Tensor] = []
-    probs_chunks: List[torch.Tensor] = []
-    all_user_ids: List[str] = []
-    all_post_ids: List[str] = []
-
-    with torch.inference_mode():
-        for batch in data_loader:
-            labels = batch["label"]
-
-            _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
-            probs = torch.sigmoid(scores)
-
-            probs_chunks.append(probs.detach())
-            labels_chunks.append(labels.detach())
-            all_user_ids.extend(batch["user_id"])
-            all_post_ids.extend(batch["post_id"])
-
-    probs_all = torch.cat(probs_chunks).float().cpu() if probs_chunks else torch.empty(0)
-    labels_all = torch.cat(labels_chunks).float().cpu() if labels_chunks else torch.empty(0)
-
-    y_true = labels_all.numpy()
-    y_pred = probs_all.numpy()
-
-    metrics: Dict[str, Any] = {
-        "total_samples": len(y_true),
-        "positive_samples": int(y_true.sum()),
-        "negative_samples": int(len(y_true) - y_true.sum()),
-    }
-
-    if np.unique(y_true).size > 1:
-        metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-        metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
-
-    metrics["accuracy_at_0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
-
-    return {
-        "metrics": metrics,
-        "predictions": {
-            "user_id": all_user_ids,
-            "post_id": all_post_ids,
-            "y_true": y_true,
-            "y_pred": y_pred,
-        },
-    }
-
-
-# =============================================================================
-# Plotting
-# =============================================================================
 
 # =============================================================================
 # Pipeline entry point
@@ -952,15 +861,16 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- output dirs ---
     run_tag = args.run_tag or ""
-    out_dir = context.new_stage_dir("04_train", tag=run_tag)
+    out_dir = context.new_stage_dir("03_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"
-    for d in (checkpoints_dir, plots_dir, logs_dir):
+    eval_dir = out_dir / "eval"
+    for d in (checkpoints_dir, plots_dir, logs_dir, eval_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / "stage.log")
-    log_operation_start("Stage 4 Two-Tower training", STAGE_LOG_NAME, logger)
+    log_operation_start("Stage 3 Two-Tower training", STAGE_LOG_NAME, logger)
     t0 = time.time()
 
     # --- seeds & cuda ---
@@ -970,10 +880,19 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim = load_training_data(
+    embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim = load_bucketed_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
+    num_total_likes_by_user = {
+        str(row["did"]): int(row["num_total_likes"])
+        for row in (
+            likes_core_df
+            .group_by("did")
+            .agg(pl.col("subject_uri").n_unique().alias("num_total_likes"))
+            .iter_rows(named=True)
+        )
+    }
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---
     max_history_len = int(args.max_history_len)
@@ -1002,36 +921,39 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_holdout_type = str(args.eval_holdout_type)
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
-    min_author_support = int(args.min_author_support)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
+    metrics_top_ks = list(args.metrics_top_ks)
+    if not metrics_top_ks:
+        raise ValueError("metrics_top_ks must contain at least one value")
+    primary_metric_name = f"ndcg@{metrics_top_ks[0]}"
 
+    if user_encoder_type == "summarized":
+        raise ValueError("Bucketed training does not support user_encoder_type='summarized'")
     if use_author_embedding_table and user_encoder_type == "summarized":
         raise ValueError("use_author_embedding_table is not supported with user_encoder_type='summarized'")
     if use_author_embedding_table and author_idx_mapping_df is None:
         raise FileNotFoundError(
-            "author_idx artifact was not found in 02_target_posts output, but --use-author-embedding-table was enabled."
+            "author_idx artifact was not found in 01_get_data output, but --use-author-embedding-table was enabled."
         )
-    author_idx_to_table_row = None
     author_table_num_rows = 0
-    author_serving_mapping_df = None
     if use_author_embedding_table:
         if author_idx_mapping_df is None:
             raise FileNotFoundError("author_idx_mapping_df is required when use_author_embedding_table is True")
-        author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
-            author_idx_mapping_df=author_idx_mapping_df,
-            min_author_support=min_author_support,
-        )
-        author_serving_mapping_df = build_author_serving_mapping(
-            author_idx_mapping_df=author_idx_mapping_df,
-            author_idx_to_table_row=author_idx_to_table_row,
-        )
+        author_table_num_rows = get_author_table_num_rows(author_idx_mapping_df)
         logger.info(
             "Author embedding table enabled: "
-            f"min_author_support={min_author_support}, "
             f"author_embedding_dim={author_embedding_dim}, "
-            f"author_table_num_rows={author_table_num_rows}, "
-            f"serving_mapping_rows={len(author_serving_mapping_df)}"
+            f"author_table_num_rows={author_table_num_rows}"
         )
+        author_idx_artifact_path = find_author_idx_artifact_path(context)
+        if author_idx_artifact_path is None:
+            logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
+        else:
+            author_idx_artifact_id = context.tracker.log_file_artifact(
+                name="author_idx_mapping",
+                path=author_idx_artifact_path,
+            )
+            logger.info(f"Author index mapping artifact id: {author_idx_artifact_id}")
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -1041,47 +963,37 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- datasets ---
     log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
-    if user_encoder_type == "summarized":
-        # get summarizer
-        summarizer_name = args.user_summarization
-        ema_alpha = float(args.ema_alpha)
-        summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
-        
-        train_dataset = SummarizedEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="train", 
-            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-        )
-        val_dataset = SummarizedEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val", 
-            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-        )
-    else:
-        train_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="train",
-            max_history_len=max_history_len, embed_dim=embed_dim,
-            use_author_embedding_table=use_author_embedding_table,
-            author_idx_to_table_row=author_idx_to_table_row,
-            logger=logger,
-        )
-        val_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val",
-            max_history_len=max_history_len, embed_dim=embed_dim,
-            use_author_embedding_table=use_author_embedding_table,
-            author_idx_to_table_row=author_idx_to_table_row,
-            logger=logger,
-        )
+    train_dataset = BucketedEngagementDataset(
+        embeddings_mmap, likes_core_df, posts_core_df, history_df, split="train",
+        max_history_len=max_history_len, embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        logger=logger,
+    )
+    val_dataset = BucketedEngagementDataset(
+        embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val",
+        max_history_len=max_history_len, embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        logger=logger,
+    )
+    val_unseen_dataset = BucketedEngagementDataset(
+        embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val_unseen_users",
+        max_history_len=max_history_len, embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        logger=logger,
+    )
 
     # Create data loaders using centralized helper
-    train_loader, val_loader, _ = create_data_loaders(
-        train_dataset, val_dataset, batch_size,
+    train_loader, val_loader, val_unseen_loader, _ = create_bucketed_data_loaders(
+        train_dataset, val_dataset, val_unseen_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        seed=random_seed,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
-    logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
+    logger.info(f"Train user-hour rows: {len(train_dataset)}, Val user-hour rows: {len(val_dataset)}")
 
     # --- create model ---
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
@@ -1115,6 +1027,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
+            val_unseen_loader=val_unseen_loader,
             device=device,
             epochs=epochs,
             learning_rate=learning_rate,
@@ -1127,64 +1040,68 @@ def run(context: Context, args) -> Dict[str, Any]:
             lr_scheduler_patience=lr_scheduler_patience,
             gradient_clip_max_norm=gradient_clip_max_norm,
             embed_dim=embed_dim,
+            metrics_top_ks=metrics_top_ks,
             experiment_tracker=context.tracker,
         )
         trained_model: TwoTowerModel = training_results["model"]
         clear_cuda_memory()
-
-        # --- plots & evaluation ---
-        hist = training_results["history"]
-
         if generate_plots:
+            hist = training_results["history"]
             try:
-                best_epoch = int(np.argmax(hist.get("val_auc", []))) + 1 if hist.get("val_auc") and len(hist.get("val_auc")) > 0 else None
+                val_metric_history = hist.get(f"val_{training_results['primary_metric_name']}", [])
+                best_epoch = val_metric_history.index(max(val_metric_history)) + 1 if val_metric_history else None
             except Exception as e:
                 logger.warning(f"Could not determine best epoch from training history: {e}")
                 best_epoch = None
             plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
-    # Collect train + val predictions for performance plots & metrics
-    train_eval = _evaluate_two_tower_model(trained_model, train_loader, device, embed_dim)
-    val_eval = _evaluate_two_tower_model(trained_model, val_loader, device, embed_dim)
+    # Collect split metrics without materializing per-user-candidate predictions
+    train_eval = evaluate_matrix_model(
+        trained_model, train_loader, device, embed_dim, metrics_top_ks,
+        progress_desc="Evaluate train",
+        disable_progress=disable_progress,
+    )
+    val_eval = evaluate_matrix_model(
+        trained_model, val_loader, device, embed_dim, metrics_top_ks,
+        progress_desc="Evaluate validation",
+        disable_progress=disable_progress,
+    )
+    val_unseen_eval = evaluate_matrix_model(
+        trained_model, val_unseen_loader, device, embed_dim, metrics_top_ks,
+        progress_desc="Evaluate validation unseen users",
+        disable_progress=disable_progress,
+    )
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
+    logger.info(f"Validation unseen users metrics: {val_unseen_eval['metrics']}")
 
-    # calculate the best auc in the case that we didn't train a model (simple dot product version)
     if training_results is not None:
-        best_val_auc = training_results["best_val_auc"]
+        best_val_metric = training_results["best_val_metric"]
+        primary_metric_name = training_results["primary_metric_name"]
     else:
-        best_train_auc = roc_auc_score(train_eval["predictions"]["y_true"], train_eval["predictions"]["y_pred"])
-        best_val_auc = roc_auc_score(val_eval["predictions"]["y_true"], val_eval["predictions"]["y_pred"])
-        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=float(best_train_auc), iteration=0)
-        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=float(best_val_auc), iteration=0)
-
-    if generate_plots:
-        try:
-            plot_model_performance(
-                train_eval["predictions"]["y_true"],
-                train_eval["predictions"]["y_pred"],
-                plots_dir / f"train_performance_{timestamp}.png",
-                title_suffix="(Train)",
+        best_val_metric = float(val_eval["metrics"].get(primary_metric_name, 0.0))
+        if context.tracker is not None:
+            context.tracker.log_scalar(
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Train {primary_metric_name}",
+                value=float(train_eval["metrics"].get(primary_metric_name, 0.0)),
+                iteration=0,
             )
-        except Exception as plot_exc:
-            logger.warning(f"Train performance plotting failed: {plot_exc}")
-        try:
-            plot_model_performance(
-                val_eval["predictions"]["y_true"],
-                val_eval["predictions"]["y_pred"],
-                plots_dir / f"val_performance_{timestamp}.png",
-                title_suffix="(Validation)",
+            context.tracker.log_scalar(
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Validation {primary_metric_name}",
+                value=best_val_metric,
+                iteration=0,
             )
-        except Exception as plot_exc:
-            logger.warning(f"Validation performance plotting failed: {plot_exc}")
+            context.tracker.log_scalar(
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Validation Unseen Users {primary_metric_name}",
+                value=float(val_unseen_eval["metrics"].get(primary_metric_name, 0.0)),
+                iteration=0,
+            )
 
     # --- save model ---
     model_path = None
-    author_table_mapping_path = (
-        checkpoints_dir / "author_table_mapping.parquet"
-        if use_author_embedding_table and save_model
-        else None
-    )
     config = {
         "model_type": "two_tower",
         "user_encoder_type": user_encoder_type,
@@ -1201,12 +1118,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         "similarity_temperature": similarity_temperature,
         "use_author_embedding_table": use_author_embedding_table,
         "author_embedding_dim": author_embedding_dim if use_author_embedding_table else None,
-        "min_author_support": min_author_support if use_author_embedding_table else None,
         "author_unknown_dropout_rate": author_unknown_dropout_rate if use_author_embedding_table else None,
         "author_table_num_rows": author_table_num_rows if use_author_embedding_table else None,
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
-        "author_table_mapping_path": str(author_table_mapping_path) if author_table_mapping_path else None,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -1215,22 +1130,13 @@ def run(context: Context, args) -> Dict[str, Any]:
                 "model_state_dict": trained_model.state_dict(),
                 "config": config,
                 "training_history": training_results["history"] if training_results is not None else None,
-                "best_val_auc": best_val_auc,
+                "primary_metric_name": primary_metric_name,
+                "best_val_metric": best_val_metric,
                 "best_val_loss": training_results["best_val_loss"] if training_results is not None else None,
             },
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
-
-        if use_author_embedding_table:
-            if author_serving_mapping_df is None or author_table_mapping_path is None:
-                raise RuntimeError("author_serving_mapping_df is required when author embeddings are enabled")
-            author_serving_mapping_df.write_parquet(author_table_mapping_path, compression="zstd")
-            author_mapping_id = context.tracker.log_artifact(
-                name="author_table_mapping",
-                path=author_table_mapping_path,
-            )
-            logger.info(f"Author table mapping artifact id: {author_mapping_id}")
 
         # Save TorchScript file, which is the format needed for ClearML serving
         # Save the post and user towers separately
@@ -1247,79 +1153,84 @@ def run(context: Context, args) -> Dict[str, Any]:
         post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
         logger.info(f"Post tower model id: {post_model_id}")
 
-    # --- save predictions ---
-    predictions_dir = out_dir / "predictions"
-    predictions_dir.mkdir(parents=True, exist_ok=True)
-
-    pl.DataFrame({
-        "did": train_eval["predictions"]["user_id"],
-        "post_id": train_eval["predictions"]["post_id"],
-        "y_true": train_eval["predictions"]["y_true"],
-        "y_pred_proba": train_eval["predictions"]["y_pred"],
-    }).write_parquet(predictions_dir / "train.parquet")
-
-    pl.DataFrame({
-        "did": val_eval["predictions"]["user_id"],
-        "post_id": val_eval["predictions"]["post_id"],
-        "y_true": val_eval["predictions"]["y_true"],
-        "y_pred_proba": val_eval["predictions"]["y_pred"],
-    }).write_parquet(predictions_dir / "val.parquet")
+    # Full per-pair prediction parquet writing is intentionally disabled for now.
+    # The bucketed path would produce one row per user-candidate pair, which can
+    # be hundreds of millions of rows per split with current sampling settings.
+    # Stage 4 uses the compact holdout ranking-row artifacts written below instead.
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
+    all_holdout_metrics: Dict[str, Dict[str, Any]] = {}
     for holdout_type in ["unseen_users", "seen_users"]:
         split_name = f"holdout_{holdout_type}"
         try:
-            if user_encoder_type == "summarized":
-                holdout_dataset = SummarizedEngagementDataset(
-                    embeddings_mmap, target_posts_df, history_df, split=split_name,
-                    summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-                )
-            else:
-                holdout_dataset = SequenceEngagementDataset(
-                    embeddings_mmap, target_posts_df, history_df, split=split_name,
-                    max_history_len=max_history_len, embed_dim=embed_dim,
-                    use_author_embedding_table=use_author_embedding_table,
-                    author_idx_to_table_row=author_idx_to_table_row,
-                    logger=logger,
-                )
+            holdout_dataset = BucketedEngagementDataset(
+                embeddings_mmap, likes_core_df, posts_core_df, history_df, split=split_name,
+                max_history_len=max_history_len, embed_dim=embed_dim,
+                use_author_embedding_table=use_author_embedding_table,
+                logger=logger,
+            )
             if len(holdout_dataset) == 0:
                 logger.info(f"No rows for split '{split_name}', skipping.")
                 continue
             log_operation_start(f"Holdout evaluation ({holdout_type})", STAGE_LOG_NAME, logger)
-            _, _, holdout_loader = create_data_loaders(
-                train_dataset, train_dataset, batch_size,  # train/val loaders unused here
+            _, _, _, holdout_loader = create_bucketed_data_loaders(
+                train_dataset, val_dataset, val_unseen_dataset, batch_size,  # train/val loaders unused here
                 holdout_dataset=holdout_dataset,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
+                seed=random_seed,
             )
-            holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
+            if holdout_loader is None:
+                logger.info(f"Holdout dataset for split '{split_name}' is empty after loading, skipping.")
+                continue
+            holdout_eval = evaluate_matrix_model(
+                trained_model,
+                holdout_loader,
+                device,
+                embed_dim,
+                metrics_top_ks,
+                collect_ranking_rows=True,
+                progress_desc=f"Evaluate holdout {holdout_type}",
+                disable_progress=disable_progress,
+            )
             split_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics ({holdout_type}): {split_metrics}")
+
+            all_holdout_metrics[split_name] = split_metrics
+
+            ranking_rows_path = eval_dir / f"{split_name}_ranking_rows.parquet"
+            write_ranking_rows(
+                holdout_eval["ranking_rows"],
+                ranking_rows_path,
+                split_name,
+                num_total_likes_by_user,
+            )
+            logger.info(f"Saved holdout ranking rows ({holdout_type}): {ranking_rows_path}")
+
             if holdout_type == eval_holdout_type:
                 holdout_metrics = split_metrics
-
-            pl.DataFrame({
-                "did": holdout_eval["predictions"]["user_id"],
-                "post_id": holdout_eval["predictions"]["post_id"],
-                "y_true": holdout_eval["predictions"]["y_true"],
-                "y_pred_proba": holdout_eval["predictions"]["y_pred"],
-            }).write_parquet(predictions_dir / f"{split_name}.parquet")
-
-            if generate_plots and holdout_type == eval_holdout_type:
-                try:
-                    plot_model_performance(
-                        holdout_eval["predictions"]["y_true"],
-                        holdout_eval["predictions"]["y_pred"],
-                        plots_dir / f"holdout_performance_{timestamp}.png",
-                        title_suffix="(Holdout)",
-                    )
-                except Exception as plot_exc:
-                    logger.warning(f"Holdout performance plotting failed: {plot_exc}")
         except Exception as exc:
             logger.warning(f"Holdout evaluation ({holdout_type}) failed (non-fatal): {exc}")
+
+    final_split_metrics: Dict[str, Dict[str, Any]] = {
+        "train": train_eval["metrics"],
+        "val": val_eval["metrics"],
+        "val_unseen_users": val_unseen_eval["metrics"],
+        **all_holdout_metrics,
+    }
+    final_metric_iteration = (
+        len(training_results["history"]["train_loss"])
+        if training_results is not None
+        else 0
+    )
+    log_final_classification_metrics(
+        context.tracker,
+        final_split_metrics,
+        final_metric_iteration,
+    )
 
     # --- training config ---
     training_config = {
@@ -1333,10 +1244,14 @@ def run(context: Context, args) -> Dict[str, Any]:
         "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
+        "val_unseen_samples": len(val_unseen_dataset),
         "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
+        "val_unseen_metrics": val_unseen_eval["metrics"],
         "holdout_metrics": holdout_metrics,
-        "best_val_auc": best_val_auc,
+        "all_holdout_metrics": all_holdout_metrics,
+        "primary_metric_name": primary_metric_name,
+        "best_val_metric": best_val_metric,
     }
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
@@ -1350,10 +1265,12 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, l2_norm={l2_normalize_embeddings}, early_stopping_min_delta={early_stopping_min_delta}, tau={similarity_temperature}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
-        f"best_val_auc: {best_val_auc:.4f}",
+        f"primary_metric_name: {primary_metric_name}",
+        f"best_val_metric: {best_val_metric:.4f}",
     ]
-    if holdout_metrics.get("auc_roc"):
-        info_lines.append(f"holdout_auc: {holdout_metrics['auc_roc']:.4f}")
+    info_lines.extend(stage_info_metric_lines(final_split_metrics))
+    if holdout_metrics.get(primary_metric_name) is not None:
+        info_lines.append(f"holdout_{primary_metric_name}: {holdout_metrics[primary_metric_name]:.4f}")
     (out_dir / "stage_info.txt").write_text("\n".join(info_lines) + "\n")
 
     logger.info(f"Two-Tower training completed in {runtime:.2f}s")
@@ -1363,6 +1280,5 @@ def run(context: Context, args) -> Dict[str, Any]:
         "artifacts": {
             "model_path": str(model_path) if model_path else None,
             "training_config": str(out_dir / "training_config.json"),
-            "author_table_mapping_path": str(author_table_mapping_path) if author_table_mapping_path else None,
         },
     }

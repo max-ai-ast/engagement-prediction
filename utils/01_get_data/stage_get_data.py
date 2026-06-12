@@ -3,9 +3,10 @@
 """
 Stage 1: Get and filter data using streaming Polars + hash-based sampling.
 
-This stage produces three core outputs:
+This stage produces four core outputs:
 - likes_core.parquet: filtered likes with emb_idx for embedding lookup
-- posts_core.parquet: metadata for liked posts + random sample, with emb_idx
+- posts_core.parquet: metadata for liked posts + per-hour random sample, with emb_idx
+- author_idx.parquet: mapping of eligible post authors to author embedding table rows
 - embeddings.npy: memmap file containing post embeddings (shape: n_posts x embed_dim)
 
 ================================================================================
@@ -23,11 +24,12 @@ Pass 1 - Count likes per user (streaming):
   - Scan all likes parquet files (no batching) and apply --likes-start/--likes-end.
   - Count total likes and per-user like counts.
   - Pre-filter users with fewer than --min-likes-per-user.
-  - If --max-liking-users is set, hash-sample eligible users
+  - Hash-sample disjoint train/val and unseen-eval user cohorts
     using --cap-random-seed (deterministic).
 
 Pass 2 - Filter likes to sampled users (streaming):
-  - Semi-join likes to the sampled user list.
+  - Join likes to the compact sampled user cohort table.
+  - Drop unseen-eval users' train-window likes before materialization.
 
 Per-user random cap (--max-likes-per-user):
   - For each user, hash-rank subject_uri with the seed and keep top-K.
@@ -35,6 +37,7 @@ Per-user random cap (--max-likes-per-user):
 
 Finalization:
   - Keep did, subject_uri, record_created_at (convert to UTC datetime if needed).
+  - Add split labels directly to likes_core.
   - Collect a final in-memory likes_core_df for downstream steps and stats.
 
 PHASE 2: Posts Filtering (_load_posts_core_polars) - NO EMBEDDINGS
@@ -44,8 +47,8 @@ Extract liked post URIs:
 
 Process posts (single scan, metadata only):
   - Scan all posts parquet files (no batching) and apply --posts-start/--posts-end.
-  - Count total posts to compute a hash threshold for --negative-posts-sample.
-  - Hash-sample posts by at_uri (seeded) and left-join liked URIs.
+  - Hash-sample posts by at_uri (seeded) within each hour bucket, targeting --negative-samples-per-hour per bucket.
+  - Left-join liked URIs.
   - Keep posts that are in the random sample OR are liked.
   - Collect metadata-only DataFrame (NO embedding expansion here).
   - Assign emb_idx as row number for later memmap lookup.
@@ -95,15 +98,16 @@ OUTPUTS
 ================================================================================
 
 Under <run_dir>/01_get_data/<timestamp>/:
-  - likes_core_*.parquet: did, subject_uri, record_created_at, emb_idx
-  - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, emb_idx
+  - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, emb_idx, author_did, author_idx
+  - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, negative_hour_bucket, split_window, emb_idx, author_idx
+  - author_idx_*.parquet: author_did, author_train_count, author_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
   - summary.json: full filtering statistics and parameters
   - stage.log: detailed execution log with memory checkpoints
   - stage_info.txt: human-readable run summary
 
 Using the outputs:
-  - Random sample (for population stats): filter posts_core where in_random_sample=True
+  - Random sample (for population stats): filter posts_core where in_random_sample=True, grouped by negative_hour_bucket
   - Liked posts: join likes_core.subject_uri with posts_core.at_uri. is_liked is also set
   - Embedding lookup: mmap = np.load(embeddings_path, mmap_mode="r"); emb = mmap[emb_idx]
   - Negative examples for training: sample from random sample, but make sure to exclude each given user's likes, since this is a true random sample that can (with low probability) contain liked posts.
@@ -133,6 +137,7 @@ from utils.helpers import (
     parse_one_ts,
     validate_dataframe_schema,
     apply_time_filter,
+    TIMESTAMP_COL_NAME,
 )
 from utils.memory_helpers import (
     check_data_load_safe,
@@ -369,13 +374,36 @@ def _plot_data_density_histogram(
         logger.warning(f"Failed to create data density histogram: {e}")
         return {}
 
-# This function is used to sample users with at least min_likes_per_user likes, and then randomly sample max_liking_users users from the eligible pool
-def _get_sampled_users_with_min_likes(
+def _get_train_start(
+    train_start: Optional[str],
+    posts_start: Optional[str],
+    likes_start: Optional[str],
+) -> str:
+    """
+    Resolve the training window start date, falling back to posts_start and likes_start
+    if not explicitly specified.
+    """
+    if train_start is not None:
+        return train_start
+    if posts_start is not None:
+        return posts_start
+    if likes_start is not None:
+        return likes_start
+    raise ValueError("Could not infer train window start from input arguments!")
+
+
+def _cap_user_table(user_lf: pl.LazyFrame, max_users: Optional[int], hash_col: str) -> pl.LazyFrame:
+    if max_users is None:
+        return user_lf
+    if max_users <= 0:
+        return user_lf.head(0)
+    return user_lf.sort([hash_col, "did"]).head(max_users)
+
+
+def _get_eligible_user_counts_lf(
     likes_lf: pl.LazyFrame,
     min_likes_per_user: int,
-    max_liking_users: Optional[int],
-    random_seed: int
-) -> Tuple[pl.DataFrame, int, int, int]:
+) -> Tuple[pl.LazyFrame, int, int, int]:
     # get total user and like count
     likes_summary_df = likes_lf.select(
         pl.col('did').n_unique().alias('user_count'),
@@ -401,17 +429,139 @@ def _get_sampled_users_with_min_likes(
         .collect(engine="streaming")
         .item()
     )
-    # ===== Sample users if cap is set =====
-    if max_liking_users is not None and n_users_eligible > max_liking_users:
-        threshold_hash = _compute_random_sample_threshold(n_users_eligible, max_liking_users)
-        user_counts_lf = (
-            user_counts_lf.with_columns(
-                pl.col("did").hash(seed=random_seed).alias("_hash_key"),
-            ).filter(
-                pl.col("_hash_key") <= threshold_hash
-            )
+    return user_counts_lf, n_users_initial, n_likes_initial, n_users_eligible
+
+
+def _get_sampled_user_cohorts_with_min_likes(
+    likes_lf: pl.LazyFrame,
+    min_likes_per_user: int,
+    max_trainval_users: Optional[int],
+    max_unseen_eval_users: Optional[int],
+    random_seed: int
+) -> Tuple[pl.DataFrame, int, int, int, int, int]:
+    user_counts_lf, n_users_initial, n_likes_initial, n_users_eligible = _get_eligible_user_counts_lf(
+        likes_lf,
+        min_likes_per_user,
+    )
+    eligible_lf = user_counts_lf.with_columns(
+        pl.concat_str([pl.lit("trainval:"), pl.col("did")]).hash(seed=random_seed).alias("_trainval_hash"),
+        pl.concat_str([pl.lit("unseen_eval:"), pl.col("did")]).hash(seed=random_seed).alias("_unseen_eval_hash"),
+    )
+
+    trainval_lf = (
+        _cap_user_table(eligible_lf, max_trainval_users, "_trainval_hash")
+        .select(["did", "like_count"])
+        .with_columns(pl.lit("trainval").alias("_user_cohort"))
+    )
+    unseen_eval_lf = (
+        eligible_lf
+        .join(trainval_lf.select("did"), on="did", how="anti")
+    )
+    unseen_eval_lf = (
+        _cap_user_table(unseen_eval_lf, max_unseen_eval_users, "_unseen_eval_hash")
+        .select(["did", "like_count"])
+        .with_columns(pl.lit("unseen_eval").alias("_user_cohort"))
+    )
+
+    sampled_users_df = pl.concat([trainval_lf, unseen_eval_lf]).collect(engine="streaming")
+    n_trainval_users = sampled_users_df.filter(pl.col("_user_cohort") == "trainval").height
+    n_unseen_eval_users = sampled_users_df.filter(pl.col("_user_cohort") == "unseen_eval").height
+    return (
+        sampled_users_df,
+        n_users_initial,
+        n_likes_initial,
+        n_users_eligible,
+        n_trainval_users,
+        n_unseen_eval_users,
+    )
+
+
+def _split_window_exprs(
+    timestamp_col: str,
+    train_start: str,
+    val_start: str,
+    holdout_start: Optional[str],
+    *,
+    parse_literals_as_datetime: bool,
+) -> Tuple[pl.Expr, pl.Expr, pl.Expr]:
+    def _lit_ts(ts: str) -> pl.Expr:
+        literal = pl.lit(ts)
+        if parse_literals_as_datetime:
+            return literal.str.to_datetime(time_zone="UTC")
+        return literal
+
+    train_window = (
+        (pl.col(timestamp_col) >= _lit_ts(train_start))
+        & (pl.col(timestamp_col) < _lit_ts(val_start))
+    )
+    if holdout_start is not None:
+        val_window = (
+            (pl.col(timestamp_col) >= _lit_ts(val_start))
+            & (pl.col(timestamp_col) < _lit_ts(holdout_start))
         )
-    return user_counts_lf.select("did").collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
+        holdout_window = pl.col(timestamp_col) >= _lit_ts(holdout_start)
+    else:
+        val_window = pl.col(timestamp_col) >= _lit_ts(val_start)
+        holdout_window = pl.lit(False)
+    return train_window, val_window, holdout_window
+
+
+def _apply_like_split_labels(
+    likes_lf: pl.LazyFrame,
+    train_start: str,
+    val_start: str,
+    holdout_start: Optional[str],
+) -> pl.LazyFrame:
+    is_trainval = pl.col("_user_cohort") == "trainval"
+    is_unseen_eval = pl.col("_user_cohort") == "unseen_eval"
+    train_window, val_window, holdout_window = _split_window_exprs(
+        TIMESTAMP_COL_NAME,
+        train_start,
+        val_start,
+        holdout_start,
+        parse_literals_as_datetime=False,
+    )
+
+    return likes_lf.with_columns(
+        pl.when(is_trainval & train_window)
+        .then(pl.lit("train"))
+        .when(is_trainval & val_window)
+        .then(pl.lit("val"))
+        .when(is_trainval & holdout_window)
+        .then(pl.lit("holdout_seen_users"))
+        .when(is_unseen_eval & val_window)
+        .then(pl.lit("val_unseen_users"))
+        .when(is_unseen_eval & holdout_window)
+        .then(pl.lit("holdout_unseen_users"))
+        .otherwise(None)
+        .alias("split")
+    )
+
+
+def _add_post_split_window(
+    posts_df: pl.DataFrame,
+    train_start: str,
+    val_start: str,
+    holdout_start: Optional[str],
+) -> pl.DataFrame:
+    train_window, val_window, holdout_window = _split_window_exprs(
+        TIMESTAMP_COL_NAME,
+        train_start,
+        val_start,
+        holdout_start,
+        parse_literals_as_datetime=True,
+    )
+
+    return posts_df.with_columns(
+        pl.when(train_window)
+        .then(pl.lit("train"))
+        .when(val_window)
+        .then(pl.lit("val"))
+        .when(holdout_window)
+        .then(pl.lit("holdout"))
+        .otherwise(None)
+        .alias("split_window")
+    )
 
 
 def _apply_per_user_random_cap(
@@ -443,10 +593,15 @@ def _load_likes_core_polars(
     end_str: Optional[str],
     paths: List[str],
     *,
-    max_liking_users: Optional[int],
+    max_trainval_users: Optional[int],
+    max_unseen_eval_users: Optional[int],
     max_likes_per_user: int,
     min_likes_per_user: int,
     random_seed: int,
+    train_start: str,
+    val_start: Optional[str],
+    holdout_start: Optional[str],
+    holdout_end: Optional[str],
     logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     """
@@ -455,8 +610,8 @@ def _load_likes_core_polars(
     High-level flow:
     1. Streamed pass: count likes per user
     2. Pre-filter users who don't meet min_likes_per_user
-    3. Sample users from eligible pool (if cap is set)
-    4. Streamed pass: keep only likes from sampled users
+    3. Sample disjoint train/val and unseen-eval users from eligible pool
+    4. Streamed pass: keep only usable likes from sampled users
     5. Apply per-user random caps (NOT recency-based)
     6. Verify min-likes threshold (handles edge cases from per-user caps)
     
@@ -470,16 +625,38 @@ def _load_likes_core_polars(
     
     raw_lf = pl.scan_parquet(paths)
     base_lf = apply_time_filter(raw_lf, start_str, end_str)
+    train_start_dt = parse_one_ts(train_start)
+    val_start_dt = parse_one_ts(val_start)
+    holdout_start_dt = parse_one_ts(holdout_start)
+    parse_one_ts(holdout_end)
+    if train_start_dt is None:
+        raise ValueError("Training window start not supplied in input arguments!")
+    if val_start is None or val_start_dt is None:
+        raise ValueError("Validation window start not supplied in input arguments!")
+    if val_start_dt <= train_start_dt:
+        raise ValueError("Train start date is greater than or equal to val start date!")
+    if holdout_start_dt is not None and holdout_start_dt <= val_start_dt:
+        raise ValueError("holdout_start must be after val_start")
+    if holdout_start_dt is None and holdout_end is not None:
+        raise ValueError("Must supply holdout_start if holdout_end is specified")
 
     # ===== PASS 1: Filter users =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
 
-    # Filter users by min likes and then sample down to max liking users
+    # Filter users by min likes and then sample disjoint train/val and unseen-eval cohorts.
     # n_users_eligible is the number of users that had the minimum number of likes, before we randomly sample
-    sampled_users_df, n_users_initial, n_likes_initial, n_users_eligible = _get_sampled_users_with_min_likes(
+    (
+        sampled_users_df,
+        n_users_initial,
+        n_likes_initial,
+        n_users_eligible,
+        n_trainval_users,
+        n_unseen_eval_users,
+    ) = _get_sampled_user_cohorts_with_min_likes(
         base_lf, 
         min_likes_per_user,
-        max_liking_users,
+        max_trainval_users,
+        max_unseen_eval_users,
         random_seed
     )
     logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
@@ -497,14 +674,39 @@ def _load_likes_core_polars(
     stats['n_users_eligible_for_sampling'] = n_users_eligible
     stats['n_users_excluded_min_likes'] = n_users_filtered
     stats['n_users_sampled'] = n_users_sampled
+    stats['n_trainval_users_sampled'] = n_trainval_users
+    stats['n_unseen_eval_users_sampled'] = n_unseen_eval_users
     logger.info(
-        f"Sampled {n_users_sampled:,} liking users "
+        f"Sampled {n_trainval_users:,} train/val users and "
+        f"{n_unseen_eval_users:,} unseen-eval users "
         f"({100*n_users_sampled/n_users_eligible:.1f}% of eligible)"
     )
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
     logger.info("Pass 2: Filtering likes to sampled users")
-    likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
+    likes_lf = base_lf.join(
+        sampled_users_df.select(["did", "_user_cohort"]).lazy(),
+        on='did',
+        how='inner',
+    )
+    before_end = (pl.col(TIMESTAMP_COL_NAME) < holdout_end) if holdout_end is not None else pl.lit(True)
+    likes_lf = likes_lf.filter(
+        before_end
+        & (
+            ((pl.col("_user_cohort") == "trainval") & (pl.col(TIMESTAMP_COL_NAME) >= train_start))
+            | ((pl.col("_user_cohort") == "unseen_eval") & (pl.col(TIMESTAMP_COL_NAME) >= val_start))
+        )
+    )
+    likes_lf = _apply_like_split_labels(likes_lf, train_start, val_start, holdout_start)
+    n_null_splits = (
+        likes_lf
+        .filter(pl.col("split").is_null())
+        .select(pl.len())
+        .collect(engine="streaming")
+        .item()
+    )
+    if n_null_splits > 0:
+        raise ValueError(f"Found {n_null_splits:,} likes with null split after split labeling")
     
     # Compute counts per user before per-user cap
     counts_pre_cap_df = (
@@ -538,7 +740,12 @@ def _load_likes_core_polars(
     if max_likes_per_user > 0 and n_after_user_sample > 0:
         likes_lf = _apply_per_user_random_cap(likes_lf, max_likes_per_user, random_seed)
     
-    likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).unique().collect(engine="streaming")
+    likes_df = (
+        likes_lf
+        .select(['did', 'subject_uri', TIMESTAMP_COL_NAME, 'split'])
+        .unique()
+        .collect(engine="streaming")
+    )
 
     # Compute post-cap counts
     n_after_cap = likes_df.height
@@ -548,10 +755,13 @@ def _load_likes_core_polars(
 
     # Convert record_created_at to datetime if it exists and is not already datetime
     schema = likes_df.schema
-    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+    if TIMESTAMP_COL_NAME in schema and schema[TIMESTAMP_COL_NAME] != pl.Datetime:
         likes_df = likes_df.with_columns(
-            pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            pl.col(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias(TIMESTAMP_COL_NAME)
         )
+    likes_df = likes_df.with_columns(
+        pl.col(TIMESTAMP_COL_NAME).dt.truncate("1h").alias('like_hour_bucket')
+    )
 
     stats['n_likes_final'] = n_after_cap
     
@@ -564,9 +774,13 @@ def _load_posts_core_polars(
     liked_post_uris_df: pl.DataFrame,
     paths: List[str],
     *,
-    negative_posts_sample: int,
+    negative_samples_per_hour: int,
     embedding_model: str,
     random_seed: int,
+    train_start: str,
+    val_start: str,
+    holdout_start: Optional[str],
+    holdout_end: Optional[str],
     logger: logging.Logger,
     # the below inputs are for testing
     get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = _infer_embed_dim_from_first_row_polars,
@@ -577,8 +791,8 @@ def _load_posts_core_polars(
 
     Processing flow:
     1. Scan all parquet files and apply the time filter.
-    2. Count total posts to set a hash-sampling threshold.
-    3. Hash-sample posts (random_seed) and left-join liked_post_uris.
+    2. Hash-sample posts within hourly buckets, targeting negative_samples_per_hour per bucket.
+    3. Left-join liked_post_uris.
     4. Keep posts that are either in the random sample or liked.
     5. Collect metadata-only DataFrame (no embeddings).
 
@@ -598,6 +812,7 @@ def _load_posts_core_polars(
     - in_random_sample: True if post was selected by hash-sampling,
                         False if included only because it was liked
     - is_liked: True if post is in likes core dataset, False otherwise
+    - negative_hour_bucket: Hour bucket for sampled negatives; null for liked-only rows
 
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
@@ -609,20 +824,28 @@ def _load_posts_core_polars(
 
     posts_lf = pl.scan_parquet(paths)
     posts_lf = apply_time_filter(posts_lf, start_str, end_str)
+    posts_schema = posts_lf.collect_schema()
+    _validate_posts_record_created_at_schema(posts_schema)
+    posts_lf = posts_lf.filter(pl.col(TIMESTAMP_COL_NAME) >= train_start)
+    if holdout_end is not None:
+        posts_lf = posts_lf.filter(pl.col(TIMESTAMP_COL_NAME) < holdout_end)
 
-    # get the total number of posts and calc threshold
+    # get the total number of posts
     n_posts_total = posts_lf.select(pl.col('at_uri').n_unique()).collect(engine="streaming").item()
     logger.info(f"n_posts_total: {n_posts_total:,}")
-    threshold_hash = _compute_random_sample_threshold(n_posts_total, negative_posts_sample)
 
     # Metadata columns only - NO embeddings during filtering
-    cols_metadata = ["at_uri", "record_created_at", "did", "record_text"]
+    cols_metadata = ["at_uri", TIMESTAMP_COL_NAME, "did", "record_text"]
+    bucket_sample_rates_df = _get_hourly_sample_rates_df(
+        posts_lf=posts_lf,
+        negative_samples_per_hour=negative_samples_per_hour,
+    )
 
     # get posts: sampled via hash, or in liked_post_uris:
     negs_and_likes_lf = _build_posts_candidate_lf(
         posts_lf=posts_lf,
         liked_post_uris_df=liked_post_uris_df,
-        threshold_hash=threshold_hash,
+        bucket_sample_rates_df=bucket_sample_rates_df,
         random_seed=random_seed,
         cols_metadata=cols_metadata,
     )
@@ -637,13 +860,17 @@ def _load_posts_core_polars(
     # Collect metadata (small - no embeddings)
     posts_core_df = negs_and_likes_lf.collect(engine="streaming")
 
-    # Convert record_created_at to datetime if it exists and is not already datetime
+    # Convert timestamps after sampling so the full posts scan can stay string-based.
     schema = posts_core_df.schema
-    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+    if TIMESTAMP_COL_NAME in schema and schema[TIMESTAMP_COL_NAME] != pl.Datetime:
         posts_core_df = posts_core_df.with_columns(
-            pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            pl.col(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias(TIMESTAMP_COL_NAME)
         )
-    
+    posts_core_df = posts_core_df.with_columns(
+        pl.col('negative_hour_bucket').cast(pl.Utf8).str.to_datetime(time_zone="UTC").alias('negative_hour_bucket')
+    )
+    posts_core_df = _add_post_split_window(posts_core_df, train_start, val_start, holdout_start)
+
     # NOTE: emb_idx is NOT assigned here - it's added later after embedding validation
     # This ensures only posts with valid embeddings get indices (no gaps in memmap)
     
@@ -652,9 +879,11 @@ def _load_posts_core_polars(
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': 'datetime',
+        TIMESTAMP_COL_NAME: 'datetime',
         'record_text': str,
         'is_liked': bool,
+        'negative_hour_bucket': 'datetime',
+        'split_window': str,
     }
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
     logger.info(f"✓ posts_core schema validated")
@@ -664,12 +893,14 @@ def _load_posts_core_polars(
     n_liked_only = posts_core_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
     n_liked_in_random = posts_core_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
     n_random_sample = posts_core_df.filter(pl.col("in_random_sample")).height
+    n_random_sample_buckets = posts_core_df.filter(pl.col("in_random_sample"))["negative_hour_bucket"].n_unique()
 
     logger.info(f"Collected posts_core: {n_posts_core:,} rows")
     logger.info(f"All posts in raw data: {n_posts_total:,}")
     logger.info(f"Liked only: {n_liked_only:,}")
     logger.info(f"Liked in random sample: {n_liked_in_random:,}")
     logger.info(f"Random sample total: {n_random_sample:,}")
+    logger.info(f"Random sample buckets: {n_random_sample_buckets:,}; target per hour: {negative_samples_per_hour:,}")
 
     # Total liked posts = those only in liked set + those also in random sample
     n_total_liked_posts = n_liked_only + n_liked_in_random
@@ -683,6 +914,8 @@ def _load_posts_core_polars(
         'n_liked_in_random_sample': n_liked_in_random,  # Liked posts that are also in random sample
         'liked_post_match_rate': liked_post_match_rate,
         'n_random_sample': n_random_sample,
+        'n_random_sample_buckets': n_random_sample_buckets,
+        'negative_samples_per_hour': negative_samples_per_hour,
         'n_posts_core': n_posts_core,
         'embedding_dim': embed_dim,
     }
@@ -693,22 +926,54 @@ def _load_posts_core_polars(
     return posts_core_df, stats, embed_dim
 
 
-def _compute_random_sample_threshold(n_rows_total: int, n_sample: int) -> int:
-    if n_rows_total <= 0:
-        return 0
-    max_hash = 2**64 - 1
-    if n_sample >= n_rows_total:
-        return max_hash
-    if n_sample <= 0:
-        return 0
-    # Use integer math to avoid float rounding issues at large ranges.
-    return (n_sample * max_hash) // n_rows_total
+def _validate_posts_record_created_at_schema(schema: pl.Schema) -> None:
+    dtype = schema.get(TIMESTAMP_COL_NAME)
+    if dtype not in (pl.String, pl.Utf8):
+        raise ValueError(
+            "Expected posts record_created_at to be stored as a string timestamp for streaming hourly sampling; "
+            f"got {dtype!r}"
+        )
+
+
+def _hour_bucket_key_expr(col_name: str) -> pl.Expr:
+    return pl.concat_str([
+        pl.col(col_name).str.slice(0, 13),
+        pl.lit(":00:00"),
+    ])
+
+
+def _get_hourly_sample_rates_df(
+    posts_lf: pl.LazyFrame,
+    negative_samples_per_hour: int,
+) -> pl.DataFrame:
+    bucket_counts_df = (
+        posts_lf
+        .select(
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("_hour_bucket_key")
+        )
+        .group_by("_hour_bucket_key")
+        .len()
+        .collect(engine="streaming")
+    )
+    if negative_samples_per_hour <= 0:
+        return bucket_counts_df.with_columns(
+            pl.lit(0.0).alias("_sample_probability")
+        ).select(["_hour_bucket_key", "_sample_probability"])
+    return (
+        bucket_counts_df
+        .with_columns(
+            (pl.lit(float(negative_samples_per_hour)) / pl.col("len").cast(pl.Float64))
+            .clip(0.0, 1.0)
+            .alias("_sample_probability")
+        )
+        .select(["_hour_bucket_key", "_sample_probability"])
+    )
 
 
 def _build_posts_candidate_lf(
     posts_lf: pl.LazyFrame,
     liked_post_uris_df: pl.DataFrame,
-    threshold_hash: int,
+    bucket_sample_rates_df: pl.DataFrame,
     random_seed: int,
     cols_metadata: List[str],
 ) -> pl.LazyFrame:
@@ -723,8 +988,10 @@ def _build_posts_candidate_lf(
         .select(cols_metadata)
         # Compute a deterministic pseudo-random hash value for each post URI (for sampling)
         .with_columns(
-            pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("_hour_bucket_key"),
+            (pl.col("at_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)).alias("_hash_score"),
         )
+        .join(bucket_sample_rates_df.lazy(), on="_hour_bucket_key", how="left")
         # Left join with liked post URIs to tag which posts are in the users' liked set.
         # The right side adds a _is_liked=True marker for all liked post URIs.
         # Note: liked_post_uris_df is already a UNIQUE list of subject_uri's
@@ -738,14 +1005,20 @@ def _build_posts_candidate_lf(
         #  - in_random_sample: Is this post selected via random hash-sampling (<= threshold)?
         #  - is_liked: Is this post present in users' likes? Nulls -> False (not liked)
         .with_columns(
-            (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
+            (pl.col("_hash_score") < pl.col("_sample_probability").fill_null(0.0)).alias("in_random_sample"),
             pl.col("_is_liked").fill_null(False).alias("is_liked"),
+        )
+        .with_columns(
+            pl.when(pl.col("in_random_sample"))
+            .then(pl.col("_hour_bucket_key"))
+            .otherwise(None)
+            .alias("negative_hour_bucket")
         )
         # Only keep posts that are either in the random sample, or are users' liked posts
         .filter(pl.col("in_random_sample") | pl.col("is_liked"))
         .unique(subset=['at_uri'])
         # Drop temporary helper columns before returning
-        .drop(["_is_liked", "_hash_key"])
+        .drop(["_is_liked", "_hash_score", "_hour_bucket_key", "_sample_probability"])
     )
 
 
@@ -764,13 +1037,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     posts_end = args.posts_end
     likes_start = args.likes_start
     likes_end = args.likes_end
-    max_liking_users = args.max_liking_users
-    if max_liking_users is not None:
-        max_liking_users = int(max_liking_users)
+    max_trainval_users = args.max_trainval_users
+    if max_trainval_users is not None:
+        max_trainval_users = int(max_trainval_users)
+    max_unseen_eval_users = args.max_unseen_eval_users
+    if max_unseen_eval_users is not None:
+        max_unseen_eval_users = int(max_unseen_eval_users)
     max_likes_per_user = int(args.max_likes_per_user)
     min_likes_per_user = int(args.min_likes_per_user)
-    negative_posts_sample = int(args.negative_posts_sample)
+    min_author_support = int(args.min_author_support)
+    negative_samples_per_hour = int(args.negative_samples_per_hour)
     cap_random_seed = int(args.cap_random_seed)
+    train_start = _get_train_start(args.train_start, posts_start, likes_start)
+    val_start = args.val_start
+    holdout_start = args.holdout_start
+    holdout_end = args.holdout_end
     embedding_model = args.embedding_model
     skip_embeddings = args.skip_embeddings
     memory_check = str(args.memory_check)  # "full", "ignore", or "skip"
@@ -780,12 +1061,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     max_memory_pct = float(args.max_memory_pct)
 
     # Use Polars-based filtering pipeline for GreenEarth Ingex data
-    # Returns: (likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, stats)
+    # Returns: (likes_core_df, posts_core_df, likes_core_path, posts_core_path, author_idx_path, embeddings_path, embed_dim, stats)
     (
         likes_core_df, 
         posts_core_df, 
         likes_core_path, 
         posts_core_path, 
+        author_idx_path,
         embeddings_path, 
         embed_dim, 
         all_stats
@@ -800,11 +1082,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         memory_check=memory_check,
         max_memory_gb=max_memory_gb,
         max_memory_pct=max_memory_pct,
-        max_liking_users=max_liking_users,
+        max_trainval_users=max_trainval_users,
+        max_unseen_eval_users=max_unseen_eval_users,
         max_likes_per_user=max_likes_per_user,
         min_likes_per_user=min_likes_per_user,
-        negative_posts_sample=negative_posts_sample,
+        min_author_support=min_author_support,
+        negative_samples_per_hour=negative_samples_per_hour,
         cap_random_seed=cap_random_seed,
+        train_start=train_start,
+        val_start=val_start,
+        holdout_start=holdout_start,
+        holdout_end=holdout_end,
         embedding_model=embedding_model,
         skip_embeddings=skip_embeddings,
     )
@@ -815,9 +1103,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     likes_schema = {
         'did': str,
         'subject_uri': str,
-        'record_created_at': 'datetime',
+        TIMESTAMP_COL_NAME: 'datetime',
+        'like_hour_bucket': 'datetime',
+        'split': str,
         'emb_idx': int,  # NEW: index for memmap lookup
         'author_did': str,
+        'author_idx': int,
     }
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
@@ -826,10 +1117,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': 'datetime',
+        TIMESTAMP_COL_NAME: 'datetime',
         'record_text': str,
         'is_liked': bool,
+        'negative_hour_bucket': 'datetime',
+        'split_window': str,
         'emb_idx': int,  # NEW: index for memmap lookup
+        'author_idx': int,
     }
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
     logger.info("✓ posts_core schema validated")
@@ -862,11 +1156,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'likes_start': likes_start,
         'likes_end': likes_end,
         'parameters': {
-            'max_liking_users': max_liking_users,
+            'max_trainval_users': max_trainval_users,
+            'max_unseen_eval_users': max_unseen_eval_users,
             'max_likes_per_user': max_likes_per_user,
             'min_likes_per_user': min_likes_per_user,
-            'negative_posts_sample': negative_posts_sample,
+            'min_author_support': min_author_support,
+            'negative_samples_per_hour': negative_samples_per_hour,
             'cap_random_seed': cap_random_seed,
+            'train_start': train_start,
+            'val_start': val_start,
+            'holdout_start': holdout_start,
+            'holdout_end': holdout_end,
             'embedding_model': embedding_model,
             'skip_embeddings': skip_embeddings,
         },
@@ -875,6 +1175,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'posts_core_rows': n_posts,
             'embedding_dim': embed_dim,
             'embeddings_file': str(embeddings_path.name) if embeddings_path is not None else None,
+            'author_idx_file': author_idx_path.name,
             'embeddings_written': not skip_embeddings,
         },
         'filtering_stats': all_stats,
@@ -888,8 +1189,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: get_data",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: max_liking_users={max_liking_users}, max_likes_per_user={max_likes_per_user}, "
-        f"min_likes_per_user={min_likes_per_user}, negative_posts_sample={negative_posts_sample}, "
+        f"settings: max_trainval_users={max_trainval_users}, max_unseen_eval_users={max_unseen_eval_users}, "
+        f"max_likes_per_user={max_likes_per_user}, min_likes_per_user={min_likes_per_user}, "
+        f"min_author_support={min_author_support}, negative_samples_per_hour={negative_samples_per_hour}, "
         f"skip_embeddings={skip_embeddings}",
         f"inputs: GCS bucket={gcs_bucket}",
         f"N_likes_core: {n_likes}",
@@ -906,6 +1208,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'artifacts': {
             'likes_core_path': str(likes_core_path),
             'posts_core_path': str(posts_core_path),
+            'author_idx_path': str(author_idx_path),
             'embeddings_path': str(embeddings_path) if embeddings_path is not None else None,
             'embed_dim': embed_dim,
         },
@@ -1077,19 +1380,25 @@ def _run_greenearth_pipeline(
     memory_check: str,
     max_memory_gb: Optional[float],
     max_memory_pct: float,
-    max_liking_users: Optional[int],
+    max_trainval_users: Optional[int],
+    max_unseen_eval_users: Optional[int],
     max_likes_per_user: int,
     min_likes_per_user: int,
-    negative_posts_sample: int,
+    min_author_support: int,
+    negative_samples_per_hour: int,
     cap_random_seed: int,
+    train_start: str,
+    val_start: Optional[str],
+    holdout_start: Optional[str],
+    holdout_end: Optional[str],
     embedding_model: str,
     skip_embeddings: bool,
-) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Path, Optional[Path], int, Dict[str, Any]]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
     
     Returns:
-        Tuple of (likes_core_df, posts_core_df, likes_core_path, posts_core_path, 
+        Tuple of (likes_core_df, posts_core_df, likes_core_path, posts_core_path, author_idx_path,
                   embeddings_path (or None if skipped), embed_dim, stats_dict)
     """
     all_stats = {}
@@ -1147,10 +1456,10 @@ def _run_greenearth_pipeline(
             embedding_dim=embedding_dim_for_estimate,
             max_memory_gb=max_memory_gb,
             max_memory_pct=max_memory_pct,
-            max_liking_users=max_liking_users,
+            max_liking_users=max_trainval_users,
             max_likes_per_user=max_likes_per_user,
             min_likes_per_user=min_likes_per_user,
-            negative_posts_sample=negative_posts_sample,
+            negative_posts_sample=negative_samples_per_hour,
             skip_safety_check=(memory_check == "ignore"),
             logger=logger,
         )
@@ -1170,10 +1479,15 @@ def _run_greenearth_pipeline(
         start_str=likes_start,
         end_str=likes_end,
         paths=likes_paths,
-        max_liking_users=max_liking_users,
+        max_trainval_users=max_trainval_users,
+        max_unseen_eval_users=max_unseen_eval_users,
         max_likes_per_user=max_likes_per_user,
         min_likes_per_user=min_likes_per_user,
         random_seed=cap_random_seed,
+        train_start=train_start,
+        val_start=val_start,
+        holdout_start=holdout_start,
+        holdout_end=holdout_end,
         logger=logger,
     )
     all_stats['likes'] = likes_stats
@@ -1192,14 +1506,20 @@ def _run_greenearth_pipeline(
     # Load posts metadata (NO embeddings - those are handled at the end)
     log_operation_start('Load posts metadata (no embeddings)', '01_GET_DATA', logger)
     embed_dim_override = get_embedding_dim_for_known_model(embedding_model) if skip_embeddings else None
+    if val_start is None:
+        raise ValueError("val_start must be provided!")
     posts_core_df, posts_stats, embed_dim = _load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
         liked_post_uris_df=liked_post_uris_df,
         paths=posts_paths,
-        negative_posts_sample=negative_posts_sample,
+        negative_samples_per_hour=negative_samples_per_hour,
         embedding_model=embedding_model,
         random_seed=cap_random_seed,
+        train_start=train_start,
+        val_start=val_start,
+        holdout_start=holdout_start,
+        holdout_end=holdout_end,
         logger=logger,
         embed_dim_override=embed_dim_override,
     )
@@ -1304,7 +1624,6 @@ def _run_greenearth_pipeline(
         likes_core_df=likes_core_df,
         posts_core_df=posts_core_df,
         min_likes_per_user=min_likes_per_user,
-        random_seed=cap_random_seed,
         logger=logger,
     )
     
@@ -1344,20 +1663,42 @@ def _run_greenearth_pipeline(
         logger.info(f"✓ All {len(likes_core_df):,} likes have valid emb_idx")
     
     mem_tracker.checkpoint("after_emb_idx_join", quiet=True)
+
+    # ========================================================================
+    # PHASE 7: Build author_idx mapping and join to core tables
+    # ========================================================================
+    log_operation_start('Build author index mapping', '01_GET_DATA', logger)
+    author_idx_df, author_stats = _build_author_idx_mapping(
+        posts_core_df=posts_core_df,
+        likes_core_df=likes_core_df,
+        min_author_support=min_author_support,
+        logger=logger,
+    )
+    posts_core_df, likes_core_df = _join_author_idx_to_core_tables(
+        posts_core_df=posts_core_df,
+        likes_core_df=likes_core_df,
+        author_idx_df=author_idx_df,
+    )
+    all_stats['authors'] = author_stats
+    mem_tracker.checkpoint("after_author_idx_join", quiet=True)
     
     # ========================================================================
-    # PHASE 7: Save parquets (FINAL - after all filtering complete)
+    # PHASE 8: Save parquets (FINAL - after all filtering complete)
     # ========================================================================
     log_operation_start('Save parquet files', '01_GET_DATA', logger)
     
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
+    author_idx_path = out_dir / f"author_idx_{ts_name}.parquet"
     
     posts_core_df.write_parquet(posts_core_path, compression="zstd")
     logger.info(f"Saved posts_core: {posts_core_path} ({len(posts_core_df):,} rows)")
     
     likes_core_df.write_parquet(likes_core_path, compression="zstd")
     logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
+
+    author_idx_df.write_parquet(author_idx_path, compression="zstd")
+    logger.info(f"Saved author_idx: {author_idx_path} ({len(author_idx_df):,} rows)")
     
     mem_tracker.checkpoint("after_parquet_save", quiet=True)
     
@@ -1374,17 +1715,16 @@ def _run_greenearth_pipeline(
             logger.info(f"Memory estimation accuracy: actual peak {actual_peak:.3f} GB vs estimated {estimated_peak:.2f} GB ({accuracy_pct:.1f}%)")
     
     # Log comprehensive attrition report
-    max_liking_users_for_report = max_liking_users if max_liking_users is not None else 0
-    _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_liking_users_for_report, logger)
+    max_trainval_users_for_report = max_trainval_users if max_trainval_users is not None else 0
+    _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_trainval_users_for_report, logger)
     
-    return likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, all_stats
+    return likes_core_df, posts_core_df, likes_core_path, posts_core_path, author_idx_path, embeddings_path, embed_dim, all_stats
 
 
 def _filter_likes_after_post_join(
     likes_core_df: pl.DataFrame,
     posts_core_df: pl.DataFrame,
     min_likes_per_user: int,
-    random_seed: int,
     logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, int]]:
     """Once we've filtered posts, now filter likes to only those that have matching posts in the dataset"""
@@ -1404,17 +1744,16 @@ def _filter_likes_after_post_join(
     # Re-verify min-likes per user
     n_users_removed_by_join_verify = 0
     if min_likes_per_user > 0:
-        # Filter users by min likes
-        # (no need to use the max_liking_users functionality)
-        # Returns: (sampled_users_df, n_users_total, n_likes_total, n_users_eligible)
-        sampled_users_df, n_users_before_min_likes, _, _ = _get_sampled_users_with_min_likes(
+        # Filter users by min likes; sampling cohorts are preserved from the
+        # earlier pass, so this only re-verifies the threshold after post joins.
+        valid_users_lf, n_users_before_min_likes, _, _ = _get_eligible_user_counts_lf(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
-            max_liking_users=None,
-            random_seed=random_seed
         )
 
-        n_users_after_join_verify = sampled_users_df.height
+        valid_users_df = valid_users_lf.select("did").collect(engine="streaming")
+
+        n_users_after_join_verify = valid_users_df.height
         n_users_removed_by_join_verify = n_users_before_min_likes - n_users_after_join_verify
 
         if n_users_removed_by_join_verify > 0:
@@ -1423,7 +1762,7 @@ def _filter_likes_after_post_join(
                 f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
             )
             # Filter likes to only users who still meet threshold
-            valid_user_dids = set(sampled_users_df['did'].to_list())
+            valid_user_dids = set(valid_users_df['did'].to_list())
             likes_core_df = likes_core_df.filter(
                 pl.col('did').is_in(valid_user_dids)
             )
@@ -1441,12 +1780,100 @@ def _filter_likes_after_post_join(
     return likes_core_df, stats
 
 
+def _build_author_idx_mapping(
+    posts_core_df: pl.DataFrame,
+    likes_core_df: pl.DataFrame,
+    min_author_support: int,
+    logger: logging.Logger,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    """Build author embedding table indices from train-window post exposures."""
+    author_support_schema = {
+        "author_did": pl.String,
+        "_author_support": pl.UInt32,
+    }
+    negative_support_df = (
+        posts_core_df
+        .filter(pl.col("in_random_sample") & (pl.col("split_window") == "train"))
+        .select(
+            pl.col("did").alias("author_did"),
+            pl.lit(1, dtype=pl.UInt32).alias("_author_support"),
+        )
+    )
+    like_support_df = (
+        likes_core_df
+        .filter(pl.col("split") == "train")
+        .select(
+            pl.col("author_did"),
+            pl.lit(1, dtype=pl.UInt32).alias("_author_support"),
+        )
+    )
+    support_df = (
+        pl.concat([negative_support_df, like_support_df], how="vertical")
+        if negative_support_df.height > 0 or like_support_df.height > 0
+        else pl.DataFrame(schema=author_support_schema)
+    )
+    if support_df.height == 0:
+        author_idx_df = pl.DataFrame({
+            "author_did": pl.Series([], dtype=pl.String),
+            "author_train_count": pl.Series([], dtype=pl.UInt32),
+            "author_idx": pl.Series([], dtype=pl.UInt32),
+        })
+    else:
+        author_idx_df = (
+            support_df
+            .filter(pl.col("author_did").is_not_null())
+            .group_by("author_did")
+            .agg(pl.col("_author_support").sum().alias("author_train_count"))
+            .filter(pl.col("author_train_count") >= min_author_support)
+            .sort("author_did")
+            .with_row_index(name="author_idx", offset=2)
+            .with_columns(pl.col("author_idx").cast(pl.UInt32))
+            .select(["author_did", "author_train_count", "author_idx"])
+        )
+
+    stats = {
+        "n_author_random_train_exposures": negative_support_df.height,
+        "n_author_like_train_exposures": like_support_df.height,
+        "n_author_train_exposures": support_df.height,
+        "n_authors_with_train_support": (
+            support_df.select(pl.col("author_did").n_unique()).item()
+            if support_df.height > 0 else 0
+        ),
+        "n_authors_indexed": author_idx_df.height,
+    }
+    logger.info(
+        f"Built author_idx mapping: {author_idx_df.height:,} authors meet "
+        f"min_author_support={min_author_support} from {support_df.height:,} train exposures"
+    )
+    return author_idx_df, stats
+
+
+def _join_author_idx_to_core_tables(
+    posts_core_df: pl.DataFrame,
+    likes_core_df: pl.DataFrame,
+    author_idx_df: pl.DataFrame,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    author_idx_lookup = author_idx_df.select(["author_did", "author_idx"])
+    posts_core_df = posts_core_df.join(
+        author_idx_lookup,
+        left_on="did",
+        right_on="author_did",
+        how="left",
+    )
+    likes_core_df = likes_core_df.join(
+        author_idx_lookup,
+        on="author_did",
+        how="left",
+    )
+    return posts_core_df, likes_core_df
+
+
 def _log_data_attrition_report(
     all_stats: Dict[str, Any],
     memory_estimate: Optional[Dict[str, Any]],
     min_likes_per_user: int,
     max_likes_per_user: int,
-    max_liking_users: int,
+    max_trainval_users: int,
     logger,
 ) -> None:
     """
@@ -1497,6 +1924,8 @@ def _log_data_attrition_report(
     n_liked_only = posts_stats.get('n_liked_only', 0)
     n_liked_in_random = posts_stats.get('n_liked_in_random_sample', 0)
     n_random_sample = posts_stats.get('n_random_sample', 0)
+    n_random_sample_buckets = posts_stats.get('n_random_sample_buckets', 0)
+    negative_samples_per_hour = posts_stats.get('negative_samples_per_hour', 0)
     n_posts_core = posts_stats.get('n_posts_core', 0)
     n_posts_dropped_no_emb = posts_stats.get('n_posts_dropped_no_embedding', 0)
     match_rate = posts_stats.get('liked_post_match_rate', 0)
@@ -1544,9 +1973,9 @@ def _log_data_attrition_report(
         logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes_per_user) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
     
     # 3. User sampling
-    if max_liking_users > 0 and n_users_eligible > 0:
+    if max_trainval_users > 0 and n_users_eligible > 0:
         sample_pct = pct(n_users_sampled, n_users_eligible)
-        logger.info(f"{'3. User sampling (' + fmt(max_liking_users) + ')':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'3. User sampling (' + fmt(max_trainval_users) + ' train/val cap)':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
         logger.info(f"{'   - Retained':<45} {f'{sample_pct:.1f}%':>12} {'':>15} {'':>10}")
     else:
         logger.info(f"{'3. User sampling (no cap)':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
@@ -1582,7 +2011,9 @@ def _log_data_attrition_report(
     logger.info(f"{'1. Time-filtered scan':<45} {fmt(n_posts_total):>15} {'':>10}")
     logger.info(f"{'2. Liked posts extracted':<45} {fmt(n_liked_posts):>15} {f'{mem_after_posts:.2f}':>10}")
     logger.info(f"{'   - Match rate vs liked URIs':<45} {f'{match_rate:.1f}%':>15} {'':>10}")
-    logger.info(f"{'3. Random sample (reservoir)':<45} {fmt(n_random_sample):>15} {'':>10}")
+    logger.info(f"{'3. Random sample (hourly)':<45} {fmt(n_random_sample):>15} {'':>10}")
+    if n_random_sample_buckets > 0:
+        logger.info(f"{'   - Buckets / target per hour':<45} {fmt(n_random_sample_buckets) + ' / ' + fmt(negative_samples_per_hour):>15} {'':>10}")
     if n_liked_in_random > 0:
         logger.info(f"{'   - Overlap with liked posts':<45} {fmt(n_liked_in_random):>15} {'':>10}")
     
@@ -1897,6 +2328,14 @@ def _attrition_stats_to_experiment_tracker(
         context.tracker.log_single_value(
             name="Posts - 3 Random Sample",
             value=posts_stats.get('n_random_sample', 0)
+        )
+        context.tracker.log_single_value(
+            name="Posts - 3 Random Sample Buckets",
+            value=posts_stats.get('n_random_sample_buckets', 0)
+        )
+        context.tracker.log_single_value(
+            name="Posts - Negative Samples Per Hour",
+            value=posts_stats.get('negative_samples_per_hour', 0)
         )
         context.tracker.log_single_value(
             name="Posts - Match Rate %",

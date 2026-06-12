@@ -55,6 +55,47 @@ def test_merge_args_with_config_rejects_unknown_keys(tmp_path, argv):
         cli._merge_args_with_config(args)
 
 
+def test_negative_samples_per_hour_replaces_old_negative_posts_sample(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--negative-samples-per-hour", "123"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.negative_samples_per_hour == 123
+    assert cli.DEFAULTS["negative_samples_per_hour"] == 1000
+    assert "negative_posts_sample" not in cli.DEFAULTS
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--negative-posts-sample", "123"])
+
+    config_path = Path(tmp_path) / "old.yml"
+    config_path.write_text("negative_posts_sample: 123\n")
+    raw = parser.parse_args(["--config", str(config_path)])
+    with pytest.raises(ValueError):
+        cli._merge_args_with_config(raw)
+
+
+def test_user_sampling_args_replace_old_names(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.max_trainval_users == 123
+    assert merged.max_unseen_eval_users == 45
+    assert "max_liking_users" not in cli.DEFAULTS
+    assert "holdout_user_fraction" not in cli.DEFAULTS
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--max-liking-users", "123"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--holdout-user-fraction", "0.2"])
+
+    config_path = Path(tmp_path) / "old_sampling.yml"
+    config_path.write_text("max_liking_users: 123\nholdout_user_fraction: 0.2\n")
+    raw = parser.parse_args(["--config", str(config_path)])
+    with pytest.raises(ValueError):
+        cli._merge_args_with_config(raw)
+
+
 def test_background_effective_config_preserves_no_post_encoder(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--no-post-encoder"])
@@ -87,6 +128,52 @@ def test_mlp_allows_cross_attention_user_encoder():
     merged = cli._merge_args_with_config(raw)
 
     assert merged.user_encoder in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE[merged.model_type]
+
+
+def test_two_tower_rejects_summarized_user_encoder_before_running_stages(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "two-tower", "--user-encoder", "summarized"])
+    merged = cli._merge_args_with_config(raw)
+    merged.output_dir = str(tmp_path)
+    ctx = cli.Context(
+        run_dir=Path(tmp_path) / "runs" / "run",
+        artifacts_dir=Path(tmp_path) / "artifacts",
+        runs_dir=Path(tmp_path) / "runs",
+        pipeline_run_id="run",
+    )
+
+    with pytest.raises(ValueError, match="user-encoder 'summarized'"):
+        cli.cmd__run_all_exec(merged, ctx)
+
+
+def test_mlp_allows_author_embedding_table():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "mlp",
+        "--user-encoder", "summarized",
+        "--use-author-embedding-table",
+        "--author-embedding-dim", "8",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.use_author_embedding_table is True
+    assert merged.model_type == "mlp"
+
+
+def test_min_author_support_must_be_positive_even_without_author_table(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "get_data"])
+    merged = cli._merge_args_with_config(raw)
+    merged.output_dir = str(tmp_path)
+    ctx = cli.Context(
+        run_dir=Path(tmp_path) / "runs" / "run",
+        artifacts_dir=Path(tmp_path) / "artifacts",
+        runs_dir=Path(tmp_path) / "runs",
+        pipeline_run_id="run",
+    )
+
+    with pytest.raises(ValueError, match="min-author-support"):
+        cli.cmd__run_all_exec(merged, ctx)
 
 
 def test_background_effective_config_preserves_no_l2_normalize_embeddings(tmp_path):
@@ -166,7 +253,7 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
         textwrap.dedent(
             """
             prior_01_get_data: 20260101_000000_deadbeef
-            prior_02_target_posts: 20260102_000000_cafebabe
+            prior_02_user_history: 20260102_000000_cafebabe
             """
         ).strip()
         + "\n"
@@ -177,4 +264,4 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     merged = cli._merge_args_with_config(raw)
 
     assert merged.prior_01_get_data == "20260101_000000_deadbeef"
-    assert merged.prior_02_target_posts == "20260102_000000_cafebabe"
+    assert merged.prior_02_user_history == "20260102_000000_cafebabe"

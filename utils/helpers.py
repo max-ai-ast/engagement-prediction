@@ -5,7 +5,7 @@ Consolidated Helpers for Engagement Prediction Pipeline
 
 This module centralizes the shared helper functions used across pipeline stages.
 Only truly cross-stage utilities live here. Stage-specific helpers should live
-inside their respective stage scripts (e.g., utils/04_train/stage_train_mlp.py).
+inside their respective stage scripts (e.g., utils/03_train/stage_train_mlp.py).
 """
 
 from __future__ import annotations
@@ -100,6 +100,20 @@ def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
     if not candidates:
         raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
     return pl.scan_parquet(candidates[0])
+
+
+def find_author_idx_artifact_path(context: Context) -> Optional[Path]:
+    get_data_dir = context.get_active_stage_inputs().get("01_get_data")
+    if get_data_dir is None:
+        get_data_dir = context.get_artifact_dir("get_data")
+    if get_data_dir is None:
+        return None
+    candidates = sorted(
+        Path(get_data_dir).glob("author_idx_*.parquet"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
 
 
 # ----------------------------------------
@@ -213,8 +227,9 @@ def validate_dataframe_schema(
     """Validate a DataFrame against an expected schema of column names and dtypes.
 
     Supports pandas DataFrame and polars DataFrame/LazyFrame. expected_schema maps
-    column name -> dtype spec, where dtype spec can be a Python type (e.g., int,
-    float, str), a pandas/numpy dtype, a dtype string, or an iterable of specs.
+    column name -> dtype spec, where dtype spec can be None for a presence-only
+    check, a Python type (e.g., int, float, str), a pandas/numpy dtype, a dtype
+    string, or an iterable of specs.
     """
     import numpy as np
     import pandas as pd
@@ -230,6 +245,8 @@ def validate_dataframe_schema(
         polars_string = {pl.String, pl.Utf8}
 
         def _matches_expected_dtype_polars(dtype: pl.DataType, expected: Any) -> bool:
+            if expected is None:
+                return True
             if isinstance(expected, (list, tuple, set)):
                 return any(_matches_expected_dtype_polars(dtype, e) for e in expected)
 
@@ -320,6 +337,8 @@ def validate_dataframe_schema(
         raise TypeError(f"df must be a pandas DataFrame or polars DataFrame/LazyFrame, got {type(df)!r}")
 
     def _matches_expected_dtype_pandas(series: pd.Series, expected: Any) -> bool:
+        if expected is None:
+            return True
         if isinstance(expected, (list, tuple, set)):
             return any(_matches_expected_dtype_pandas(series, e) for e in expected)
 
@@ -434,9 +453,11 @@ def _configure_matplotlib_backend():
 def plot_training_history(history: Dict[str, List[float]], save_path: Optional[Path] = None, best_epoch: Optional[int] = None):
     _configure_matplotlib_backend()
     import matplotlib.pyplot as plt  # type: ignore
-    required_keys = ['train_loss', 'val_loss', 'train_auc', 'val_auc']
-    if any(k not in history for k in required_keys) or len(history.get('train_loss', [])) == 0:
+    if any(k not in history for k in ['train_loss', 'val_loss']) or len(history.get('train_loss', [])) == 0:
         return
+    train_metric_key = next((k for k in history if k.startswith('train_') and k != 'train_loss'), None)
+    metric_key = train_metric_key.replace('train_', '', 1) if train_metric_key is not None else None
+    val_metric_key = f'val_{metric_key}' if metric_key is not None else None
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=FIGURE_SIZE)
     epochs = range(1, len(history['train_loss']) + 1)
     ax1.plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
@@ -446,11 +467,12 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
     ax1.set_ylabel('Loss')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    ax2.plot(epochs, history['train_auc'], 'b-', label='Train AUC', linewidth=2)
-    ax2.plot(epochs, history['val_auc'], 'r-', label='Val AUC', linewidth=2)
-    ax2.set_title('Training and Validation AUC')
+    if train_metric_key is not None and val_metric_key in history:
+        ax2.plot(epochs, history[train_metric_key], 'b-', label=f'Train {metric_key}', linewidth=2)
+        ax2.plot(epochs, history[val_metric_key], 'r-', label=f'Val {metric_key}', linewidth=2)
+    ax2.set_title('Training and Validation Metric')
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('AUC')
+    ax2.set_ylabel(metric_key or 'Metric')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     if best_epoch is not None:

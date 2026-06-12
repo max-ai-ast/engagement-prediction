@@ -4,6 +4,7 @@ import struct
 import sys
 import zlib
 import base64
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +53,17 @@ def _write_posts_parquet(tmp_path, rows):
     path = tmp_path / "posts.parquet"
     df.write_parquet(path)
     return path
+
+
+def _split_kwargs(**overrides):
+    kwargs = dict(
+        train_start="2024-01-01T00:00:00",
+        val_start="2024-01-03T00:00:00",
+        holdout_start=None,
+        holdout_end=None,
+    )
+    kwargs.update(overrides)
+    return kwargs
 
 
 def _make_posts_rows(embedding_model):
@@ -108,17 +120,31 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
         start_str="2024-01-02T00:00:00",
         end_str="2024-01-04T00:00:00",
         paths=[str(likes_path)],
-        max_liking_users=None,
+        max_trainval_users=None,
+        max_unseen_eval_users=0,
         max_likes_per_user=0,
         min_likes_per_user=2,
         random_seed=123,
+        **_split_kwargs(),
         logger=logger,
     )
 
     assert likes_df.height == 2
     assert likes_df["did"].unique().to_list() == ["user_a"]
     assert likes_df.schema["record_created_at"] == pl.Datetime
+    assert likes_df.schema["like_hour_bucket"] == pl.Datetime
+    splits_by_uri = {
+        row["subject_uri"]: row["split"]
+        for row in likes_df.select(["subject_uri", "split"]).iter_rows(named=True)
+    }
+    assert splits_by_uri == {"post:1": "train", "post:2": "val"}
     assert likes_df['did'].n_unique() == 1
+    buckets_by_uri = {
+        row["subject_uri"]: row["like_hour_bucket"]
+        for row in likes_df.select(["subject_uri", "like_hour_bucket"]).iter_rows(named=True)
+    }
+    assert buckets_by_uri["post:1"].isoformat() == "2024-01-02T00:00:00+00:00"
+    assert buckets_by_uri["post:2"].isoformat() == "2024-01-03T00:00:00+00:00"
 
 
 def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
@@ -135,10 +161,12 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
         start_str="2024-01-01T00:00:00",
         end_str="2024-01-03T00:00:00",
         paths=[str(likes_path)],
-        max_liking_users=None,
+        max_trainval_users=None,
+        max_unseen_eval_users=0,
         max_likes_per_user=2,
         min_likes_per_user=0,
         random_seed=42,
+        **_split_kwargs(),
         logger=logger,
     )
 
@@ -146,30 +174,117 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
     assert likes_df.filter(pl.col("did") == "user_b").height == 1
 
 
-def test_get_sampled_users_deterministic(stage_get_data_module):
+def test_get_sampled_user_cohorts_deterministic_and_disjoint(stage_get_data_module):
     likes_rows = [
         {"did": f"user_{i}", "subject_uri": f"post:{i}", "record_created_at": "2024-01-02T00:00:00"}
         for i in range(10)
     ]
     likes_lf = pl.DataFrame(likes_rows).lazy()
 
-    first, *_ = stage_get_data_module._get_sampled_users_with_min_likes(
+    first, *_ = stage_get_data_module._get_sampled_user_cohorts_with_min_likes(
         likes_lf=likes_lf,
         min_likes_per_user=1,
-        max_liking_users=5,
+        max_trainval_users=5,
+        max_unseen_eval_users=3,
         random_seed=7,
     )
-    second, *_ = stage_get_data_module._get_sampled_users_with_min_likes(
+    second, *_ = stage_get_data_module._get_sampled_user_cohorts_with_min_likes(
         likes_lf=likes_lf,
         min_likes_per_user=1,
-        max_liking_users=5,
+        max_trainval_users=5,
+        max_unseen_eval_users=3,
         random_seed=7,
     )
 
-    first_set = set(first["did"].to_list())
-    second_set = set(second["did"].to_list())
-    assert first_set == second_set
-    assert len(first_set) <= 5
+    assert set(first["did"].to_list()) == set(second["did"].to_list())
+    trainval = set(first.filter(pl.col("_user_cohort") == "trainval")["did"].to_list())
+    unseen = set(first.filter(pl.col("_user_cohort") == "unseen_eval")["did"].to_list())
+    assert len(trainval) == 5
+    assert len(unseen) == 3
+    assert trainval.isdisjoint(unseen)
+
+
+def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path, stage_get_data_module):
+    likes_rows = []
+    for user_idx in range(8):
+        for ts in [
+            "2024-01-02T00:00:00",
+            "2024-01-04T00:00:00",
+            "2024-01-06T00:00:00",
+        ]:
+            likes_rows.append({
+                "did": f"user_{user_idx}",
+                "subject_uri": f"post:{user_idx}:{ts}",
+                "record_created_at": ts,
+            })
+    likes_path = _write_likes_parquet(tmp_path, likes_rows)
+    logger = logging.getLogger("test_stage_get_data.unseen_splits")
+
+    likes_df, stats = stage_get_data_module._load_likes_core_polars(
+        start_str="2024-01-01T00:00:00",
+        end_str="2024-01-07T00:00:00",
+        paths=[str(likes_path)],
+        max_trainval_users=3,
+        max_unseen_eval_users=2,
+        max_likes_per_user=0,
+        min_likes_per_user=1,
+        random_seed=99,
+        **_split_kwargs(
+            val_start="2024-01-03T00:00:00",
+            holdout_start="2024-01-05T00:00:00",
+        ),
+        logger=logger,
+    )
+
+    assert stats["n_trainval_users_sampled"] == 3
+    assert stats["n_unseen_eval_users_sampled"] == 2
+    assert set(likes_df["split"].unique().to_list()) == {
+        "train",
+        "val",
+        "holdout_seen_users",
+        "val_unseen_users",
+        "holdout_unseen_users",
+    }
+    unseen_users = set(
+        likes_df
+        .filter(pl.col("split").is_in(["val_unseen_users", "holdout_unseen_users"]))
+        ["did"]
+        .unique()
+        .to_list()
+    )
+    unseen_train_rows = likes_df.filter(
+        pl.col("did").is_in(unseen_users)
+        & (pl.col("split") == "train")
+    )
+    assert unseen_train_rows.height == 0
+
+
+def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
+    likes_rows = [
+        {"did": "user_a", "subject_uri": "post:1", "record_created_at": "2024-01-02T00:00:00"},
+        {"did": "user_a", "subject_uri": "post:2", "record_created_at": "2024-01-04T00:00:00"},
+        {"did": "user_a", "subject_uri": "post:3", "record_created_at": "2024-01-06T00:00:00"},
+    ]
+    likes_path = _write_likes_parquet(tmp_path, likes_rows)
+    logger = logging.getLogger("test_stage_get_data.holdout_end")
+
+    likes_df, _ = stage_get_data_module._load_likes_core_polars(
+        start_str="2024-01-01T00:00:00",
+        end_str="2024-01-07T00:00:00",
+        paths=[str(likes_path)],
+        max_trainval_users=None,
+        max_unseen_eval_users=0,
+        max_likes_per_user=0,
+        min_likes_per_user=1,
+        random_seed=99,
+        **_split_kwargs(
+            holdout_start="2024-01-05T00:00:00",
+            holdout_end="2024-01-05T00:00:00",
+        ),
+        logger=logger,
+    )
+
+    assert set(likes_df["subject_uri"].to_list()) == {"post:1", "post:2"}
 
 
 def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_module):
@@ -191,9 +306,10 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
         end_str="2024-01-03T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        negative_posts_sample=len(posts_rows),
+        negative_samples_per_hour=len(posts_rows),
         embedding_model=embedding_model,
         random_seed=11,
+        **_split_kwargs(),
         logger=logger,
     )
 
@@ -213,9 +329,16 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
     assert "at_uri" in posts_df.columns
     assert "is_liked" in posts_df.columns
     assert "in_random_sample" in posts_df.columns
+    assert "negative_hour_bucket" in posts_df.columns
+    assert "split_window" in posts_df.columns
+    assert posts_df.schema["negative_hour_bucket"] == pl.Datetime
+    assert posts_df["split_window"].unique().to_list() == ["train"]
+    assert posts_df.filter(pl.col("at_uri") == "post:1")["is_liked"].all()
+    assert posts_df.filter(pl.col("at_uri") == "post:1")["in_random_sample"].all()
+    assert posts_df.filter(pl.col("at_uri") == "post:1")["negative_hour_bucket"].null_count() == 0
 
 
-def test_load_posts_liked_always_included(tmp_path, stage_get_data_module):
+def test_load_posts_liked_always_included_with_null_negative_bucket(tmp_path, stage_get_data_module):
     """Test that liked posts are always included even with zero random sample."""
     embedding_model = "test-model"
     posts_rows = _make_posts_rows(embedding_model)
@@ -228,9 +351,10 @@ def test_load_posts_liked_always_included(tmp_path, stage_get_data_module):
         end_str="2024-01-03T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        negative_posts_sample=0,
+        negative_samples_per_hour=0,
         embedding_model=embedding_model,
         random_seed=21,
+        **_split_kwargs(),
         logger=logger,
     )
 
@@ -238,10 +362,194 @@ def test_load_posts_liked_always_included(tmp_path, stage_get_data_module):
     assert set(["post:2", "post:5"]).issubset(returned_uris)
     assert posts_df.filter(pl.col("at_uri") == "post:2")["is_liked"].all()
     assert posts_df.filter(pl.col("at_uri") == "post:5")["is_liked"].all()
+    assert posts_df["in_random_sample"].sum() == 0
+    assert posts_df["negative_hour_bucket"].null_count() == posts_df.height
     assert stats["n_liked_posts"] == 2
     
     # emb_idx should NOT be present (added later by memmap write)
     assert "emb_idx" not in posts_df.columns
+
+
+def test_load_posts_samples_approximately_per_hour(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = []
+    for hour in [0, 1]:
+        for idx in range(50):
+            posts_rows.append({
+                "at_uri": f"post:{hour}:{idx}",
+                "did": f"user_{hour}_{idx}",
+                "record_created_at": f"2024-01-02T{hour:02d}:15:00",
+                "record_text": f"text {hour} {idx}",
+                "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}],
+            })
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    liked_post_uris_df = pl.DataFrame({"subject_uri": ["missing:post"]})
+    logger = logging.getLogger("test_stage_get_data.posts_per_hour")
+
+    posts_df, stats, _ = stage_get_data_module._load_posts_core_polars(
+        start_str="2024-01-02T00:00:00",
+        end_str="2024-01-02T02:00:00",
+        liked_post_uris_df=liked_post_uris_df,
+        paths=[str(posts_path)],
+        negative_samples_per_hour=10,
+        embedding_model=embedding_model,
+        random_seed=33,
+        **_split_kwargs(),
+        logger=logger,
+    )
+
+    random_counts = (
+        posts_df
+        .filter(pl.col("in_random_sample"))
+        .group_by("negative_hour_bucket")
+        .len()
+    )
+    assert 10 <= posts_df.height <= 30
+    assert stats["n_random_sample"] == posts_df.height
+    assert stats["n_random_sample_buckets"] == 2
+    assert random_counts["len"].min() > 0
+    assert random_counts["len"].max() <= 20
+
+
+def test_load_posts_adds_split_window_and_filters_holdout_end(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = [
+        {"at_uri": "post:pretrain", "did": "author_a", "record_created_at": "2024-01-01T00:00:00", "record_text": "pre", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:train", "did": "author_a", "record_created_at": "2024-01-02T00:00:00", "record_text": "train", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:val", "did": "author_b", "record_created_at": "2024-01-04T00:00:00", "record_text": "val", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:holdout", "did": "author_c", "record_created_at": "2024-01-05T00:00:00", "record_text": "holdout", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:after", "did": "author_d", "record_created_at": "2024-01-06T00:00:00", "record_text": "after", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+    ]
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    liked_post_uris_df = pl.DataFrame({"subject_uri": []}, schema={"subject_uri": pl.String})
+    logger = logging.getLogger("test_stage_get_data.posts_split_window")
+
+    posts_df, _, _ = stage_get_data_module._load_posts_core_polars(
+        start_str="2024-01-01T00:00:00",
+        end_str="2024-01-07T00:00:00",
+        liked_post_uris_df=liked_post_uris_df,
+        paths=[str(posts_path)],
+        negative_samples_per_hour=len(posts_rows),
+        embedding_model=embedding_model,
+        random_seed=33,
+        **_split_kwargs(
+            train_start="2024-01-02T00:00:00",
+            val_start="2024-01-03T00:00:00",
+            holdout_start="2024-01-05T00:00:00",
+            holdout_end="2024-01-06T00:00:00",
+        ),
+        logger=logger,
+    )
+
+    split_by_uri = {
+        row["at_uri"]: row["split_window"]
+        for row in posts_df.select(["at_uri", "split_window"]).iter_rows(named=True)
+    }
+    assert split_by_uri == {
+        "post:train": "train",
+        "post:val": "val",
+        "post:holdout": "holdout",
+    }
+
+
+def test_load_posts_rejects_non_string_record_created_at(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_path = _write_posts_parquet(tmp_path, [{
+        "at_uri": "post:1",
+        "did": "user_a",
+        "record_created_at": datetime(2024, 1, 2, 0, 15, 0),
+        "record_text": "one",
+        "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}],
+    }])
+    liked_post_uris_df = pl.DataFrame({"subject_uri": []}, schema={"subject_uri": pl.String})
+    logger = logging.getLogger("test_stage_get_data.posts_bad_ts")
+
+    with pytest.raises(ValueError, match="record_created_at"):
+        stage_get_data_module._load_posts_core_polars(
+            start_str=None,
+            end_str=None,
+            liked_post_uris_df=liked_post_uris_df,
+            paths=[str(posts_path)],
+            negative_samples_per_hour=1,
+            embedding_model=embedding_model,
+            random_seed=33,
+            **_split_kwargs(),
+            logger=logger,
+        )
+
+
+def test_build_author_idx_counts_train_exposures_and_joins_to_core_tables(stage_get_data_module):
+    posts_core_df = pl.DataFrame({
+        "at_uri": ["post:1", "post:2", "post:3", "post:4", "post:5", "post:6"],
+        "did": ["author_a", "author_a", "author_b", "author_b", "author_c", "author_d"],
+        "in_random_sample": [True, True, False, True, True, True],
+        "split_window": ["train", "train", "train", "val", "train", "holdout"],
+    })
+    likes_core_df = pl.DataFrame({
+        "did": ["user_1", "user_2", "user_3", "user_4", "user_5", "user_6"],
+        "subject_uri": ["post:1", "post:1", "post:2", "post:3", "post:4", "post:5"],
+        "split": ["train", "train", "train", "train", "val", "holdout_seen_users"],
+        "author_did": ["author_a", "author_a", "author_a", "author_b", "author_b", "author_c"],
+    })
+    logger = logging.getLogger("test_stage_get_data.author_idx")
+
+    author_idx_df, stats = stage_get_data_module._build_author_idx_mapping(
+        posts_core_df=posts_core_df,
+        likes_core_df=likes_core_df,
+        min_author_support=2,
+        logger=logger,
+    )
+
+    assert author_idx_df.to_dicts() == [{
+        "author_did": "author_a",
+        "author_train_count": 5,
+        "author_idx": 2,
+    }]
+    assert stats["n_author_random_train_exposures"] == 3
+    assert stats["n_author_like_train_exposures"] == 4
+
+    posts_with_author_idx, likes_with_author_idx = stage_get_data_module._join_author_idx_to_core_tables(
+        posts_core_df=posts_core_df,
+        likes_core_df=likes_core_df,
+        author_idx_df=author_idx_df,
+    )
+    post_idx_by_uri = {
+        row["at_uri"]: row["author_idx"]
+        for row in posts_with_author_idx.select(["at_uri", "author_idx"]).iter_rows(named=True)
+    }
+    assert post_idx_by_uri["post:1"] == 2
+    assert post_idx_by_uri["post:2"] == 2
+    assert post_idx_by_uri["post:3"] is None
+    assert likes_with_author_idx.filter(pl.col("author_did") == "author_a")["author_idx"].to_list() == [2, 2, 2]
+    assert likes_with_author_idx.filter(pl.col("author_did") == "author_b")["author_idx"].null_count() == 2
+
+
+def test_build_author_idx_assignment_is_deterministic_and_starts_at_two(stage_get_data_module):
+    posts_core_df = pl.DataFrame({
+        "at_uri": ["post:b", "post:a", "post:c"],
+        "did": ["author_b", "author_a", "author_c"],
+        "in_random_sample": [True, True, True],
+        "split_window": ["train", "train", "train"],
+    })
+    likes_core_df = pl.DataFrame({
+        "subject_uri": pl.Series([], dtype=pl.String),
+        "split": pl.Series([], dtype=pl.String),
+        "author_did": pl.Series([], dtype=pl.String),
+    })
+    logger = logging.getLogger("test_stage_get_data.author_idx_deterministic")
+
+    author_idx_df, _ = stage_get_data_module._build_author_idx_mapping(
+        posts_core_df=posts_core_df,
+        likes_core_df=likes_core_df,
+        min_author_support=1,
+        logger=logger,
+    )
+
+    assert author_idx_df.select(["author_did", "author_idx"]).to_dicts() == [
+        {"author_did": "author_a", "author_idx": 2},
+        {"author_did": "author_b", "author_idx": 3},
+        {"author_did": "author_c", "author_idx": 4},
+    ]
 
 
 def test_write_embeddings_memmap(tmp_path, stage_get_data_module):
