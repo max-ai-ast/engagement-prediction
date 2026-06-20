@@ -82,7 +82,7 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
     assert get_stage_folder_to_keys() == {
         "01_get_data": ("get_data",),
         "02_user_history": ("user_history",),
-        "03_train": ("train_mlp", "train_two_tower", "train_bst_ranker"),
+        "03_train": ("train_mlp", "train_two_tower", "train_bst_ranker", "train_din_ranker"),
         "04_evaluate": ("evaluate",),
     }
 

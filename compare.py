@@ -30,7 +30,7 @@ DEFAULT_COMPARE_DATALOADER_PERSISTENT_WORKERS = True
 DEFAULT_COMPARE_DATALOADER_PREFETCH_FACTOR = 2
 DEFAULT_COMPARE_DISABLE_PROGRESS = False
 DEFAULT_COMPARE_BST_CANDIDATE_CHUNK_SIZE = 1024
-VALID_COMPARE_MODEL_TYPES = {"two-tower", "bst-ranker"}
+VALID_COMPARE_MODEL_TYPES = {"two-tower", "bst-ranker", "din-ranker"}
 
 
 def _parse_compare_model_spec(raw: str) -> Dict[str, str]:
@@ -83,10 +83,14 @@ def _validate_compare_author_config(model_spec: Dict[str, str], config: Dict[str
 
 
 def _validate_compare_bst_config(model_spec: Dict[str, str], config: Dict[str, Any]) -> None:
-    if model_spec["model_type"] != "bst-ranker":
+    if model_spec["model_type"] not in ("bst-ranker", "din-ranker"):
         return
     _require_compare_model_config(model_spec, config, "content_projection_dim")
     _require_compare_model_config(model_spec, config, "author_projection_dim")
+    if model_spec["model_type"] == "din-ranker":
+        _require_compare_model_config(model_spec, config, "model_dim")
+        _require_compare_model_config(model_spec, config, "attention_hidden_dims")
+        _require_compare_model_config(model_spec, config, "prediction_hidden_dims")
 
 
 def _resolve_compare_max_history_len(
@@ -162,7 +166,7 @@ def _make_compare_adapter(
     bst_candidate_chunk_size: int,
     config_overrides: Optional[Dict[str, Any]],
 ):
-    from utils.ranking_adapters import BstPthAdapter, TwoTowerPthAdapter
+    from utils.ranking_adapters import BstPthAdapter, DinPthAdapter, TwoTowerPthAdapter
 
     if model_spec["model_type"] == "two-tower":
         if config_overrides is None:
@@ -175,6 +179,17 @@ def _make_compare_adapter(
                 candidate_chunk_size=bst_candidate_chunk_size,
             )
         return BstPthAdapter(
+            model_spec["checkpoint_path"],
+            candidate_chunk_size=bst_candidate_chunk_size,
+            config_overrides=config_overrides,
+        )
+    if model_spec["model_type"] == "din-ranker":
+        if config_overrides is None:
+            return DinPthAdapter(
+                model_spec["checkpoint_path"],
+                candidate_chunk_size=bst_candidate_chunk_size,
+            )
+        return DinPthAdapter(
             model_spec["checkpoint_path"],
             candidate_chunk_size=bst_candidate_chunk_size,
             config_overrides=config_overrides,

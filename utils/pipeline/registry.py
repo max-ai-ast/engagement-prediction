@@ -19,6 +19,7 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'train_mlp':       ("utils/03_train/stage_train_mlp.py",                    "03_train"),
     'train_two_tower': ("utils/03_train/stage_train_two_tower.py",              "03_train"),
     'train_bst_ranker': ("utils/03_train/stage_train_bst_ranker.py",            "03_train"),
+    'train_din_ranker': ("utils/03_train/stage_train_din_ranker.py",            "03_train"),
     'evaluate':        ("utils/04_evaluate/stage_evaluate.py",                  "04_evaluate"),
 }
 

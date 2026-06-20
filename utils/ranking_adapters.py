@@ -100,7 +100,7 @@ class TwoTowerPthAdapter:
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
             self.config = config
-        
+
         if self.model is None:
             raise ValueError("Problem loading Two Tower model!")
         self.model = self.model.to(device)
@@ -181,7 +181,7 @@ class BstPthAdapter:
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
             self.config = config
-        
+
         if self.model is None:
             raise ValueError("Problem loading BST model!")
         self.model = self.model.to(device)
@@ -222,6 +222,96 @@ class BstPthAdapter:
                 history_embeddings=history_embeddings,
                 history_mask=history_mask,
                 history_time_deltas_hours=history_time_deltas_hours,
+                candidate_post_embeddings=candidate_embeddings_chunk,
+                history_author_indices=history_author_indices,
+                candidate_post_author_idx=candidate_author_chunk,
+            )
+            score_chunks.append(logits)
+
+        return MatrixBatchScores(scores=torch.cat(score_chunks, dim=1))
+
+
+class DinPthAdapter:
+    """Matrix-ranking scorer for saved DINRanker .pth checkpoints."""
+
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        candidate_chunk_size: int,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ):
+        if candidate_chunk_size <= 0:
+            raise ValueError("candidate_chunk_size must be positive")
+        self.checkpoint_path = Path(checkpoint_path)
+        self.candidate_chunk_size = int(candidate_chunk_size)
+        self.config_overrides = dict(config_overrides or {})
+        self.model: Optional[torch.nn.Module] = None
+        self.config: Optional[Dict[str, Any]] = None
+
+    def prepare_for_eval(self, device: str) -> None:
+        if self.model is None:
+            checkpoint = _load_checkpoint(self.checkpoint_path)
+            config = _load_checkpoint_config(checkpoint, self.checkpoint_path)
+            config = {**config, **self.config_overrides}
+            if config.get("model_type") != "din-ranker":
+                raise ValueError(f"Expected din-ranker checkpoint, got model_type={config.get('model_type')!r}")
+            if not bool(config.get("use_author_embedding_table", False)):
+                raise ValueError("DinPthAdapter requires a DIN checkpoint trained with author embeddings")
+
+            stage_train_din_ranker = importlib.import_module("utils.03_train.stage_train_din_ranker")
+            model = stage_train_din_ranker.DINRanker(
+                post_embedding_dim=int(_require_config(config, "post_embedding_dim")),
+                author_table_num_rows=int(_require_config(config, "author_table_num_rows")),
+                author_embedding_dim=int(_require_config(config, "author_embedding_dim")),
+                content_projection_dim=int(_require_config(config, "content_projection_dim")),
+                author_projection_dim=int(_require_config(config, "author_projection_dim")),
+                model_dim=int(_require_config(config, "model_dim")),
+                attention_hidden_dims=list(_require_config(config, "attention_hidden_dims")),
+                prediction_hidden_dims=list(_require_config(config, "prediction_hidden_dims")),
+                dropout_rate=float(_require_config(config, "dropout_rate")),
+                author_unknown_dropout_rate=float(config.get("author_unknown_dropout_rate") or 0.0),
+            )
+            model.load_state_dict(checkpoint["model_state_dict"])
+            self.model = model
+            self.config = config
+
+        if self.model is None:
+            raise ValueError("Problem loading DIN model!")
+        self.model = self.model.to(device)
+        self.model.eval()
+
+    def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        if self.model is None:
+            self.prepare_for_eval(device)
+        if self.model is None:
+            raise RuntimeError("DinPthAdapter model was not initialized")
+
+        required_fields = (
+            "history_embeddings",
+            "history_mask",
+            "candidate_post_embeddings",
+            "history_author_indices",
+            "candidate_post_author_idx",
+        )
+        missing = [field for field in required_fields if field not in batch]
+        if missing:
+            raise RuntimeError(f"DinPthAdapter batch is missing required fields: {', '.join(missing)}")
+
+        history_embeddings = batch["history_embeddings"].to(device, non_blocking=True)
+        history_mask = batch["history_mask"].to(device, non_blocking=True)
+        candidate_post_embeddings = batch["candidate_post_embeddings"].to(device, non_blocking=True)
+        history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
+        candidate_post_author_idx = batch["candidate_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
+
+        num_candidates = int(candidate_post_embeddings.size(0))
+        score_chunks = []
+        for start in range(0, num_candidates, self.candidate_chunk_size):
+            end = min(start + self.candidate_chunk_size, num_candidates)
+            candidate_embeddings_chunk = candidate_post_embeddings[start:end]
+            candidate_author_chunk = candidate_post_author_idx[start:end]
+            logits = self.model.score_candidate_matrix(
+                history_embeddings=history_embeddings,
+                history_mask=history_mask,
                 candidate_post_embeddings=candidate_embeddings_chunk,
                 history_author_indices=history_author_indices,
                 candidate_post_author_idx=candidate_author_chunk,

@@ -106,9 +106,11 @@ DEFAULTS: Dict[str, Any] = {
     "learning_rate": 0.001,
     "weight_decay_mlp": 0.1,
     "weight_decay_two_tower": 0.01,
+    "content_projection_dim": 128,
+    "author_projection_dim": 32,
+    "prediction_hidden_dims": [64, 32, 16],
+    "candidate_sample_size": 64,
     "bst_model_dim": 128,
-    "bst_content_projection_dim": 128,
-    "bst_author_projection_dim": 32,
     "bst_time_embedding_dim": 16,
     "bst_num_attention_heads": 4,
     "bst_num_transformer_layers": 1,
@@ -116,13 +118,15 @@ DEFAULTS: Dict[str, Any] = {
     "bst_dropout_rate": 0.1,
     "bst_norm_first": False,
     "bst_time_delta_bucket_boundaries_hours": [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0],
-    "bst_prediction_hidden_dims": [64, 32, 16],
     "bst_weight_decay": 0.01,
     "bst_use_auc_as_primary": False,
     "bst_training_mode": "listwise",
-    "bst_candidate_sample_size": 64,
-    "bst_batch_size": 128,
     "bst_max_train_batches_per_epoch": None,
+    "din_model_dim": 128,
+    "din_attention_hidden_dims": [64, 32],
+    "din_dropout_rate": 0.1,
+    "din_weight_decay": 0.01,
+    "din_max_train_batches_per_epoch": None,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -530,6 +534,8 @@ def _get_train_key(model_type: str) -> str:
         return 'train_two_tower'
     elif model_type == 'bst-ranker':
         return 'train_bst_ranker'
+    elif model_type == 'din-ranker':
+        return 'train_din_ranker'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -537,33 +543,33 @@ def _get_train_key(model_type: str) -> str:
 def _validate_bst_config(args: argparse.Namespace) -> None:
     if not bool(args.use_author_embedding_table):
         raise ValueError("--use-author-embedding-table is required when --model-type is 'bst-ranker'.")
-    if args.bst_prediction_hidden_dims is None:
-        raise ValueError("--bst-prediction-hidden-dims is required when --model-type is 'bst-ranker'.")
+    if args.prediction_hidden_dims is None:
+        raise ValueError("--prediction-hidden-dims is required when --model-type is 'bst-ranker'.")
 
-    if isinstance(args.bst_prediction_hidden_dims, (str, bytes)):
-        raise ValueError("--bst-prediction-hidden-dims must be a list of integers.")
+    if isinstance(args.prediction_hidden_dims, (str, bytes)):
+        raise ValueError("--prediction-hidden-dims must be a list of integers.")
     try:
-        prediction_hidden_dims = tuple(int(v) for v in args.bst_prediction_hidden_dims)
+        prediction_hidden_dims = tuple(int(v) for v in args.prediction_hidden_dims)
     except (TypeError, ValueError) as exc:
-        raise ValueError("--bst-prediction-hidden-dims must be a list of integers.") from exc
+        raise ValueError("--prediction-hidden-dims must be a list of integers.") from exc
     if any(dim <= 0 for dim in prediction_hidden_dims):
-        raise ValueError("--bst-prediction-hidden-dims values must be positive integers.")
+        raise ValueError("--prediction-hidden-dims values must be positive integers.")
 
     model_dim = int(args.bst_model_dim)
-    content_projection_dim = int(args.bst_content_projection_dim)
-    author_projection_dim = int(args.bst_author_projection_dim)
+    content_projection_dim = int(args.content_projection_dim)
+    author_projection_dim = int(args.author_projection_dim)
     time_embedding_dim = int(args.bst_time_embedding_dim)
     num_attention_heads = int(args.bst_num_attention_heads)
     num_transformer_layers = int(args.bst_num_transformer_layers)
-    bst_candidate_sample_size = int(args.bst_candidate_sample_size)
-    bst_batch_size = int(args.bst_batch_size)
+    candidate_sample_size = int(args.candidate_sample_size)
+    batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
     if content_projection_dim <= 0:
-        raise ValueError("--bst-content-projection-dim must be positive.")
+        raise ValueError("--content-projection-dim must be positive.")
     if author_projection_dim <= 0:
-        raise ValueError("--bst-author-projection-dim must be positive.")
+        raise ValueError("--author-projection-dim must be positive.")
     if time_embedding_dim <= 0:
         raise ValueError("--bst-time-embedding-dim must be positive.")
     if num_attention_heads <= 0:
@@ -574,12 +580,54 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-training-mode must be listwise or pairwise.")
     if args.bst_training_mode == "listwise" and num_transformer_layers != 1:
         raise ValueError("--bst-training-mode=listwise requires --bst-num-transformer-layers=1.")
-    if bst_candidate_sample_size <= 0:
-        raise ValueError("--bst-candidate-sample-size must be positive.")
-    if bst_batch_size <= 0:
-        raise ValueError("--bst-batch-size must be positive.")
+    if candidate_sample_size <= 0:
+        raise ValueError("--candidate-sample-size must be positive.")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
+
+
+def _validate_din_config(args: argparse.Namespace) -> None:
+    if not bool(args.use_author_embedding_table):
+        raise ValueError("--use-author-embedding-table is required when --model-type is 'din-ranker'.")
+    for attr_name, flag_name in (
+        ("din_attention_hidden_dims", "--din-attention-hidden-dims"),
+        ("prediction_hidden_dims", "--prediction-hidden-dims"),
+    ):
+        hidden_dims = getattr(args, attr_name)
+        if hidden_dims is None:
+            raise ValueError(f"{flag_name} is required when --model-type is 'din-ranker'.")
+        if isinstance(hidden_dims, (str, bytes)):
+            raise ValueError(f"{flag_name} must be a list of integers.")
+        try:
+            parsed_hidden_dims = tuple(int(v) for v in hidden_dims)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{flag_name} must be a list of integers.") from exc
+        if any(dim <= 0 for dim in parsed_hidden_dims):
+            raise ValueError(f"{flag_name} values must be positive integers.")
+
+    model_dim = int(args.din_model_dim)
+    content_projection_dim = int(args.content_projection_dim)
+    author_projection_dim = int(args.author_projection_dim)
+    candidate_sample_size = int(args.candidate_sample_size)
+    batch_size = int(args.batch_size)
+    din_max_train_batches_per_epoch = args.din_max_train_batches_per_epoch
+    dropout_rate = float(args.din_dropout_rate)
+    if model_dim <= 0:
+        raise ValueError("--din-model-dim must be positive.")
+    if content_projection_dim <= 0:
+        raise ValueError("--content-projection-dim must be positive.")
+    if author_projection_dim <= 0:
+        raise ValueError("--author-projection-dim must be positive.")
+    if not 0.0 <= dropout_rate <= 1.0:
+        raise ValueError("--din-dropout-rate must be in [0, 1].")
+    if candidate_sample_size <= 0:
+        raise ValueError("--candidate-sample-size must be positive.")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if din_max_train_batches_per_epoch is not None and int(din_max_train_batches_per_epoch) <= 0:
+        raise ValueError("--din-max-train-batches-per-epoch must be positive when provided.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -678,6 +726,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
     if model_type == "bst-ranker":
         _validate_bst_config(args)
+    if model_type == "din-ranker":
+        _validate_din_config(args)
 
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
@@ -733,6 +783,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'train_mlp': "Stage 3: Train model (MLP)…",
                 'train_two_tower': "Stage 3: Train model (Two-Tower)…",
                 'train_bst_ranker': "Stage 3: Train model (BST Ranker)…",
+                'train_din_ranker': "Stage 3: Train model (DIN Ranker)…",
                 'evaluate': "Stage 4: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
@@ -845,8 +896,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
                           default=argparse.SUPPRESS, help_text="User encoder type (summarized, full_transformer, or cross_attention).")
-    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker"],
-                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, or bst-ranker")
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker", "din-ranker"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, bst-ranker, or din-ranker")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
@@ -881,13 +932,18 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Minimum train-history author occurrence count required for a dedicated embedding row")
     _add_arg_with_default(p_all, "--author-unknown-dropout-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Training-time probability of replacing a supported history author with the UNK row")
+    # Ranker shared options
+    _add_arg_with_default(p_all, "--content-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Ranker content branch projection dimension")
+    _add_arg_with_default(p_all, "--author-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Ranker author branch projection dimension")
+    _add_arg_with_default(p_all, "--prediction-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
+                          help_text="Ranker prediction-head hidden dimensions. Use no values for a direct linear head")
+    _add_arg_with_default(p_all, "--candidate-sample-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Candidate cap for listwise ranker training batches")
     # BST ranker specific options
     _add_arg_with_default(p_all, "--bst-model-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker fused post/author model dimension")
-    _add_arg_with_default(p_all, "--bst-content-projection-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="BST ranker content branch projection dimension")
-    _add_arg_with_default(p_all, "--bst-author-projection-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="BST ranker author branch projection dimension")
     _add_arg_with_default(p_all, "--bst-time-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker time-delta embedding dimension")
     _add_arg_with_default(p_all, "--bst-num-attention-heads", type=int, default=argparse.SUPPRESS,
@@ -903,20 +959,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--bst-time-delta-bucket-boundaries-hours", type=float, nargs="+",
                           default=argparse.SUPPRESS,
                           help_text="BST ranker time-delta bucket boundaries in hours")
-    _add_arg_with_default(p_all, "--bst-prediction-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
-                          help_text="Required BST ranker prediction-head hidden dimensions. Use no values for a direct linear head")
     _add_arg_with_default(p_all, "--bst-weight-decay", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for BST ranker model")
     _add_arg_with_default(p_all, "--bst-use-auc-as-primary", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Use validation unseen AUC-ROC as the BST primary metric instead of validation unseen loss")
     _add_arg_with_default(p_all, "--bst-training-mode", type=str, choices=["listwise", "pairwise"], default=argparse.SUPPRESS,
                           help_text="BST training objective/data shape: listwise matrix ranking or pairwise binary classification")
-    _add_arg_with_default(p_all, "--bst-candidate-sample-size", type=int, default=argparse.SUPPRESS,
-                          help_text="Candidate cap for BST listwise training batches")
-    _add_arg_with_default(p_all, "--bst-batch-size", type=int, default=argparse.SUPPRESS,
-                          help_text="Batch size for BST ranker training")
     _add_arg_with_default(p_all, "--bst-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
                           help_text="Optional cap on BST train batches per epoch for fast experiments")
+    # DIN ranker specific options
+    _add_arg_with_default(p_all, "--din-model-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="DIN ranker fused post/author model dimension")
+    _add_arg_with_default(p_all, "--din-attention-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
+                          help_text="DIN ranker attention-unit hidden dimensions. Use no values for a direct linear attention unit")
+    _add_arg_with_default(p_all, "--din-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="DIN ranker dropout rate")
+    _add_arg_with_default(p_all, "--din-weight-decay", type=float, default=argparse.SUPPRESS,
+                          help_text="Weight decay for DIN ranker model")
+    _add_arg_with_default(p_all, "--din-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional cap on DIN train batches per epoch for fast experiments")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -982,10 +1043,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "train_din_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "train_din_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")

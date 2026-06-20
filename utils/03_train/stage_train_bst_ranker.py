@@ -46,6 +46,7 @@ from utils.matrix_ranking import (
     stage_info_metric_lines,
 )
 from utils.pipeline.core import Context
+from utils.ranker_utilities import BSTPostAuthorFeatureEncoder, LinearPredictionHead
 
 
 STAGE_LOG_NAME = "STAGE_03_TRAIN_BST_RANKER"
@@ -79,147 +80,6 @@ def bucketize_time_deltas_hours(
     positive_bucket_ids = torch.bucketize(deltas, boundary_tensor, right=False) + 1
     zero_bucket_ids = torch.zeros_like(positive_bucket_ids)
     return torch.where(deltas <= 0.0, zero_bucket_ids, positive_bucket_ids).to(dtype=torch.long)
-
-
-class BSTPostAuthorFeatureEncoder(nn.Module):
-    """Fuse MiniLM post embeddings with author embeddings for the BST ranker."""
-
-    def __init__(
-        self,
-        post_embedding_dim: int,
-        author_table_num_rows: int,
-        author_embedding_dim: int,
-        content_projection_dim: int,
-        author_projection_dim: int,
-        model_dim: int,
-        author_unknown_dropout_rate: float,
-    ):
-        super().__init__()
-        if post_embedding_dim <= 0:
-            raise ValueError("post_embedding_dim must be positive")
-        if author_table_num_rows < 2:
-            raise ValueError("author_table_num_rows must be at least 2")
-        if author_embedding_dim <= 0:
-            raise ValueError("author_embedding_dim must be positive")
-        if content_projection_dim <= 0:
-            raise ValueError("content_projection_dim must be positive")
-        if author_projection_dim <= 0:
-            raise ValueError("author_projection_dim must be positive")
-        if model_dim <= 0:
-            raise ValueError("model_dim must be positive")
-        if not 0.0 <= author_unknown_dropout_rate <= 1.0:
-            raise ValueError("author_unknown_dropout_rate must be in [0, 1]")
-
-        self.post_embedding_dim = int(post_embedding_dim)
-        self.content_projection_dim = int(content_projection_dim)
-        self.author_projection_dim = int(author_projection_dim)
-        self.model_dim = int(model_dim)
-        self.author_unknown_dropout_rate = float(author_unknown_dropout_rate)
-        self.author_embedding = nn.Embedding(
-            num_embeddings=int(author_table_num_rows),
-            embedding_dim=int(author_embedding_dim),
-            padding_idx=AUTHOR_PAD_IDX,
-        )
-        nn.init.xavier_uniform_(self.author_embedding.weight)
-        with torch.no_grad():
-            self.author_embedding.weight[AUTHOR_PAD_IDX].zero_()
-
-        self.content_projection = nn.Linear(
-            int(post_embedding_dim),
-            self.content_projection_dim,
-        )
-        self.author_projection = nn.Linear(
-            int(author_embedding_dim),
-            self.author_projection_dim,
-        )
-        self.projection_activation = nn.GELU()
-        self.content_projection_norm = nn.LayerNorm(self.content_projection_dim)
-        self.author_projection_norm = nn.LayerNorm(self.author_projection_dim)
-        self.fusion_layer = nn.Linear(
-            self.content_projection_dim + self.author_projection_dim,
-            int(model_dim),
-        )
-        for layer in (self.content_projection, self.author_projection, self.fusion_layer):
-            nn.init.xavier_uniform_(layer.weight)
-            if layer.bias is not None:
-                nn.init.zeros_(layer.bias)
-
-    def forward(
-        self,
-        post_embeddings: torch.Tensor,
-        author_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        if post_embeddings.size(-1) != self.post_embedding_dim:
-            raise ValueError(
-                f"post_embeddings last dimension ({post_embeddings.size(-1)}) must match post_embedding_dim ({self.post_embedding_dim})"
-            )
-        if post_embeddings.shape[:-1] != author_indices.shape:
-            raise ValueError("author_indices shape must match post_embeddings leading dimensions")
-
-        author_indices = author_indices.to(device=post_embeddings.device, dtype=torch.long)
-        if self.training and self.author_unknown_dropout_rate > 0.0:
-            eligible = author_indices > AUTHOR_UNK_IDX
-            if torch.any(eligible):
-                dropout_mask = torch.rand(author_indices.shape, device=author_indices.device) < self.author_unknown_dropout_rate
-                author_indices = torch.where(
-                    eligible & dropout_mask,
-                    torch.full_like(author_indices, AUTHOR_UNK_IDX),
-                    author_indices,
-                )
-
-        author_embeddings = self.author_embedding(author_indices)
-        content_features = self.content_projection_norm(
-            self.projection_activation(self.content_projection(post_embeddings))
-        )
-        author_features = self.author_projection_norm(
-            self.projection_activation(self.author_projection(author_embeddings))
-        )
-        fused_inputs = torch.cat([content_features, author_features], dim=-1)
-        return self.fusion_layer(fused_inputs)
-
-
-class LinearPredictionHead(nn.Module):
-    """Linear-layer prediction head for BST candidate-pair encodings."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: Sequence[int],
-        dropout_rate: float,
-    ):
-        super().__init__()
-        if input_dim <= 0:
-            raise ValueError("input_dim must be positive")
-        if not 0.0 <= dropout_rate <= 1.0:
-            raise ValueError("dropout_rate must be in [0, 1]")
-
-        hidden_dims = tuple(int(hidden_dim) for hidden_dim in hidden_dims)
-        for hidden_dim in hidden_dims:
-            if hidden_dim <= 0:
-                raise ValueError("hidden_dims must contain only positive values")
-
-        layers: list[nn.Module] = []
-        prev_dim = int(input_dim)
-        for hidden_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(float(dropout_rate)),
-                ]
-            )
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, 1))
-        self.network = nn.Sequential(*layers)
-
-        for module in self.network.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, encoded_pair: torch.Tensor) -> torch.Tensor:
-        return self.network(encoded_pair).squeeze(-1)
 
 
 class BSTRanker(nn.Module):
@@ -1193,8 +1053,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     max_history_len = int(args.max_history_len)
     model_dim = int(args.bst_model_dim)
-    content_projection_dim = int(args.bst_content_projection_dim)
-    author_projection_dim = int(args.bst_author_projection_dim)
+    content_projection_dim = int(args.content_projection_dim)
+    author_projection_dim = int(args.author_projection_dim)
     time_embedding_dim = int(args.bst_time_embedding_dim)
     num_attention_heads = int(args.bst_num_attention_heads)
     num_transformer_layers = int(args.bst_num_transformer_layers)
@@ -1202,15 +1062,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     dropout_rate = float(args.bst_dropout_rate)
     norm_first = bool(args.bst_norm_first)
     time_delta_bucket_boundaries_hours = tuple(float(v) for v in args.bst_time_delta_bucket_boundaries_hours)
-    if args.bst_prediction_hidden_dims is None:
-        raise ValueError("bst_prediction_hidden_dims is required for BST ranker training")
-    prediction_hidden_dims = tuple(int(v) for v in args.bst_prediction_hidden_dims)
+    if args.prediction_hidden_dims is None:
+        raise ValueError("prediction_hidden_dims is required for BST ranker training")
+    prediction_hidden_dims = tuple(int(v) for v in args.prediction_hidden_dims)
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     bst_training_mode = str(args.bst_training_mode)
-    batch_size = int(args.bst_batch_size)
-    bst_candidate_sample_size = int(args.bst_candidate_sample_size)
+    batch_size = int(args.batch_size)
+    candidate_sample_size = int(args.candidate_sample_size)
     bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
     if bst_max_train_batches_per_epoch is not None:
         bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
@@ -1288,12 +1148,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_unk_idx": AUTHOR_UNK_IDX,
         "bst_use_auc_as_primary": bst_use_auc_as_primary,
         "bst_training_mode": bst_training_mode,
-        "bst_candidate_sample_size": bst_candidate_sample_size,
+        "candidate_sample_size": candidate_sample_size,
     }
     training_config = {
         **config,
         "batch_size": batch_size,
-        "bst_batch_size": batch_size,
         "bst_max_train_batches_per_epoch": bst_max_train_batches_per_epoch,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
@@ -1329,7 +1188,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len,
             embed_dim=embed_dim,
             use_author_embedding_table=use_author_embedding_table,
-            candidate_sample_size=bst_candidate_sample_size,
+            candidate_sample_size=candidate_sample_size,
             seed=random_seed,
             logger=logger,
         )
@@ -1342,7 +1201,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len,
             embed_dim=embed_dim,
             use_author_embedding_table=use_author_embedding_table,
-            candidate_sample_size=bst_candidate_sample_size,
+            candidate_sample_size=candidate_sample_size,
             seed=random_seed,
             logger=logger,
         )
@@ -1355,7 +1214,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len,
             embed_dim=embed_dim,
             use_author_embedding_table=use_author_embedding_table,
-            candidate_sample_size=bst_candidate_sample_size,
+            candidate_sample_size=candidate_sample_size,
             seed=random_seed,
             logger=logger,
         )
@@ -1617,7 +1476,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "stage: train_bst_ranker",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: mode={bst_training_mode}, batch_size={batch_size}, candidate_sample_size={bst_candidate_sample_size}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
+        f"settings: mode={bst_training_mode}, batch_size={batch_size}, candidate_sample_size={candidate_sample_size}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"val_unseen_samples: {len(val_unseen_dataset)}",

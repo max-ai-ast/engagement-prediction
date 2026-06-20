@@ -167,7 +167,7 @@ def test_bst_ranker_model_type_maps_train_alias():
         "--start-from", "train",
         "--stop-after", "train",
         "--use-author-embedding-table",
-        "--bst-prediction-hidden-dims", "144", "72",
+        "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
 
@@ -194,12 +194,51 @@ def test_bst_ranker_explicit_train_stage_names_parse():
         "--start-from", "train_bst_ranker",
         "--stop-after", "train_bst_ranker",
         "--use-author-embedding-table",
-        "--bst-prediction-hidden-dims", "144", "72",
+        "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.start_from == "train_bst_ranker"
     assert merged.stop_after == "train_bst_ranker"
+
+
+def test_din_ranker_model_type_maps_train_alias():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "din-ranker",
+        "--start-from", "train",
+        "--stop-after", "train",
+        "--use-author-embedding-table",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    train_key = cli._get_train_key(merged.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, includes_train = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        merged.start_from,
+        merged.stop_after,
+        train_key,
+    )
+
+    assert train_key == "train_din_ranker"
+    assert stage_order[start_idx] == "train_din_ranker"
+    assert stage_order[stop_idx] == "train_din_ranker"
+    assert includes_train is True
+
+
+def test_din_ranker_explicit_train_stage_names_parse():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "din-ranker",
+        "--start-from", "train_din_ranker",
+        "--stop-after", "train_din_ranker",
+        "--use-author-embedding-table",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.start_from == "train_din_ranker"
+    assert merged.stop_after == "train_din_ranker"
 
 
 def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
@@ -210,8 +249,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             model_type: bst-ranker
             use_author_embedding_table: true
             bst_model_dim: 96
-            bst_content_projection_dim: 80
-            bst_author_projection_dim: 24
+            content_projection_dim: 80
+            author_projection_dim: 24
             bst_time_embedding_dim: 32
             bst_num_attention_heads: 8
             bst_num_transformer_layers: 1
@@ -219,12 +258,12 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_dropout_rate: 0.2
             bst_norm_first: true
             bst_time_delta_bucket_boundaries_hours: [1, 2, 4]
-            bst_prediction_hidden_dims: [128, 64]
+            prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
             bst_use_auc_as_primary: true
             bst_training_mode: listwise
-            bst_candidate_sample_size: 32
-            bst_batch_size: 16
+            candidate_sample_size: 32
+            batch_size: 16
             bst_max_train_batches_per_epoch: 5
             """
         ).strip()
@@ -237,17 +276,57 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
 
     assert merged.model_type == "bst-ranker"
     assert merged.bst_model_dim == 96
-    assert merged.bst_content_projection_dim == 80
-    assert merged.bst_author_projection_dim == 24
+    assert merged.content_projection_dim == 80
+    assert merged.author_projection_dim == 24
     assert merged.bst_time_embedding_dim == 32
     assert merged.bst_num_attention_heads == 8
-    assert merged.bst_prediction_hidden_dims == [128, 64]
+    assert merged.prediction_hidden_dims == [128, 64]
     assert merged.bst_use_auc_as_primary is True
     assert merged.bst_training_mode == "listwise"
-    assert merged.bst_candidate_sample_size == 32
-    assert merged.bst_batch_size == 16
+    assert merged.candidate_sample_size == 32
+    assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
     cli._validate_bst_config(merged)
+
+
+def test_merge_args_with_config_accepts_din_ranker_keys(tmp_path):
+    config_path = Path(tmp_path) / "din.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            model_type: din-ranker
+            use_author_embedding_table: true
+            din_model_dim: 96
+            content_projection_dim: 80
+            author_projection_dim: 24
+            din_attention_hidden_dims: [128, 64]
+            prediction_hidden_dims: [64, 32]
+            din_dropout_rate: 0.2
+            din_weight_decay: 0.02
+            candidate_sample_size: 32
+            batch_size: 16
+            din_max_train_batches_per_epoch: 5
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.model_type == "din-ranker"
+    assert merged.din_model_dim == 96
+    assert merged.content_projection_dim == 80
+    assert merged.author_projection_dim == 24
+    assert merged.din_attention_hidden_dims == [128, 64]
+    assert merged.prediction_hidden_dims == [64, 32]
+    assert merged.din_dropout_rate == 0.2
+    assert merged.din_weight_decay == 0.02
+    assert merged.candidate_sample_size == 32
+    assert merged.batch_size == 16
+    assert merged.din_max_train_batches_per_epoch == 5
+    cli._validate_din_config(merged)
 
 
 def test_bst_ranker_listwise_training_defaults():
@@ -259,10 +338,29 @@ def test_bst_ranker_listwise_training_defaults():
     merged = cli._merge_args_with_config(raw)
 
     assert merged.bst_training_mode == "listwise"
-    assert merged.bst_candidate_sample_size == 64
-    assert merged.bst_batch_size == 128
+    assert merged.candidate_sample_size == 64
+    assert merged.batch_size == cli.DEFAULTS["batch_size"]
     assert merged.bst_max_train_batches_per_epoch is None
     cli._validate_bst_config(merged)
+
+
+def test_din_ranker_training_defaults():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "din-ranker",
+        "--use-author-embedding-table",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.din_model_dim == 128
+    assert merged.content_projection_dim == 128
+    assert merged.author_projection_dim == 32
+    assert merged.din_attention_hidden_dims == [64, 32]
+    assert merged.prediction_hidden_dims == [64, 32, 16]
+    assert merged.candidate_sample_size == 64
+    assert merged.batch_size == cli.DEFAULTS["batch_size"]
+    assert merged.din_max_train_batches_per_epoch is None
+    cli._validate_din_config(merged)
 
 
 def test_bst_ranker_auc_primary_flag_defaults_to_false():
@@ -310,8 +408,8 @@ def test_bst_ranker_pairwise_allows_multiple_transformer_layers():
 @pytest.mark.parametrize(
     ("flag", "message"),
     [
-        ("--bst-candidate-sample-size", "bst-candidate-sample-size"),
-        ("--bst-batch-size", "bst-batch-size"),
+        ("--candidate-sample-size", "candidate-sample-size"),
+        ("--batch-size", "batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
     ],
 )
@@ -330,20 +428,29 @@ def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, messag
 
 def test_bst_ranker_requires_author_embedding_table():
     parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "bst-ranker", "--bst-prediction-hidden-dims", "144", "72"])
+    raw = parser.parse_args(["--model-type", "bst-ranker", "--prediction-hidden-dims", "144", "72"])
     merged = cli._merge_args_with_config(raw)
 
     with pytest.raises(ValueError, match="use-author-embedding-table"):
         cli._validate_bst_config(merged)
 
 
+def test_din_ranker_requires_author_embedding_table():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "din-ranker"])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="use-author-embedding-table"):
+        cli._validate_din_config(merged)
+
+
 def test_bst_ranker_requires_prediction_hidden_dims():
     parser = cli.build_parser()
     raw = parser.parse_args(["--model-type", "bst-ranker", "--use-author-embedding-table"])
     merged = cli._merge_args_with_config(raw)
-    merged.bst_prediction_hidden_dims = None
+    merged.prediction_hidden_dims = None
 
-    with pytest.raises(ValueError, match="bst-prediction-hidden-dims"):
+    with pytest.raises(ValueError, match="prediction-hidden-dims"):
         cli._validate_bst_config(merged)
 
 
@@ -352,19 +459,34 @@ def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
         "--use-author-embedding-table",
-        "--bst-prediction-hidden-dims",
+        "--prediction-hidden-dims",
     ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.bst_prediction_hidden_dims == []
+    assert merged.prediction_hidden_dims == []
     cli._validate_bst_config(merged)
+
+
+def test_din_ranker_accepts_explicit_empty_hidden_dims():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "din-ranker",
+        "--use-author-embedding-table",
+        "--din-attention-hidden-dims",
+        "--prediction-hidden-dims",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.din_attention_hidden_dims == []
+    assert merged.prediction_hidden_dims == []
+    cli._validate_din_config(merged)
 
 
 @pytest.mark.parametrize(
     ("arg_name", "error_match"),
     [
-        ("bst_content_projection_dim", "bst-content-projection-dim"),
-        ("bst_author_projection_dim", "bst-author-projection-dim"),
+        ("content_projection_dim", "content-projection-dim"),
+        ("author_projection_dim", "author-projection-dim"),
     ],
 )
 def test_bst_ranker_validates_projection_dims(arg_name, error_match):
@@ -372,7 +494,7 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
         "--use-author-embedding-table",
-        "--bst-prediction-hidden-dims", "144", "72",
+        "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
     setattr(merged, arg_name, 0)
@@ -381,13 +503,37 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
         cli._validate_bst_config(merged)
 
 
+@pytest.mark.parametrize(
+    ("arg_name", "error_match"),
+    [
+        ("din_model_dim", "din-model-dim"),
+        ("content_projection_dim", "content-projection-dim"),
+        ("author_projection_dim", "author-projection-dim"),
+        ("candidate_sample_size", "candidate-sample-size"),
+        ("batch_size", "batch-size"),
+        ("din_max_train_batches_per_epoch", "din-max-train-batches-per-epoch"),
+    ],
+)
+def test_din_ranker_validates_training_controls(arg_name, error_match):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "din-ranker",
+        "--use-author-embedding-table",
+    ])
+    merged = cli._merge_args_with_config(raw)
+    setattr(merged, arg_name, 0)
+
+    with pytest.raises(ValueError, match=error_match):
+        cli._validate_din_config(merged)
+
+
 def test_bst_ranker_validates_transformer_head_divisibility():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
         "--use-author-embedding-table",
         "--bst-time-embedding-dim", "15",
-        "--bst-prediction-hidden-dims", "144", "72",
+        "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
 

@@ -40,6 +40,20 @@ def _compare_checkpoint_config(max_history_len=7, use_author_embedding_table=Tru
     }
 
 
+def _compare_din_checkpoint_config(max_history_len=7, use_author_embedding_table=True):
+    config = _compare_checkpoint_config(
+        max_history_len=max_history_len,
+        use_author_embedding_table=use_author_embedding_table,
+    )
+    config.update({
+        "model_type": "din-ranker",
+        "model_dim": 4,
+        "attention_hidden_dims": [4],
+        "prediction_hidden_dims": [4],
+    })
+    return config
+
+
 def _write_compare_checkpoint(path: Path, config: dict) -> None:
     torch.save({"model_state_dict": {}, "config": config}, path)
 
@@ -50,12 +64,17 @@ def test_compare_rankers_parser_accepts_repeated_models():
         "compare-rankers",
         "--model", "tt:two-tower:/tmp/two_tower.pth",
         "--model", "bst:bst-ranker:/tmp/bst.pth",
+        "--model", "din:din-ranker:/tmp/din.pth",
         "--splits", "val", "holdout_unseen_users",
         "--bst-candidate-chunk-size", "512",
     ])
 
     assert raw.command == "compare-rankers"
-    assert raw.model == ["tt:two-tower:/tmp/two_tower.pth", "bst:bst-ranker:/tmp/bst.pth"]
+    assert raw.model == [
+        "tt:two-tower:/tmp/two_tower.pth",
+        "bst:bst-ranker:/tmp/bst.pth",
+        "din:din-ranker:/tmp/din.pth",
+    ]
     assert raw.splits == ["val", "holdout_unseen_users"]
     assert raw.bst_candidate_chunk_size == 512
 
@@ -181,6 +200,15 @@ def test_compare_rankers_requires_bst_projection_config():
         compare._validate_compare_bst_config(spec, config)
 
 
+def test_compare_rankers_requires_din_config():
+    spec = {"name": "din", "model_type": "din-ranker", "checkpoint_path": "/tmp/din.pth"}
+    config = _compare_din_checkpoint_config()
+    del config["attention_hidden_dims"]
+
+    with pytest.raises(ValueError, match="attention_hidden_dims"):
+        compare._validate_compare_bst_config(spec, config)
+
+
 def test_compare_rankers_rejects_config(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args([
@@ -205,8 +233,10 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     )
     two_tower_checkpoint = tmp_path / "two_tower.pth"
     bst_checkpoint = tmp_path / "bst.pth"
+    din_checkpoint = tmp_path / "din.pth"
     _write_compare_checkpoint(two_tower_checkpoint, _compare_checkpoint_config(max_history_len=7))
     _write_compare_checkpoint(bst_checkpoint, _compare_checkpoint_config(max_history_len=7))
+    _write_compare_checkpoint(din_checkpoint, _compare_din_checkpoint_config(max_history_len=7))
 
     import utils.dataloaders as dataloaders
     import utils.matrix_ranking as matrix_ranking
@@ -265,6 +295,11 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
             self.checkpoint_path = checkpoint_path
             self.candidate_chunk_size = candidate_chunk_size
 
+    class FakeDinAdapter:
+        def __init__(self, checkpoint_path, candidate_chunk_size):
+            self.checkpoint_path = checkpoint_path
+            self.candidate_chunk_size = candidate_chunk_size
+
     def fake_evaluate_matrix_scorer(
         adapter,
         data_loader,
@@ -296,6 +331,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     monkeypatch.setattr(dataloaders, "BucketedEngagementDataset", FakeBucketedDataset)
     monkeypatch.setattr(ranking_adapters, "TwoTowerPthAdapter", FakeTwoTowerAdapter)
     monkeypatch.setattr(ranking_adapters, "BstPthAdapter", FakeBstAdapter)
+    monkeypatch.setattr(ranking_adapters, "DinPthAdapter", FakeDinAdapter)
     monkeypatch.setattr(matrix_ranking, "evaluate_matrix_scorer", fake_evaluate_matrix_scorer)
 
     parser = cli.build_parser()
@@ -306,6 +342,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
         "--prior-02-user-history", str(history_dir),
         "--model", f"tt:two-tower:{two_tower_checkpoint}",
         "--model", f"bst:bst-ranker:{bst_checkpoint}",
+        "--model", f"din:din-ranker:{din_checkpoint}",
         "--splits", "val", "empty",
         "--metrics-top-ks", "30",
         "--batch-size", "2",
@@ -320,11 +357,13 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
         {"split": "val", "use_author_embedding_table": True, "max_history_len": 7, "embed_dim": 2},
         {"split": "empty", "use_author_embedding_table": True, "max_history_len": 7, "embed_dim": 2},
     ]
-    assert len(eval_calls) == 2
+    assert len(eval_calls) == 3
     assert all(call["device"] == "cpu" for call in eval_calls)
     assert isinstance(eval_calls[0]["adapter"], FakeTwoTowerAdapter)
     assert isinstance(eval_calls[1]["adapter"], FakeBstAdapter)
+    assert isinstance(eval_calls[2]["adapter"], FakeDinAdapter)
     assert eval_calls[1]["adapter"].candidate_chunk_size == 17
+    assert eval_calls[2]["adapter"].candidate_chunk_size == 17
 
     compare_dirs = list((artifacts_dir / "compare_rankers").iterdir())
     assert len(compare_dirs) == 1
@@ -332,7 +371,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     metrics_summary = json.loads((out_dir / "metrics.json").read_text())
     assert metrics_summary["skipped_splits"] == ["empty"]
     assert metrics_summary["max_history_len"] == 7
-    assert set(metrics_summary["metrics"].keys()) == {"tt", "bst"}
+    assert set(metrics_summary["metrics"].keys()) == {"tt", "bst", "din"}
     assert set(metrics_summary["metrics"]["tt"].keys()) == {"val"}
     assert (out_dir / "metrics.csv").read_text().startswith("model_name,model_type,checkpoint_path,split,metric,value\n")
     assert json.loads((out_dir / "model_specs.json").read_text())[0]["name"] == "tt"
