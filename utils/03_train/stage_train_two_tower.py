@@ -89,6 +89,7 @@ Outputs under <run_dir>/03_train/<timestamp>/:
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -1064,6 +1065,62 @@ def run(context: Context, args) -> Dict[str, Any]:
         author_unknown_dropout_rate=author_unknown_dropout_rate,
     )
 
+    def _save_two_tower_artifacts(
+        model_to_save: TwoTowerModel,
+        results: Optional[Dict[str, Any]],
+        metric_name: str,
+        metric_value: float,
+    ) -> Path:
+        model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
+        torch.save(
+            {
+                "model_state_dict": model_to_save.state_dict(),
+                "config": config,
+                "training_history": results["history"] if results is not None else None,
+                "primary_metric_name": metric_name,
+                "best_val_metric": metric_value,
+                "best_val_loss": results["best_val_loss"] if results is not None else None,
+            },
+            model_path,
+        )
+        logger.info(f"Model saved to: {model_path}")
+
+        # Save TorchScript file, which is the format needed for ClearML serving
+        # Save the post and user towers separately
+        torchscript_model = copy.deepcopy(model_to_save).cpu().eval()
+        torchscript_user_name = "engagement_user_tower"
+        torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
+        torch.jit.script(torchscript_model.user_tower).save(torchscript_user_path)
+        user_model_metadata = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        user_model_id = user_model_metadata.get("model_id", "")
+        logger.info(f"User tower model id: {user_model_id}")
+
+        torchscript_post_name = "engagement_post_tower"
+        torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
+        torch.jit.script(torchscript_model.post_tower).save(torchscript_post_path)
+        post_model_metadata = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        post_model_id = post_model_metadata.get("model_id", "")
+        logger.info(f"Post tower model id: {post_model_id}")
+
+        manifest = {
+            "embedding_space_id": post_model_id,
+            "user_tower_clearml_model_id": user_model_id,
+            "post_tower_clearml_model_id": post_model_id,
+            "user_tower_uri": user_model_metadata.get("uri", ""),
+            "post_tower_uri": post_model_metadata.get("uri", ""),
+            "output_embedding_dim": shared_dim,
+            "clearml_task_id": getattr(context.tracker, "id", "")
+        }
+        manifest_path = checkpoints_dir / "two_tower_serving_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        try:
+            manifest_uri = context.tracker.log_file_artifact("two_tower_serving_manifest", manifest_path)
+            logger.info(f"Two-tower serving manifest artifact id: {manifest_uri}")
+        except Exception:
+            logger.exception("Failed to upload two-tower serving manifest; continuing without manifest artifact.")
+        return model_path
+
+    model_path = None
     if (not use_post_encoder) and (user_encoder_type == "summarized"):
         logger.info(f"Creating a simple dot-product model, no need for training")
         trained_model: TwoTowerModel = model
@@ -1093,6 +1150,15 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
         trained_model: TwoTowerModel = training_results["model"]
         clear_cuda_memory()
+        best_val_metric = training_results["best_val_metric"]
+        primary_metric_name = training_results["primary_metric_name"]
+        if save_model:
+            model_path = _save_two_tower_artifacts(
+                trained_model,
+                training_results,
+                primary_metric_name,
+                best_val_metric,
+            )
         if generate_plots:
             hist = training_results["history"]
             try:
@@ -1148,56 +1214,13 @@ def run(context: Context, args) -> Dict[str, Any]:
                 iteration=0,
             )
 
-    # --- save model ---
-    model_path = None
-    if save_model:
-        model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
-        torch.save(
-            {
-                "model_state_dict": trained_model.state_dict(),
-                "config": config,
-                "training_history": training_results["history"] if training_results is not None else None,
-                "primary_metric_name": primary_metric_name,
-                "best_val_metric": best_val_metric,
-                "best_val_loss": training_results["best_val_loss"] if training_results is not None else None,
-            },
-            model_path,
+    if save_model and model_path is None:
+        model_path = _save_two_tower_artifacts(
+            trained_model,
+            training_results,
+            primary_metric_name,
+            best_val_metric,
         )
-        logger.info(f"Model saved to: {model_path}")
-
-        # Save TorchScript file, which is the format needed for ClearML serving
-        # Save the post and user towers separately
-        trained_model = trained_model.cpu()
-        torchscript_user_name = "engagement_user_tower"
-        torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
-        torch.jit.script(trained_model.user_tower).save(torchscript_user_path)
-        user_model_metadata = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
-        user_model_id = user_model_metadata["model_id"]
-        logger.info(f"User tower model id: {user_model_id}")
-
-        torchscript_post_name = "engagement_post_tower"
-        torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
-        torch.jit.script(trained_model.post_tower).save(torchscript_post_path)
-        post_model_metadata = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
-        post_model_id = post_model_metadata["model_id"]
-        logger.info(f"Post tower model id: {post_model_id}")
-
-        manifest = {
-            "embedding_space_id": post_model_id,
-            "user_tower_clearml_model_id": user_model_id,
-            "post_tower_clearml_model_id": post_model_id,
-            "user_tower_uri": user_model_metadata["uri"],
-            "post_tower_uri": post_model_metadata["uri"],
-            "output_embedding_dim": shared_dim,
-            "clearml_task_id": context.tracker.id
-        }
-        manifest_path = checkpoints_dir / "two_tower_serving_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        try:
-            manifest_uri = context.tracker.log_file_artifact("two_tower_serving_manifest", manifest_path)
-            logger.info(f"Two-tower serving manifest artifact id: {manifest_uri}")
-        except Exception:
-            logger.exception("Failed to upload two-tower serving manifest; continuing without manifest artifact.")
 
     # Full per-pair prediction parquet writing is intentionally disabled for now.
     # The bucketed path would produce one row per user-candidate pair, which can

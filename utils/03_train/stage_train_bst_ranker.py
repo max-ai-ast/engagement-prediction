@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import time
 from contextlib import nullcontext
@@ -1333,6 +1334,46 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     trained_model: BSTRanker = training_results["model"]
     clear_cuda_memory()
 
+    model_path = None
+    if save_model:
+        log_operation_start("Save BST ranker checkpoint", STAGE_LOG_NAME, logger)
+        model_path = checkpoints_dir / f"bst_ranker_{timestamp}.pth"
+        torch.save(
+            {
+                "model_state_dict": trained_model.state_dict(),
+                "config": config,
+                "training_history": training_results["history"],
+                "primary_metric_name": training_results["primary_metric_name"],
+                "best_val_metric": training_results["best_val_metric"],
+                "best_val_loss": training_results["best_val_loss"],
+            },
+            model_path,
+        )
+        logger.info(f"Model saved to: {model_path}")
+
+        torchscript_model = copy.deepcopy(trained_model).cpu().eval()
+        torchscript_name = "ranker"
+        torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
+        torch.jit.script(torchscript_model).save(torchscript_path)
+        ranker_model_metadata = context.tracker.log_artifact(name=torchscript_name, path=torchscript_path)
+        ranker_model_id = ranker_model_metadata.get("model_id", "")
+        ranker_uri = ranker_model_metadata.get("uri", "")
+        logger.info(f"Ranker model id: {ranker_model_id}")
+        logger.info(f"Ranker model URI: {ranker_uri}")
+
+        manifest = {
+            "ranker_clearml_model_id": ranker_model_id,
+            "ranker_uri": ranker_uri,
+            "clearml_task_id": getattr(context.tracker, "id", ""),
+        }
+        manifest_path = checkpoints_dir / "ranker_serving_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        try:
+            manifest_uri = context.tracker.log_file_artifact("ranker_serving_manifest", manifest_path)
+            logger.info(f"Ranker serving manifest artifact id: {manifest_uri}")
+        except Exception:
+            logger.exception("Failed to upload ranker serving manifest; continuing without manifest artifact.")
+
     if generate_plots:
         hist = training_results["history"]
         try:
@@ -1422,46 +1463,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Train metrics: {train_metrics}")
     logger.info(f"Validation metrics: {val_metrics}")
     logger.info(f"Validation unseen users metrics: {val_unseen_metrics}")
-
-    model_path = None
-    if save_model:
-        log_operation_start("Save BST ranker checkpoint", STAGE_LOG_NAME, logger)
-        model_path = checkpoints_dir / f"bst_ranker_{timestamp}.pth"
-        torch.save(
-            {
-                "model_state_dict": trained_model.state_dict(),
-                "config": config,
-                "training_history": training_results["history"],
-                "primary_metric_name": training_results["primary_metric_name"],
-                "best_val_metric": training_results["best_val_metric"],
-                "best_val_loss": training_results["best_val_loss"],
-            },
-            model_path,
-        )
-        logger.info(f"Model saved to: {model_path}")
-
-        trained_model = trained_model.cpu().eval()
-        torchscript_name = "ranker"
-        torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
-        torch.jit.script(trained_model).save(torchscript_path)
-        ranker_model_metadata = context.tracker.log_artifact(name=torchscript_name, path=torchscript_path)
-        ranker_model_id = ranker_model_metadata.get("model_id", "")
-        ranker_uri = ranker_model_metadata.get("uri", "")
-        logger.info(f"Ranker model id: {ranker_model_id}")
-        logger.info(f"Ranker model URI: {ranker_uri}")
-
-        manifest = {
-            "ranker_clearml_model_id": ranker_model_id,
-            "ranker_uri": ranker_uri,
-            "clearml_task_id": getattr(context.tracker, "id", ""),
-        }
-        manifest_path = checkpoints_dir / "ranker_serving_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        try:
-            manifest_uri = context.tracker.log_file_artifact("ranker_serving_manifest", manifest_path)
-            logger.info(f"Ranker serving manifest artifact id: {manifest_uri}")
-        except Exception:
-            logger.exception("Failed to upload ranker serving manifest; continuing without manifest artifact.")
 
     final_split_metrics: Dict[str, Dict[str, Any]] = {
         "train": train_metrics,
