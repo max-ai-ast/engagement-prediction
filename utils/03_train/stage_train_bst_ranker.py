@@ -105,6 +105,7 @@ class BSTRanker(nn.Module):
         self.author_projection_dim = int(author_projection_dim)
         self.model_dim = int(model_dim)
         self.time_embedding_dim = int(time_embedding_dim)
+        self.dropout_rate = float(dropout_rate)
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -258,8 +259,12 @@ class BSTRanker(nn.Module):
         head_dim = embed_dim // num_heads
         scale = float(head_dim) ** -0.5
 
-        q_weight, k_weight, v_weight = self_attn.in_proj_weight.chunk(3, dim=0)
-        q_bias, k_bias, v_bias = self_attn.in_proj_bias.chunk(3, dim=0)
+        in_proj_weight = self_attn.in_proj_weight
+        in_proj_bias = self_attn.in_proj_bias
+        if in_proj_weight is None or in_proj_bias is None:
+            raise RuntimeError("score_candidate_matrix requires packed self-attention projections")
+        q_weight, k_weight, v_weight = in_proj_weight.chunk(3, dim=0)
+        q_bias, k_bias, v_bias = in_proj_bias.chunk(3, dim=0)
         query = F.linear(candidate_input, q_weight, q_bias).view(num_candidates, num_heads, head_dim)
         history_key = F.linear(history_input, k_weight, k_bias).view(num_users, max_history_len, num_heads, head_dim)
         history_value = F.linear(history_input, v_weight, v_bias).view(num_users, max_history_len, num_heads, head_dim)
@@ -272,7 +277,7 @@ class BSTRanker(nn.Module):
         candidate_scores = candidate_scores.unsqueeze(0).unsqueeze(-1).expand(num_users, -1, -1, -1)
         attention_scores = torch.cat([history_scores, candidate_scores], dim=-1)
         attention_weights = torch.softmax(attention_scores, dim=-1)
-        attention_weights = F.dropout(attention_weights, p=float(self_attn.dropout), training=self.training)
+        attention_weights = F.dropout(attention_weights, p=self.dropout_rate, training=self.training)
 
         if max_history_len == 0:
             history_context = torch.zeros(
@@ -291,18 +296,18 @@ class BSTRanker(nn.Module):
             * candidate_value.unsqueeze(0)
         )
         attention_output = (history_context + candidate_context).reshape(num_users, num_candidates, embed_dim)
-        return self_attn.out_proj(attention_output)
+        return F.linear(attention_output, self_attn.out_proj.weight, self_attn.out_proj.bias)
 
     def _candidate_token_feed_forward(
         self,
         layer: nn.TransformerEncoderLayer,
         candidate_state: torch.Tensor,
     ) -> torch.Tensor:
-        hidden = layer.linear1(candidate_state)
-        hidden = layer.activation(hidden)
-        hidden = layer.dropout(hidden)
-        hidden = layer.linear2(hidden)
-        return layer.dropout2(hidden)
+        hidden = F.linear(candidate_state, layer.linear1.weight, layer.linear1.bias)
+        hidden = F.gelu(hidden)
+        hidden = F.dropout(hidden, p=self.dropout_rate, training=self.training)
+        hidden = F.linear(hidden, layer.linear2.weight, layer.linear2.bias)
+        return F.dropout(hidden, p=self.dropout_rate, training=self.training)
 
     def score_candidate_matrix_one_layer(
         self,
@@ -313,7 +318,7 @@ class BSTRanker(nn.Module):
         history_author_indices: torch.Tensor,
         candidate_post_author_idx: torch.Tensor,
     ) -> torch.Tensor:
-        layer = self._validate_one_layer_matrix_scorer()
+        self._validate_one_layer_matrix_scorer()
         if history_embeddings.dim() != 3:
             raise ValueError("history_embeddings must have shape [U, H, D]")
         if candidate_post_embeddings.dim() != 2:
@@ -335,6 +340,31 @@ class BSTRanker(nn.Module):
         if candidate_post_author_idx.shape != (num_candidates,):
             raise ValueError("candidate_post_author_idx must have shape [C]")
 
+        return self.score_candidate_matrix(
+            history_embeddings=history_embeddings,
+            history_mask=history_mask,
+            history_time_deltas_hours=history_time_deltas_hours,
+            candidate_post_embeddings=candidate_post_embeddings,
+            history_author_indices=history_author_indices,
+            candidate_post_author_idx=candidate_post_author_idx,
+        )
+
+    @torch.jit.export
+    def score_candidate_matrix(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_time_deltas_hours: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_author_indices: torch.Tensor,
+        candidate_post_author_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if len(self.transformer_encoder.layers) != 1:
+            raise RuntimeError("score_candidate_matrix requires exactly one transformer layer")
+        layer = self.transformer_encoder.layers[0]
+
+        num_users = int(history_embeddings.size(0))
+        num_candidates = int(candidate_post_embeddings.size(0))
         device = history_embeddings.device
         history_mask = history_mask.to(device=device, dtype=torch.bool)
         history_time_deltas_hours = history_time_deltas_hours.to(device=device)
@@ -355,26 +385,61 @@ class BSTRanker(nn.Module):
         candidate_input = torch.cat([candidate_post_vectors, candidate_time_embeddings], dim=-1)
 
         if layer.norm_first:
-            attention_output = layer.dropout1(
+            normed_history_input = F.layer_norm(
+                history_input,
+                [self.transformer_input_dim],
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+            )
+            normed_candidate_input = F.layer_norm(
+                candidate_input,
+                [self.transformer_input_dim],
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+            )
+            attention_output = F.dropout(
                 self._candidate_token_self_attention(
                     layer,
-                    layer.norm1(history_input),
+                    normed_history_input,
                     history_mask,
-                    layer.norm1(candidate_input),
-                )
+                    normed_candidate_input,
+                ),
+                p=self.dropout_rate,
+                training=self.training,
             )
             candidate_state = candidate_input.unsqueeze(0) + attention_output
+            normed_candidate_state = F.layer_norm(
+                candidate_state,
+                [self.transformer_input_dim],
+                layer.norm2.weight,
+                layer.norm2.bias,
+                layer.norm2.eps,
+            )
             candidate_state = candidate_state + self._candidate_token_feed_forward(
                 layer,
-                layer.norm2(candidate_state),
+                normed_candidate_state,
             )
         else:
-            attention_output = layer.dropout1(
-                self._candidate_token_self_attention(layer, history_input, history_mask, candidate_input)
+            attention_output = F.dropout(
+                self._candidate_token_self_attention(layer, history_input, history_mask, candidate_input),
+                p=self.dropout_rate,
+                training=self.training,
             )
-            candidate_state = layer.norm1(candidate_input.unsqueeze(0) + attention_output)
-            candidate_state = layer.norm2(
-                candidate_state + self._candidate_token_feed_forward(layer, candidate_state)
+            candidate_state = F.layer_norm(
+                candidate_input.unsqueeze(0) + attention_output,
+                [self.transformer_input_dim],
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+            )
+            candidate_state = F.layer_norm(
+                candidate_state + self._candidate_token_feed_forward(layer, candidate_state),
+                [self.transformer_input_dim],
+                layer.norm2.weight,
+                layer.norm2.bias,
+                layer.norm2.eps,
             )
 
         logits = self.prediction_head(candidate_state.reshape(num_users * num_candidates, self.transformer_input_dim))

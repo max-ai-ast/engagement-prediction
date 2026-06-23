@@ -379,6 +379,26 @@ def test_bst_ranker_torchscript_forward_matches_eager():
     assert torch.allclose(scripted_output, eager_output, atol=1e-5)
 
 
+def test_bst_ranker_torchscript_exports_matrix_scorer():
+    model = _make_model().eval()
+    batch = _batch()
+
+    with torch.no_grad():
+        expected = model.score_candidate_matrix_one_layer(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_scores = scripted_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+
+    assert scripted_scores.shape == expected.shape
+    torch.testing.assert_close(scripted_scores, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_bst_ranker_rejects_invalid_prediction_hidden_dims():
     with pytest.raises(ValueError, match="hidden_dims"):
         _make_model(prediction_hidden_dims=[0])
