@@ -104,6 +104,8 @@ max_trainval_users: 1000
 max_unseen_eval_users: 100
 max_likes_per_user: 16
 negative_samples_per_hour: 10
+negative_sampling_alpha: 0.5
+min_likes_per_negative_post: 50
 min_likes_per_user: 0
 memory_check: "skip"
 ```
@@ -114,6 +116,7 @@ Important Stage 1 behavior:
 - `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
 - `max_unseen_eval_users` samples users used only for unseen validation and holdout.
 - `negative_samples_per_hour` controls the same-hour post pool used for matrix ranker training.
+- `negative_sampling_alpha` and `min_likes_per_negative_post` control popularity-weighted negative sampling.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
 Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.

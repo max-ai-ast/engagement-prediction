@@ -74,6 +74,28 @@ def test_negative_samples_per_hour_replaces_old_negative_posts_sample(tmp_path):
         cli._merge_args_with_config(raw)
 
 
+def test_negative_sampling_popularity_args_merge_from_cli_and_config(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--negative-sampling-alpha", "0.25",
+        "--min-likes-per-negative-post", "12",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.negative_sampling_alpha == 0.25
+    assert merged.min_likes_per_negative_post == 12
+    assert cli.DEFAULTS["negative_sampling_alpha"] == 0.5
+    assert cli.DEFAULTS["min_likes_per_negative_post"] == 50
+
+    config_path = Path(tmp_path) / "negative_sampling.yml"
+    config_path.write_text("negative_sampling_alpha: 0.75\nmin_likes_per_negative_post: 80\n")
+    raw = parser.parse_args(["--config", str(config_path), "--negative-sampling-alpha", "0.4"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.negative_sampling_alpha == 0.4
+    assert merged.min_likes_per_negative_post == 80
+
+
 def test_user_sampling_args_replace_old_names(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])

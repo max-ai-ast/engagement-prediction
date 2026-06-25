@@ -607,6 +607,23 @@ def _apply_per_user_recency_cap(
     )
 
 
+def _get_post_like_counts(
+    raw_likes_lf: pl.LazyFrame,
+    min_likes_per_negative_post: int,
+) -> pl.DataFrame:
+    return (
+        raw_likes_lf
+        .select(
+            pl
+            .col("subject_uri")
+            .value_counts(sort=True)
+        )
+        .unnest("subject_uri")
+        .filter(pl.col("count") >= min_likes_per_negative_post)
+        .collect(engine="streaming")
+    )
+
+
 def _load_likes_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
@@ -621,8 +638,9 @@ def _load_likes_core_polars(
     val_start: Optional[str],
     holdout_start: Optional[str],
     holdout_end: Optional[str],
+    min_likes_per_negative_post: int,
     logger: logging.Logger,
-) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, Dict[str, Any], pl.DataFrame]:
     """
     Load and filter likes data using a streaming Polars pipeline.
     
@@ -783,8 +801,14 @@ def _load_likes_core_polars(
     )
 
     stats['n_likes_final'] = n_after_cap
+
+    ### Get global posts with a minimum number of likes and a weight based on like count,
+    ### for sampling negatives in the next step
+    like_counts_df = _get_post_like_counts(base_lf, min_likes_per_negative_post)
+    stats['min_likes_per_negative_post'] = min_likes_per_negative_post
+    stats['n_negative_candidate_posts_by_like_count'] = like_counts_df.height
     
-    return likes_df, stats
+    return likes_df, stats, like_counts_df
 
 
 def _load_posts_core_polars(
@@ -793,7 +817,9 @@ def _load_posts_core_polars(
     liked_post_uris_df: pl.DataFrame,
     paths: List[str],
     *,
+    like_counts_df: pl.DataFrame,
     negative_samples_per_hour: int,
+    negative_sampling_alpha: float,
     embedding_model: str,
     random_seed: int,
     train_start: str,
@@ -855,19 +881,18 @@ def _load_posts_core_polars(
 
     # Metadata columns only - NO embeddings during filtering
     cols_metadata = ["at_uri", TIMESTAMP_COL_NAME, "did", "record_text"]
-    bucket_sample_rates_df = _get_hourly_sample_rates_df(
-        posts_lf=posts_lf,
-        negative_samples_per_hour=negative_samples_per_hour,
-    )
 
     # get posts: sampled via hash, or in liked_post_uris:
-    negs_and_likes_lf = _build_posts_candidate_lf(
-        posts_lf=posts_lf,
-        liked_post_uris_df=liked_post_uris_df,
-        bucket_sample_rates_df=bucket_sample_rates_df,
-        random_seed=random_seed,
-        cols_metadata=cols_metadata,
+    negative_posts_df = _get_negative_sample_posts(
+        posts_lf,
+        like_counts_df,
+        cols_metadata,
+        negative_samples_per_hour,
+        random_seed,
+        negative_sampling_alpha,
     )
+    liked_posts_df = _get_liked_posts_metadata_df(posts_lf, liked_post_uris_df, cols_metadata)
+    posts_core_df = _combine_posts_dfs(negative_posts_df, liked_posts_df, cols_metadata)
 
     # get embedding dim (we need this for later memmap writing, but don't expand here)
     if embed_dim_override is not None:
@@ -875,9 +900,6 @@ def _load_posts_core_polars(
     else:
         embed_dim = get_embed_dim_fn(posts_lf, embedding_model)
     logger.info(f"Detected embedding dimension: {embed_dim}")
-
-    # Collect metadata (small - no embeddings)
-    posts_core_df = negs_and_likes_lf.collect(engine="streaming")
 
     # Convert timestamps after sampling so the full posts scan can stay string-based.
     schema = posts_core_df.schema
@@ -935,6 +957,7 @@ def _load_posts_core_polars(
         'n_random_sample': n_random_sample,
         'n_random_sample_buckets': n_random_sample_buckets,
         'negative_samples_per_hour': negative_samples_per_hour,
+        'negative_sampling_alpha': negative_sampling_alpha,
         'n_posts_core': n_posts_core,
         'embedding_dim': embed_dim,
     }
@@ -989,55 +1012,106 @@ def _get_hourly_sample_rates_df(
     )
 
 
-def _build_posts_candidate_lf(
+def _get_negative_sample_posts(
+    posts_lf: pl.LazyFrame,
+    like_counts_df: pl.DataFrame,
+    cols_metadata: List[str],
+    negative_samples_per_hour: int,
+    random_seed: int,
+    negative_sampling_alpha: float = 0.5,
+) -> pl.DataFrame:
+    posts_with_weights_df = (
+        posts_lf
+        # Select only required metadata columns for further processing
+        .select(cols_metadata)
+        .with_columns(
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("negative_hour_bucket"),
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket
+        .join(
+            like_counts_df.lazy(),
+            left_on="at_uri",
+            right_on="subject_uri",
+            how="inner",
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count
+        .with_columns(
+            (
+                (pl.col("count") ** negative_sampling_alpha) /
+                (pl.col("count") ** negative_sampling_alpha).sum().over("negative_hour_bucket")
+            ).alias("_negative_sample_weight")
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _negative_sample_weight
+        .with_columns(
+            pl.col("_negative_sample_weight").cum_sum().over("negative_hour_bucket").alias("_cum_sample_weight")
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _negative_sample_weight, _cum_sample_weight
+        .sort(["negative_hour_bucket", "_cum_sample_weight"])
+        .collect(engine="streaming")
+    )
+
+    hour_buckets = posts_with_weights_df["negative_hour_bucket"].unique().to_list()
+    rng = np.random.default_rng(random_seed)
+    rand_df = pl.DataFrame({
+        "negative_hour_bucket": [hb for hb in hour_buckets for _ in range(negative_samples_per_hour)],
+        "_rand_val": rng.random(len(hour_buckets) * negative_samples_per_hour),
+    }).sort(["negative_hour_bucket", "_rand_val"])
+
+    return (
+        rand_df
+        .join_asof(
+            posts_with_weights_df,
+            left_on="_rand_val",
+            right_on="_cum_sample_weight",
+            by="negative_hour_bucket",
+            strategy="forward",
+        ) # negative_hour_bucket, _rand_val, at_uri, record_created_at, did, record_text, count, _negative_sample_weight, _cum_sample_weight
+        .drop(["_rand_val", "count", "_negative_sample_weight", "_cum_sample_weight"])
+        .with_columns(
+            pl.lit(False).alias("is_liked"),
+            pl.lit(True).alias("in_random_sample"),
+        ) # negative_hour_bucket, at_uri, record_created_at, did, record_text, is_liked, in_random_sample
+    )
+
+
+def _get_liked_posts_metadata_df(
     posts_lf: pl.LazyFrame,
     liked_post_uris_df: pl.DataFrame,
-    bucket_sample_rates_df: pl.DataFrame,
-    random_seed: int,
     cols_metadata: List[str],
-) -> pl.LazyFrame:
+) -> pl.DataFrame:
     """
-    Build the posts candidate set by sampling random posts and including all liked posts.
-
     Only selects metadata columns - embeddings are handled separately at the end of the pipeline.
     """
     return (
         posts_lf
-        # Select only required metadata columns for further processing
-        .select(cols_metadata)
-        # Compute a deterministic pseudo-random hash value for each post URI (for sampling)
-        .with_columns(
-            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("_hour_bucket_key"),
-            (pl.col("at_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)).alias("_hash_score"),
-        )
-        .join(bucket_sample_rates_df.lazy(), on="_hour_bucket_key", how="left")
-        # Left join with liked post URIs to tag which posts are in the users' liked set.
-        # The right side adds a _is_liked=True marker for all liked post URIs.
-        # Note: liked_post_uris_df is already a UNIQUE list of subject_uri's
+        .select(cols_metadata) # at_uri, record_created_at, did, record_text
         .join(
-            liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
+            liked_post_uris_df.with_columns(pl.lit(True).alias("is_liked")).lazy(),
             left_on="at_uri",
             right_on="subject_uri",
-            how="left",
-        )
-        # Two new columns:
-        #  - in_random_sample: Is this post selected via random hash-sampling (<= threshold)?
-        #  - is_liked: Is this post present in users' likes? Nulls -> False (not liked)
+            how="inner",
+        ) # at_uri, record_created_at, did, record_text, is_liked
         .with_columns(
-            (pl.col("_hash_score") < pl.col("_sample_probability").fill_null(0.0)).alias("in_random_sample"),
-            pl.col("_is_liked").fill_null(False).alias("is_liked"),
+            pl.lit(False).alias("in_random_sample"),
+            pl.lit(None).alias("negative_hour_bucket"),
+        ) # at_uri, record_created_at, did, record_text, is_liked, in_random_sample, negative_hour_bucket
+        .collect(engine="streaming")
+    )
+
+
+def _combine_posts_dfs(
+    negative_posts_df: pl.DataFrame,
+    liked_posts_df: pl.DataFrame,
+    cols_metadata: list[str],
+) -> pl.DataFrame:
+    return (
+        pl
+        .concat([
+            negative_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"]),
+            liked_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"]),
+        ])
+        .group_by(cols_metadata)
+        .agg(
+            pl.col("is_liked").any(),
+            pl.col("in_random_sample").any(),
+            pl.col("negative_hour_bucket").drop_nulls().first(),
         )
-        .with_columns(
-            pl.when(pl.col("in_random_sample"))
-            .then(pl.col("_hour_bucket_key"))
-            .otherwise(None)
-            .alias("negative_hour_bucket")
-        )
-        # Only keep posts that are either in the random sample, or are users' liked posts
-        .filter(pl.col("in_random_sample") | pl.col("is_liked"))
-        .unique(subset=['at_uri'])
-        # Drop temporary helper columns before returning
-        .drop(["_is_liked", "_hash_score", "_hour_bucket_key", "_sample_probability"])
     )
 
 
@@ -1066,6 +1140,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     min_likes_per_user = int(args.min_likes_per_user)
     min_author_support = int(args.min_author_support)
     negative_samples_per_hour = int(args.negative_samples_per_hour)
+    negative_sampling_alpha = float(args.negative_sampling_alpha)
+    min_likes_per_negative_post = int(args.min_likes_per_negative_post)
+    if negative_sampling_alpha < 0:
+        raise ValueError("negative_sampling_alpha must be non-negative")
+    if min_likes_per_negative_post < 0:
+        raise ValueError("min_likes_per_negative_post must be non-negative")
     cap_random_seed = int(args.cap_random_seed)
     train_start = _get_train_start(args.train_start, posts_start, likes_start)
     val_start = args.val_start
@@ -1107,6 +1187,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         min_likes_per_user=min_likes_per_user,
         min_author_support=min_author_support,
         negative_samples_per_hour=negative_samples_per_hour,
+        negative_sampling_alpha=negative_sampling_alpha,
+        min_likes_per_negative_post=min_likes_per_negative_post,
         cap_random_seed=cap_random_seed,
         train_start=train_start,
         val_start=val_start,
@@ -1181,6 +1263,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'min_likes_per_user': min_likes_per_user,
             'min_author_support': min_author_support,
             'negative_samples_per_hour': negative_samples_per_hour,
+            'negative_sampling_alpha': negative_sampling_alpha,
+            'min_likes_per_negative_post': min_likes_per_negative_post,
             'cap_random_seed': cap_random_seed,
             'train_start': train_start,
             'val_start': val_start,
@@ -1211,6 +1295,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"settings: max_trainval_users={max_trainval_users}, max_unseen_eval_users={max_unseen_eval_users}, "
         f"max_likes_per_user={max_likes_per_user}, min_likes_per_user={min_likes_per_user}, "
         f"min_author_support={min_author_support}, negative_samples_per_hour={negative_samples_per_hour}, "
+        f"negative_sampling_alpha={negative_sampling_alpha}, min_likes_per_negative_post={min_likes_per_negative_post}, "
         f"skip_embeddings={skip_embeddings}",
         f"inputs: GCS bucket={gcs_bucket}",
         f"N_likes_core: {n_likes}",
@@ -1405,6 +1490,8 @@ def _run_greenearth_pipeline(
     min_likes_per_user: int,
     min_author_support: int,
     negative_samples_per_hour: int,
+    negative_sampling_alpha: float,
+    min_likes_per_negative_post: int,
     cap_random_seed: int,
     train_start: str,
     val_start: Optional[str],
@@ -1494,7 +1581,7 @@ def _run_greenearth_pipeline(
     # PHASE 1: Load and filter likes (no emb_idx yet)
     # ========================================================================
     log_operation_start('Load and filter likes data', '01_GET_DATA', logger)
-    likes_core_df, likes_stats = _load_likes_core_polars(
+    likes_core_df, likes_stats, like_counts_df = _load_likes_core_polars(
         start_str=likes_start,
         end_str=likes_end,
         paths=likes_paths,
@@ -1507,6 +1594,7 @@ def _run_greenearth_pipeline(
         val_start=val_start,
         holdout_start=holdout_start,
         holdout_end=holdout_end,
+        min_likes_per_negative_post=min_likes_per_negative_post,
         logger=logger,
     )
     all_stats['likes'] = likes_stats
@@ -1532,7 +1620,9 @@ def _run_greenearth_pipeline(
         end_str=posts_end,
         liked_post_uris_df=liked_post_uris_df,
         paths=posts_paths,
+        like_counts_df=like_counts_df,
         negative_samples_per_hour=negative_samples_per_hour,
+        negative_sampling_alpha=negative_sampling_alpha,
         embedding_model=embedding_model,
         random_seed=cap_random_seed,
         train_start=train_start,
