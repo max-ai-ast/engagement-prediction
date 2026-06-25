@@ -51,7 +51,7 @@ AGENTS.local.md
 Thumbs.db
 
 # Config
-config.yml
+config*.yml
 
 # Pytest
 .pytest_cache/
