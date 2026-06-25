@@ -1,0 +1,21 @@
+########## high-level ##########
+background: true
+output_dir: "/mnt/data/dave/outputs/"
+experiment_tracker: "clearml"
+start_from: "get_data"
+stop_after: "get_data"
+
+########## 01_get_data ##########
+gcs_bucket: "greenearth-471522-ingex-extract-prod"
+posts_start: "2026-06-20"
+posts_end: "2026-06-24"
+likes_start: "2026-06-20"
+likes_end: "2026-06-24"
+val_start: "2026-06-22"
+holdout_start: "2026-06-23"
+max_trainval_users: 1000
+max_unseen_eval_users: 100
+max_likes_per_user: 16
+negative_samples_per_hour: 10
+min_likes_per_user: 0
+memory_check: "skip"
