@@ -1602,8 +1602,6 @@ def _run_greenearth_pipeline(
         initial_negative_sampling_pct=initial_negative_sampling_pct,
         logger=logger,
     )
-    del like_counts_df
-    gc.collect()
 
     all_stats['likes'] = likes_stats
     n_users_final = likes_core_df['did'].n_unique()
@@ -1640,6 +1638,8 @@ def _run_greenearth_pipeline(
         logger=logger,
         embed_dim_override=embed_dim_override,
     )
+    del like_counts_df
+    gc.collect()
     all_stats['posts'] = posts_stats
     all_stats['embedding_dim'] = embed_dim
     mem_tracker.checkpoint("after_posts_load", quiet=True)
