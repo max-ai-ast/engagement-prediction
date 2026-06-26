@@ -55,11 +55,21 @@ def _write_posts_parquet(tmp_path, rows):
     return path
 
 
-def _like_counts_for_posts(rows, count=100):
+def _prior_likes_for_posts(rows, count=100, popularity_hour_bucket="2024-01-02T00:00:00"):
+    if callable(popularity_hour_bucket):
+        buckets = [popularity_hour_bucket(row) for row in rows]
+    elif isinstance(popularity_hour_bucket, dict):
+        buckets = [popularity_hour_bucket[row["at_uri"]] for row in rows]
+    else:
+        buckets = [popularity_hour_bucket for _ in rows]
     return pl.DataFrame({
         "subject_uri": [row["at_uri"] for row in rows],
-        "count": [count for _ in rows],
-    })
+        "popularity_hour_bucket": buckets,
+        "prior_cumulative_likes": [count for _ in rows],
+    }).with_columns(
+        pl.col("popularity_hour_bucket").str.to_datetime(time_zone="UTC"),
+        pl.col("prior_cumulative_likes").cast(pl.UInt64),
+    )
 
 
 def _split_kwargs(**overrides):
@@ -123,7 +133,7 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     likes_path = _write_likes_parquet(tmp_path, likes_rows)
     logger = logging.getLogger("test_stage_get_data.likes")
 
-    likes_df, stats, like_counts_df = stage_get_data_module._load_likes_core_polars(
+    likes_df, stats = stage_get_data_module._load_likes_core_polars(
         start_str="2024-01-02T00:00:00",
         end_str="2024-01-04T00:00:00",
         paths=[str(likes_path)],
@@ -133,7 +143,6 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
         min_likes_per_user=2,
         random_seed=123,
         **_split_kwargs(),
-        min_likes_per_negative_post=1,
         logger=logger,
     )
 
@@ -147,7 +156,6 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     }
     assert splits_by_uri == {"post:1": "train", "post:2": "val"}
     assert likes_df['did'].n_unique() == 1
-    assert set(like_counts_df["subject_uri"].to_list()) == {"post:1", "post:2", "post:3"}
     buckets_by_uri = {
         row["subject_uri"]: row["like_hour_bucket"]
         for row in likes_df.select(["subject_uri", "like_hour_bucket"]).iter_rows(named=True)
@@ -166,7 +174,7 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
     likes_path = _write_likes_parquet(tmp_path, likes_rows)
     logger = logging.getLogger("test_stage_get_data.likes_cap")
 
-    likes_df, _, _ = stage_get_data_module._load_likes_core_polars(
+    likes_df, _ = stage_get_data_module._load_likes_core_polars(
         start_str="2024-01-01T00:00:00",
         end_str="2024-01-03T00:00:00",
         paths=[str(likes_path)],
@@ -176,7 +184,6 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
         min_likes_per_user=0,
         random_seed=42,
         **_split_kwargs(),
-        min_likes_per_negative_post=1,
         logger=logger,
     )
 
@@ -230,7 +237,7 @@ def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path
     likes_path = _write_likes_parquet(tmp_path, likes_rows)
     logger = logging.getLogger("test_stage_get_data.unseen_splits")
 
-    likes_df, stats, _ = stage_get_data_module._load_likes_core_polars(
+    likes_df, stats = stage_get_data_module._load_likes_core_polars(
         start_str="2024-01-01T00:00:00",
         end_str="2024-01-07T00:00:00",
         paths=[str(likes_path)],
@@ -243,7 +250,6 @@ def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path
             val_start="2024-01-03T00:00:00",
             holdout_start="2024-01-05T00:00:00",
         ),
-        min_likes_per_negative_post=1,
         logger=logger,
     )
 
@@ -279,7 +285,7 @@ def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
     likes_path = _write_likes_parquet(tmp_path, likes_rows)
     logger = logging.getLogger("test_stage_get_data.holdout_end")
 
-    likes_df, _, _ = stage_get_data_module._load_likes_core_polars(
+    likes_df, _ = stage_get_data_module._load_likes_core_polars(
         start_str="2024-01-01T00:00:00",
         end_str="2024-01-07T00:00:00",
         paths=[str(likes_path)],
@@ -292,11 +298,58 @@ def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
             holdout_start="2024-01-05T00:00:00",
             holdout_end="2024-01-05T00:00:00",
         ),
-        min_likes_per_negative_post=1,
         logger=logger,
     )
 
     assert set(likes_df["subject_uri"].to_list()) == {"post:1", "post:2"}
+
+
+def test_prior_cumulative_likes_excludes_same_hour_and_forces_liked_uris(stage_get_data_module):
+    raw_likes_lf = pl.DataFrame([
+        {"did": "user_a", "subject_uri": "post:forced", "record_created_at": "2024-01-02T00:10:00"},
+        {"did": "user_b", "subject_uri": "post:forced", "record_created_at": "2024-01-02T00:20:00"},
+        {"did": "user_c", "subject_uri": "post:forced", "record_created_at": "2024-01-02T01:05:00"},
+        {"did": "user_d", "subject_uri": "post:sampled_only", "record_created_at": "2024-01-02T00:15:00"},
+    ]).lazy()
+    liked_post_uris_df = pl.DataFrame({"subject_uri": ["post:forced"]})
+
+    prior_likes_df = stage_get_data_module._build_prior_cumulative_likes_df(
+        raw_likes_lf=raw_likes_lf,
+        liked_post_uris_df=liked_post_uris_df,
+        random_seed=123,
+        initial_negative_sampling_pct=0.0,
+    )
+
+    assert set(prior_likes_df["subject_uri"].to_list()) == {"post:forced"}
+
+    likes_df = pl.DataFrame({
+        "did": ["target_same", "target_next", "target_later"],
+        "subject_uri": ["post:forced", "post:forced", "post:forced"],
+        "record_created_at": [
+            "2024-01-02T00:30:00",
+            "2024-01-02T01:30:00",
+            "2024-01-02T02:30:00",
+        ],
+        "split": ["train", "train", "train"],
+    }).with_columns(
+        pl.col("record_created_at").str.to_datetime(time_zone="UTC")
+    ).with_columns(
+        pl.col("record_created_at").dt.truncate("1h").alias("like_hour_bucket")
+    )
+    enriched_likes_df = stage_get_data_module._add_prior_cumulative_likes_to_likes(
+        likes_df,
+        prior_likes_df,
+    )
+
+    counts_by_did = {
+        row["did"]: row["prior_cumulative_likes"]
+        for row in enriched_likes_df.select(["did", "prior_cumulative_likes"]).iter_rows(named=True)
+    }
+    assert counts_by_did == {
+        "target_same": 0,
+        "target_next": 2,
+        "target_later": 3,
+    }
 
 
 def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_module):
@@ -318,9 +371,10 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
         end_str="2024-01-03T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        like_counts_df=_like_counts_for_posts(posts_rows),
+        prior_likes_df=_prior_likes_for_posts(posts_rows),
         negative_samples_per_hour=len(posts_rows),
         negative_sampling_alpha=0.5,
+        min_likes_per_negative_post=1,
         embedding_model=embedding_model,
         random_seed=11,
         **_split_kwargs(),
@@ -344,12 +398,46 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
     assert "is_liked" in posts_df.columns
     assert "in_random_sample" in posts_df.columns
     assert "negative_hour_bucket" in posts_df.columns
+    assert "prior_cumulative_likes" in posts_df.columns
     assert "split_window" in posts_df.columns
     assert posts_df.schema["negative_hour_bucket"] == pl.Datetime
     assert posts_df["split_window"].unique().to_list() == ["train"]
     assert posts_df.filter(pl.col("at_uri") == "post:1")["is_liked"].all()
     assert posts_df.filter(pl.col("at_uri") == "post:1")["in_random_sample"].all()
     assert posts_df.filter(pl.col("at_uri") == "post:1")["negative_hour_bucket"].null_count() == 0
+
+
+def test_negative_sampling_filters_and_weights_by_prior_counts(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = [
+        {"at_uri": "post:low", "did": "author_low", "record_created_at": "2024-01-01T12:00:00", "record_text": "low", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:mid", "did": "author_mid", "record_created_at": "2024-01-01T12:00:00", "record_text": "mid", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:popular", "did": "author_popular", "record_created_at": "2024-01-01T12:00:00", "record_text": "popular", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+    ]
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    prior_likes_df = pl.DataFrame({
+        "subject_uri": ["post:low", "post:mid", "post:popular"],
+        "popularity_hour_bucket": ["2024-01-02T05:00:00", "2024-01-02T05:00:00", "2024-01-02T05:00:00"],
+        "prior_cumulative_likes": [4, 6, 1_000_000],
+    }).with_columns(
+        pl.col("popularity_hour_bucket").str.to_datetime(time_zone="UTC"),
+        pl.col("prior_cumulative_likes").cast(pl.UInt64),
+    )
+
+    posts_df = stage_get_data_module._get_negative_sample_posts(
+        posts_lf=pl.scan_parquet(str(posts_path)),
+        prior_likes_df=prior_likes_df,
+        cols_metadata=["at_uri", "record_created_at", "did", "record_text"],
+        negative_samples_per_hour=1,
+        random_seed=33,
+        negative_sampling_alpha=1.0,
+        min_likes_per_negative_post=5,
+    )
+
+    assert posts_df["at_uri"].to_list() == ["post:popular"]
+    assert posts_df["prior_cumulative_likes"].to_list() == [1_000_000]
+    assert posts_df["negative_hour_bucket"].to_list()[0].isoformat() == "2024-01-02T05:00:00+00:00"
+    assert posts_df["record_created_at"].to_list() == ["2024-01-01T12:00:00"]
 
 
 def test_load_posts_liked_always_included_with_null_negative_bucket(tmp_path, stage_get_data_module):
@@ -365,9 +453,10 @@ def test_load_posts_liked_always_included_with_null_negative_bucket(tmp_path, st
         end_str="2024-01-03T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        like_counts_df=_like_counts_for_posts(posts_rows),
+        prior_likes_df=_prior_likes_for_posts(posts_rows),
         negative_samples_per_hour=0,
         negative_sampling_alpha=0.5,
+        min_likes_per_negative_post=1,
         embedding_model=embedding_model,
         random_seed=21,
         **_split_kwargs(),
@@ -380,6 +469,7 @@ def test_load_posts_liked_always_included_with_null_negative_bucket(tmp_path, st
     assert posts_df.filter(pl.col("at_uri") == "post:5")["is_liked"].all()
     assert posts_df["in_random_sample"].sum() == 0
     assert posts_df["negative_hour_bucket"].null_count() == posts_df.height
+    assert posts_df["prior_cumulative_likes"].null_count() == posts_df.height
     assert stats["n_liked_posts"] == 2
     
     # emb_idx should NOT be present (added later by memmap write)
@@ -407,9 +497,13 @@ def test_load_posts_samples_approximately_per_hour(tmp_path, stage_get_data_modu
         end_str="2024-01-02T02:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        like_counts_df=_like_counts_for_posts(posts_rows),
+        prior_likes_df=_prior_likes_for_posts(
+            posts_rows,
+            popularity_hour_bucket=lambda row: f"2024-01-02T{int(row['at_uri'].split(':')[1]):02d}:00:00",
+        ),
         negative_samples_per_hour=10,
         negative_sampling_alpha=0.5,
+        min_likes_per_negative_post=1,
         embedding_model=embedding_model,
         random_seed=33,
         **_split_kwargs(),
@@ -425,8 +519,8 @@ def test_load_posts_samples_approximately_per_hour(tmp_path, stage_get_data_modu
     assert 10 <= posts_df.height <= 30
     assert stats["n_random_sample"] == posts_df.height
     assert stats["n_random_sample_buckets"] == 2
-    assert random_counts["len"].min() > 0
-    assert random_counts["len"].max() <= 20
+    assert random_counts["len"].min() == 10
+    assert random_counts["len"].max() == 10
 
 
 def test_load_posts_adds_split_window_and_filters_holdout_end(tmp_path, stage_get_data_module):
@@ -447,9 +541,10 @@ def test_load_posts_adds_split_window_and_filters_holdout_end(tmp_path, stage_ge
         end_str="2024-01-07T00:00:00",
         liked_post_uris_df=liked_post_uris_df,
         paths=[str(posts_path)],
-        like_counts_df=_like_counts_for_posts(posts_rows),
+        prior_likes_df=_prior_likes_for_posts(posts_rows),
         negative_samples_per_hour=len(posts_rows),
         negative_sampling_alpha=0.5,
+        min_likes_per_negative_post=1,
         embedding_model=embedding_model,
         random_seed=33,
         **_split_kwargs(
@@ -490,11 +585,12 @@ def test_load_posts_rejects_non_string_record_created_at(tmp_path, stage_get_dat
                 end_str=None,
                 liked_post_uris_df=liked_post_uris_df,
                 paths=[str(posts_path)],
-                like_counts_df=_like_counts_for_posts([{
+                prior_likes_df=_prior_likes_for_posts([{
                     "at_uri": "post:1",
                 }]),
                 negative_samples_per_hour=1,
                 negative_sampling_alpha=0.5,
+                min_likes_per_negative_post=1,
                 embedding_model=embedding_model,
             random_seed=33,
             **_split_kwargs(),

@@ -66,8 +66,8 @@ DEFAULTS: Dict[str, Any] = {
     "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
     "negative_samples_per_hour": 1000,  # Stage 1: random posts per hour for negative cases
     "negative_sampling_alpha": 0.5,  # Stage 1: popularity weighting exponent for negative sampling
-    "min_likes_per_negative_post": 50,  # Stage 1: minimum global likes for negative-sampling candidates
-    "initial_negative_sampling_pct": 0.1,  # Stage 1: initial sampling rate before aggregating like counts for negs
+    "min_likes_per_negative_post": 50,  # Stage 1: minimum prior-hour likes for negative-sampling candidates
+    "initial_negative_sampling_pct": 0.1,  # Stage 1: initial post sampling rate before aggregating prior like counts for negs
     "cap_random_seed": 42,
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
@@ -803,9 +803,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--negative-sampling-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="Popularity weighting exponent for negative sampling in Stage 1")
     _add_arg_with_default(p_all, "--min-likes-per-negative-post", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum global like count for posts eligible for negative sampling in Stage 1")
+                          help_text="Minimum prior-hour like count for posts eligible for negative sampling in Stage 1")
     _add_arg_with_default(p_all, "--initial-negative-sampling-pct", type=float, default=argparse.SUPPRESS,
-                          help_text="Initial downsampling rate before counting likes per post to sample as negs in Stage 1")
+                          help_text="Initial post downsampling rate before counting prior likes for negative sampling in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
     _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
