@@ -41,7 +41,7 @@ def _make_mlp(
 
 
 def _matrix_batch() -> dict:
-    return {
+    batch = {
         "history_embeddings": torch.tensor(
             [
                 [[1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0], [0.0, 0.0, 0.0, 0.0]],
@@ -74,6 +74,8 @@ def _matrix_batch() -> dict:
         "user_id": ["u1", "u2"],
         "bucket": "2026-05-01T00:00:00Z",
     }
+    batch["candidate_valid_mask"] = torch.ones_like(batch["label_matrix"], dtype=torch.bool)
+    return batch
 
 
 def _matrix_batch_with_authors() -> dict:
@@ -186,7 +188,7 @@ def test_all_positive_candidate_rows_have_valid_ap_and_undefined_auc():
         dtype=torch.float32,
     )
 
-    rows = ranking_rows_for_batch(batch, scores, labels, [1, 2])
+    rows = ranking_rows_for_batch(batch, scores, labels, [1, 2], torch.ones_like(labels, dtype=torch.bool))
 
     assert rows[0]["average_precision"] == pytest.approx(1.0)
     assert rows[0]["auc_roc"] is None
@@ -297,6 +299,7 @@ def test_mlp_compute_loss_rejects_rows_without_positives():
         ],
         dtype=torch.float32,
     )
+    batch["candidate_valid_mask"] = torch.ones_like(batch["label_matrix"], dtype=torch.bool)
 
     with pytest.raises(RuntimeError, match="at least one positive"):
         model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)

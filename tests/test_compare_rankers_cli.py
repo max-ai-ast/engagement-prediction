@@ -257,7 +257,11 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
             return {"row_idx": idx}
 
         def collate_batch(self, items):
-            return {"label_matrix": torch.tensor([[1.0, 0.0]], dtype=torch.float32)}
+            labels = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+            return {
+                "label_matrix": labels,
+                "candidate_valid_mask": torch.ones_like(labels, dtype=torch.bool),
+            }
 
     class FakeTwoTowerAdapter:
         def __init__(self, checkpoint_path):
