@@ -1209,6 +1209,9 @@ def _get_negative_sample_posts(
     )
     liked_marker_lf = (
         liked_post_uris_df
+        .rename({
+            "subject_uri": "at_uri",
+        })
         .with_columns(pl.lit(True).alias("is_liked"))
         .lazy()
     )
