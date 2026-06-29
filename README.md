@@ -1,298 +1,324 @@
-### Contributing
+# Engagement Prediction
 
-Interested in contributing? We'd love to have you! 
+This repo trains and evaluates engagement rankers for Bluesky posts. The active workflow is a four-stage artifact pipeline:
 
-First, please join our discord and introduce yourself: https://discord.com/invite/8bWEyrkrJC. Unless you've joined the discord and engaged with the community there, all issues/PRs will be auto-closed.
+1. `01_get_data`: load Ingex parquet data, split likes into train/validation/holdout windows, write post embeddings and compact core tables.
+2. `02_user_history`: build per-user, per-hour history lists for model training.
+3. `03_train`: train an MLP, two-tower, or BST ranker.
+4. `04_evaluate`: run holdout evaluation modules from ranking-row artifacts written by Stage 3.
 
-### Engagement Prediction (Modular Workflow)
+The historical featurize/relevel/split workflow is not part of the active branch.
 
-This repository implements a six-stage modular pipeline to predict engagement on Bluesky posts with minimal duplication of work and fast iteration for releveling experiments.
+## Setup
 
-New design goals:
-- Compute and cache all post embeddings up front (text and images) once per time window.
-- Perform releveling and user splitting as a separate, iterative step without recomputing embeddings.
-- Reuse the same user-featurization logic in both training and evaluation.
-- Support multiple model architectures (MLP and Two-Tower) for comparison.
+Install conda, then create the pinned environment:
 
-### Setup instructions
-1. Install conda (recommended: Miniforge).  
+```bash
+conda-lock install -n eng-pred conda-lock.yml
+conda activate eng-pred
+python -c "import torch; print(torch.__version__)"
+```
 
-    We recommend Miniforge, a minimal conda distribution that defaults to conda-forge.  
-    Download from: https://github.com/conda-forge/miniforge
-
-    Follow the installer for your platform. Restart your shell after installation
-
-    Verify:
-
-    ```bash
-    conda --version
-    ```
-
-    You might have to activate conda from the install location e.g.:
-    ```bash
-    source /opt/miniconda3/bin/activate
-    ```
-
-2. Install conda-lock
-
-    Install conda-lock into your base environment:
-
-    ```bash
-    conda install -n base conda-lock
-    ```
-    Verify:
-    ```bash
-    conda-lock --version
-    ```
-
-3. Create the environment from the lock file and activate it
-
-    This installs exactly the pinned dependencies known to work. You can name your environment whatever you like, e.g. "eng-pred":
-    ```bash
-    conda-lock install -n eng-pred conda-lock.yml
-    conda activate eng-pred
-    ```
-
-4. Sanity check
-    ```bash
-    python -c "import torch; print(torch.__version__)"
-    ```
-
-If you modify or add new dependencies, please update environment.yml to reflect the change. Also please update environment.ci.yml. (The latter is the environment file for running tests in github actions. It does not include the large CUDA dependencies because the server that runs the tests does not have a GPU, and they would significantly increase the time to run the tests. The github actions CI will fail if environment.yml and environment.ci.yml are not in sync (see `scripts/check_env_sync.py`)). Then regenerate the conda-lock files for both environments:
+If dependencies change, update both `environment.yml` and `environment.ci.yml`, then regenerate lock files:
 
 ```bash
 conda-lock -f environment.yml -p linux-64 --mamba --lockfile conda-lock.yml
 conda-lock -f environment.ci.yml -p linux-64 --mamba --lockfile conda-lock.ci.yml
 ```
 
-5. Experiment tracking setup
-   The only currently implemented experiment tracker is ClearML. If you'd like to use it, make sure you have ClearML installed (it should be installed via the conda-lock above), and run `clearml-init` in the repo. 
+ClearML is the implemented experiment tracker. To use it, run `clearml-init` after activating the environment. For local or test runs without ClearML, pass `--experiment-tracker none`.
 
-### Testing
-This repo utilizes `pytest`. To run the tests locally, simply run the `pytest` command. The tests will automatically be run in github actions for all commits to `main` or any pull request (see `.github/workflows/ci.yml`). The default behavior is to store tmp files in the `/tmp/pytest-of-{username}` directory. To use the current directory, instead run:
+## Testing
+
+Run tests from this directory with the project conda environment:
 
 ```bash
-TMPDIR=$PWD pytest
+conda run -n eng-pred pytest -q
 ```
-Tests all reside in the `tests/` directory and should use the file naming convention: `test_*.py`.
 
-### Repository layout (stages under `utils/`)
+To keep pytest temporary files inside the repo:
 
-- `utils/01_get_data/stage_get_data.py`: Stage 1 — Load most recent parquet dumps from Green Earth Ingex or Spaces and save a compact raw bundle.
-- `utils/02_featurize/stage_featurize.py`: Stage 2 — Build candidate post set and compute text+image embeddings → save `embedding_bundle_*.pkl`.
-- `utils/03_relevel/stage_relevel_uniform.py`: Stage 3 — Discover topics and compute per-user mixtures; optional uniform-mixture-balanced relevel selection.
-- `utils/04_split/stage_split_users.py`: Stage 4 — Produce `user_splits.json` (train/val/holdout).
-- `utils/04_train/stage_train_mlp.py`: Stage 4 (MLP) — Train MLP model using bundle + splits; saves checkpoint and `training_config.json`.
-- `utils/04_train/stage_train_two_tower.py`: Stage 4 (Two-Tower) — Train two-tower model with user history full-transformer encoder.
-- `utils/06_evaluate/stage_evaluate.py`: Stage 6 — Consolidated evaluation (pairs, matrix, global_unliked).
-- `utils/00_helpers/helpers.py`: Minimal cross-stage helpers (re-exported from existing modules).
-- `utils/pipeline/{core.py, registry.py}`: Context, timestamped output dirs, and stage registry.
+```bash
+TMPDIR=$PWD conda run -n eng-pred pytest -q
+```
 
-Shared utilities remain:
-- `utils/user_features.py`: Shared user-featurization (topic_mixture, multi_centroid, mean)
-- `utils/data_utils_with_images.py`, `utils/train_test_helpers.py`, `utils/visual_helpers.py`: Data I/O, modeling, plotting helpers
+Tests live under `tests/` and use the `test_*.py` naming convention.
 
-Legacy scripts (still available, not recommended for the new workflow): `src/preprocess.py` and old CLI flows; the old run-all flow is defunct.
+## Repository Layout
 
-### Model Architectures
+- `cli.py`: unified pipeline CLI. `run-all` is implicit, so `python cli.py --config config.yml` and `python cli.py run-all --config config.yml` are both accepted.
+- `compare.py`: checkpoint-backed ranker comparison CLI.
+- `utils/01_get_data/stage_get_data.py`: Stage 1 data ingestion, time-window splits, negative sampling pools, embeddings memmap, author index mapping.
+- `utils/02_user_history/stage_generate_user_history.py`: Stage 2 user-hour history directory with prior embedding ids, author ids, and time-delta features.
+- `utils/03_train/stage_train_mlp.py`: Stage 3 MLP matrix ranker.
+- `utils/03_train/stage_train_two_tower.py`: Stage 3 two-tower matrix ranker.
+- `utils/03_train/stage_train_bst_ranker.py`: Stage 3 BST heavy ranker.
+- `utils/04_evaluate/stage_evaluate.py`: Stage 4 holdout evaluation from compact ranking-row artifacts.
+- `utils/dataloaders.py`: bucketed listwise datasets, samplers, and shared user encoders.
+- `utils/matrix_ranking.py`: shared matrix ranking metrics, final metric logging, and ranking-row writers.
+- `utils/ranking_adapters.py`: `.pth` checkpoint adapters for compare-rankers.
+- `utils/pipeline/{core.py,dependencies.py,registry.py}`: artifact directories, lineage, dependency resolution, and stage registry.
 
-#### MLP Model (default)
-The original architecture using a multi-layer perceptron:
-- User features: Multi-centroid representations (per-user KMeans over liked post embeddings)
-- Post features: Pre-computed text + image embeddings
-- Training: BCE loss with 50/50 balanced positive/negative pairs
+## Running The Pipeline
 
-#### Two-Tower Model
-A retrieval-optimized architecture with separate user and post encoders:
-- **User Tower**: Encodes user preferences from their liked post history using:
-  - Self-attention layers to capture interest patterns
-  - Learnable positional embeddings (recency-aware)
-  - Dual aggregation: attention-weighted pooling + mean pooling
-- **Post Tower**: Projects post embeddings to shared space via MLP
-- **Training**: BCE loss with explicit positive/negative pairs
-
-### Quick start
-
-Below, replace paths with your actual workspace if different.  
-
-The pipeline can be run with command-line args (as in the examples below), or with a YAML config file, e.g.:
+The CLI merges defaults, an optional YAML/JSON config, and explicit command-line flags. CLI flags win over config values.
 
 ```bash
 python cli.py --config config.yml
 ```
 
-Example config file:
+For foreground local iteration:
+
+```bash
+python cli.py --config config.yml --background false --experiment-tracker none
+```
+
+For a small Stage 1 smoke run, see `config_test.yml`.
+
+### Output Layout
+
+By default, outputs are written under `outputs/` in two coordinated views:
+
+- `artifacts/<stage_folder>/<stage_run_id>/`: canonical stage artifacts.
+- `runs/<pipeline_run_id>/<stage_folder>`: symlinks to the canonical artifacts for one pipeline run.
+
+Each stage writes `manifest.json`, `resolved_config.json`, `stage.log`, and `stage_info.txt` when it completes.
+
+### Stage 1: Get Data
+
+Stage 1 reads Ingex parquet data from GCS, applies date filters, splits users and likes, and writes compact artifacts used by all downstream stages.
+
+Common config keys:
+
 ```yaml
-posts_start: "2026-01-04"
-posts_end: "2026-01-04T02:00:00"
-likes_start: "2026-01-04"
-likes_end: "2026-01-04T02:00:00"
-background: false
-output_dir: "/path/to/outputs"
-start_from: "train"
-model_type: "two-tower" 
+gcs_bucket: "greenearth-471522-ingex-extract-prod"
+posts_start: "2026-06-20"
+posts_end: "2026-06-24"
+likes_start: "2026-06-20"
+likes_end: "2026-06-24"
+train_start: "2026-06-20"
+val_start: "2026-06-22"
+holdout_start: "2026-06-23"
+holdout_end: null
+max_trainval_users: 1000
+max_unseen_eval_users: 100
+max_likes_per_user: 16
+negative_samples_per_hour: 10
+min_likes_per_user: 0
+memory_check: "skip"
 ```
 
-1) Stage 1 — Get data (creates a run dir)  
-The default behavior is to use data from [Green Earth ingex](https://github.com/greenearth-social/ingex) with date filters. For example:
+Important Stage 1 behavior:
+
+- `max_likes_per_user` applies a deterministic random per-user cap.
+- `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
+- `max_unseen_eval_users` samples users used only for unseen validation and holdout.
+- `negative_samples_per_hour` controls the same-hour post pool used for matrix ranker training.
+- `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
+
+Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
+
+### Stage 2: User History
+
+Stage 2 creates `history_posts_*.parquet`, keyed by `(did, like_hour_bucket)`.
+
+The history artifact includes:
+
+- `prior_emb_indices`: prior liked post embedding ids, sorted most-recent first.
+- `prior_like_age_hours_at_bucket_start`: age of each prior like relative to the target hour bucket, aligned with `prior_emb_indices`.
+- `prior_author_indices`: aligned author ids when Stage 1 wrote author metadata.
+- `raw_prior_count`: uncapped count before `max_prior_likes`.
+
+Common config:
+
+```yaml
+max_prior_likes: 64
+```
+
+### Stage 3: Training
+
+All active model types use the same Stage 1/2 artifact contract and bucketed same-hour candidates.
+
+Shared training options:
+
+```yaml
+model_type: "two-tower" # mlp, two-tower, or bst-ranker
+max_history_len: 64
+epochs: 100
+batch_size: 128
+learning_rate: 3e-4
+patience: 10
+early_stopping_min_delta: 0.002
+metrics_top_ks: [30]
+num_dataloader_workers: 4
+dataloader_pin_memory: true
+dataloader_prefetch_factor: 1
+dataloader_persistent_workers: false
+```
+
+#### MLP
+
+The MLP path scores the full user-by-candidate matrix for each hour bucket. It supports `summarized`, `full_transformer`, and `cross_attention` user encoders.
+
 ```bash
-python cli.py --use-latest \
-  --posts-start 2026-01-04 --posts-end 2026-01-04T06:00:00 --likes-start 2026-01-04 --likes-end 2026-01-04T06:00:00
+python cli.py --model-type mlp --user-encoder summarized --stop-after train
 ```
-Note that there is a default GCS Bucket but it can also be overridden using `--gcs-bucket`. To use Digital Ocean Spaces data instead, specify the data source, e.g.:
+
+Useful options:
+
+- `--hidden-dims`
+- `--dropout-rate-mlp`
+- `--user-summarization mean|ema|linear_recency`
+- `--ema-alpha`
+
+#### Two-Tower
+
+The two-tower path independently encodes users and candidate posts, then scores with a dot product over the shared embedding space. It supports `full_transformer` and `cross_attention` user encoders.
+
 ```bash
-python cli.py --use-latest \
-  --data-source digitalocean --max-files-per-table 5 --max-posts-per-author 3 --image-mode auto
+python cli.py --model-type two-tower --user-encoder cross_attention --stop-after train
 ```
-Creates a run directory like `outputs/<timestamp>_run_d<files>_mppa<cap>/` 
-2) Stage 2 - Featurize, saves `featurize/embedding_bundle_<timestamp>.pkl` with:
-- `posts_emb_df` (post_emb_* and image_emb_* columns)
-- `likes_df`
-- `join_like`, `join_post`, `text_column`, `author_column`
-- `embedding_dim`, `image_mode`, `embedding_model`, metadata  
 
-If `--data-source` is `greenearth`, embeddings are assumed to already exist and just need to be extracted. If `--data-source` is `digitalocean`, embeddings are computed.
+Useful options:
 
-3) Stage 3 — Relevel users (iterate here without recomputing embeddings)
+- `--shared-dim`
+- `--user-hidden-dim`
+- `--post-hidden-dim`
+- `--num-attention-heads`
+- `--num-attention-layers`
+- `--l2-normalize-embeddings`
+- `--similarity-temperature`
+- `--use-author-embedding-table`
+
+Two-tower training writes checkpoint files, `training_config.json`, `training_results.json`, TorchScript tower artifacts, a serving manifest, and holdout ranking rows under `eval/`.
+
+#### BST Ranker
+
+The BST ranker fuses content embeddings, author embeddings, time-delta buckets, and a candidate-aware transformer. It currently requires author embeddings.
+
 ```bash
-# via run-all or directly calling the stage script; parameters still accepted
+python cli.py --model-type bst-ranker \
+  --use-author-embedding-table \
+  --prediction-hidden-dims 64 32 16 \
+  --stop-after train
 ```
-Saves under the run directory in `relevel/`:
-- `user_topic_mixtures.parquet`, optional `topic_model.pkl` and `topic_pca.pkl`
-- optional `retained_users.json` when using uniform-mixture-balanced selection
 
-4) Stage 4 — Split users → `user_splits.json`
+BST training uses matrix ranking over same-hour candidate sets with additional sampled negatives. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
 
-5) Stage 5 — Train using the bundle + splits
+Useful options:
+
+- `--bst-additional-batch-negatives`
+- `--content-projection-dim`
+- `--author-projection-dim`
+- `--bst-model-dim`
+- `--bst-time-embedding-dim`
+- `--bst-num-attention-heads`
+- `--bst-num-transformer-layers`
+- `--bst-transformer-ff-dim`
+- `--bst-dropout-rate`
+- `--bst-time-delta-bucket-boundaries-hours`
+- `--bst-max-train-batches-per-epoch`
+
+Current branch note: BST training writes train/validation metrics and checkpoints, but Stage 4 evaluation expects holdout ranking-row artifacts. Until BST holdout ranking rows are wired in, use `--stop-after train` for BST runs and compare checkpoints with `compare-rankers`.
+
+### Stage 4: Evaluate
+
+Stage 4 consumes holdout ranking rows from Stage 3:
+
+```text
+03_train/<stage_run_id>/eval/holdout_unseen_users_ranking_rows.parquet
+03_train/<stage_run_id>/eval/holdout_seen_users_ranking_rows.parquet
+```
+
+Run the full pipeline for MLP or two-tower:
+
 ```bash
-# orchestrated via run-all; training dir: <run_dir>/train/<timestamp>/
+python cli.py --model-type two-tower --user-encoder cross_attention
 ```
-Notes:
-- Training allocates each user's liked posts into embedding vs target sets, builds user features from embedding posts, and creates balanced positive/negative target pairs.
-- The model checkpoint saves the feature schema for evaluation to match dimensions.
 
-6) Stage 6 — Evaluation (no embedding recompute)
+Or evaluate a pinned training output:
+
 ```bash
-# via consolidated stage_evaluate.py (modes: pairs | matrix | global_unliked)
+python cli.py --start-from evaluate --prior-03-train 20260620_120000_train_two_tower
 ```
-Outputs:
-- Probability matrix `.npz`, optional balanced eval set `.npz`, metrics JSON, and plots under `outputs/.../evaluate/` or `outputs/full_feed_similarity/<timestamp>/`.
 
-### User feature schemas (MLP model only)
-- `topic_mixture`: Requires a KMeans topic model (and optional PCA) from Stage 2; user features are per-like topic mixtures.
-- `multi_centroid`: Per-user MiniBatchKMeans over embedding-capable liked posts; exports K centroids and weights.
-- `mean`: Mean embedding of embedding-capable liked posts.
+Useful options:
 
-The shared implementation lives in `utils/user_features.py` and is used consistently in training and evaluation.
+- `--eval-holdout-type unseen_users|seen_users`
+- `--skip-modules cold_start_curves,performance_inequality`
+- `--prior-03-train`
 
-### Important flags and tips
-- Image embeddings: Ensure the `--image-mode` choice at Stage 1 matches expectations at training/evaluation (dimension consistency is enforced).
-- Device: Most scripts accept `--device cuda` when available.
-- Reproducibility: Set seeds via `--cap-random-seed` (Stage 1/4) and `--random-seed` (Stage 2/3).
-- Outputs:
-  - Stage 1: `outputs/precompute/<timestamp>/embedding_bundle_<timestamp>.pkl`
-  - Stage 2: `outputs/relevel/<timestamp>/{user_splits.json, topic_model.pkl, topic_pca.pkl}`
-  - Stage 3: `outputs/checkpoints/engagement_model_<timestamp>.pth`, plus logs/plots
-  - Stage 4: `outputs/.../evaluate/<timestamp>_*` and `outputs/full_feed_similarity/<timestamp>/`
+## Compare Rankers
 
-### Legacy workflow
-The previous `src/preprocess.py` → `src/train.py` → `src/evaluate_full_feed_similarity.py` flow that recomputed embeddings during evaluation is still supported for compatibility, but the new four-stage workflow above is recommended.
+`compare-rankers` evaluates saved `.pth` checkpoints on shared bucketed candidate sets without rerunning training.
 
-### End-to-end execution
-
-#### MLP Model (default)
-Run all six stages with the default MLP architecture:
 ```bash
-python cli.py --user-encoder summarized \
-  --max-files-per-table 7 --max-posts-per-author 3 --image-mode auto \
-  --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10 \
-  --epochs 300 --batch-size 256 --device cuda
+python cli.py compare-rankers \
+  --output-dir /mnt/data/dave/outputs \
+  --prior-01-get-data 20260617_205310_fec862c8 \
+  --prior-02-user-history 20260618_095653_14c6b8fc \
+  --model tt:two-tower:/path/to/two_tower.pth \
+  --model bst:bst-ranker:/path/to/bst_ranker.pth \
+  --splits val val_unseen_users holdout_unseen_users \
+  --metrics-top-ks 30 \
+  --batch-size 256 \
+  --device cuda
 ```
 
-MLP supports `summarized`, `full_transformer`, and `cross_attention` user encoders.
-The learned encoder modes use the sequence dataset and feed the learned user vector
-into the MLP head.
+Compare outputs are written under `artifacts/compare_rankers/<stage_run_id>/`:
 
-#### Two-Tower Model
-Run all six stages with the two-tower architecture:
+- `metrics.json`
+- `metrics.csv`
+- `model_specs.json`
+- `stage_info.txt`
+- `stage.log`
+
+Current compare-rankers assumptions:
+
+- Model specs use `name:type:path`.
+- Supported types are `two-tower` and `bst-ranker`.
+- Compared checkpoints must use author embeddings.
+- If compared checkpoints use different `max_history_len` values, pass `--max-history-len` to choose the evaluation history length.
+- BST checkpoints are scored with the optimized one-layer matrix scorer.
+
+## Selective Reruns And Prior Pins
+
+Use `--start-from`, `--stop-after`, and prior pins to reuse artifacts:
+
 ```bash
-python cli.py --model-type two-tower --user-encoder full_transformer \
-  --max-files-per-table 7 --max-posts-per-author 3 --image-mode auto \
-  --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10 \
-  --epochs 100 --batch-size 256 --device cuda
+python cli.py --config config.yml \
+  --start-from train \
+  --stop-after train \
+  --prior-01-get-data 20260617_205310_fec862c8 \
+  --prior-02-user-history 20260618_095653_14c6b8fc
 ```
 
-Two-tower specific options:
-- `--model-type two-tower`: Use the two-tower architecture instead of MLP
-- `--user-encoder full_transformer`: User encoder type (`summarized`, `full_transformer`, or `cross_attention`)
-- `--shared-dim 128`: Output embedding dimension for both towers
-- `--num-attention-heads 4`: Number of attention heads in user history encoder
-- `--num-attention-layers 2`: Number of transformer layers in user history encoder
-- `--max-history-len 20`: Maximum number of liked posts per user for history encoding
+Accepted stage aliases:
 
-#### Train-Eval with Two-Tower
-Train a two-tower model on an existing run directory:
+- `get_data`
+- `user_history`
+- `train`, `train_mlp`, `train_two_tower`, `train_bst_ranker`
+- `evaluate`
+
+Prior pins can be stage run ids under `artifacts/<stage_folder>/`, absolute paths, or paths relative to `output_dir`.
+
+## Background Runs
+
+By default, `config.yml` may set `background: true`. In background mode, the CLI writes `run-all.resolved-config.json` and starts a foreground child process with `nohup`.
+
+Run in the foreground while iterating:
+
 ```bash
-python cli.py train-eval --model-type two-tower --user-encoder full_transformer \
-  --run-dir outputs/20231215_run_d7_mppa3/ \
-  --epochs 100 --batch-size 256 --device cuda
+python cli.py --config config.yml --background false
 ```
 
-Or with explicit paths:
-```bash
-python cli.py train-eval --model-type two-tower --user-encoder full_transformer \
-  --embedding-bundle outputs/run/02_featurize/embedding_bundle_*.pkl \
-  --user-splits outputs/run/04_split/user_splits.json \
-  --shared-dim 256 --num-attention-heads 8 --max-history-len 50
-```
+## Development Notes
 
-#### Standalone Two-Tower Training
-The two-tower module can also be run directly:
-```bash
-python utils/05_train/stage_train_two_tower.py \
-  --embedding-bundle path/to/embedding_bundle.pkl \
-  --user-splits path/to/user_splits.json \
-  --epochs 100 --device cuda
-```
+- Keep Stage 1/2 artifact schemas stable when possible; all model types share them.
+- Use `utils/matrix_ranking.py` for matrix ranking metrics and ranking-row writes.
+- Use `utils/ranking_adapters.py` when adding checkpoint-backed comparison support.
+- Avoid adding new training paths without registering them in `utils/pipeline/registry.py` and documenting their artifact contract here.
 
-By default, the pipeline runs in the foreground. Use `--background` to run with nohup and write a log under `outputs/run-all_<ts>.log` (mirrored to `<run_dir>/run-all.log` once the run directory is created).
+## Contributing
 
-### Two-Tower Output Structure
-
-Two-tower training outputs:
-```
-05_train/<timestamp>/
-├── checkpoints/
-│   ├── two_tower_<ts>.pth
-│   └── two_tower_best.pth
-├── plots/
-│   ├── training_history_<ts>.png
-│   ├── val_performance_<ts>.png
-│   └── holdout_performance_<ts>.png
-├── predictions/
-│   ├── train.parquet
-│   ├── val.parquet
-│   ├── holdout_unseen_users.parquet
-│   └── holdout_seen_users.parquet    (only if holdout_start was configured)
-├── training_config.json
-└── stage_info.txt
-```
-
-### Testing
-Use `pytest` for lightweight tests where available.
-```bash
-pip install -r requirements.txt pytest
-pytest -q
-```
-
-# Specific Testing Examples
-
-Two-tower model:
-```bash
-python cli.py --model-type two-tower --user-encoder full_transformer   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
-```
-
-MLP model:
-```bash
-python cli.py --model-type mlp --user-encoder summarized   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
-```
+Interested in contributing? Please join the Discord and introduce yourself first: https://discord.com/invite/8bWEyrkrJC.

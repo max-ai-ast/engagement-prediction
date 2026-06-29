@@ -16,9 +16,11 @@ Inputs:
 
 Outputs under <run_dir>/02_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
-  {did, like_hour_bucket, prior_emb_indices} and, when author_idx is available,
-  {prior_author_indices}
+  {did, like_hour_bucket, prior_emb_indices, prior_like_age_hours_at_bucket_start}
+  and, when author_idx is available, {prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
+  prior_like_age_hours_at_bucket_start is a List[Float32] aligned element-wise with
+  prior_emb_indices and measured from the target like_hour_bucket,
   prior_author_indices is a List[UInt32] aligned element-wise with
   prior_emb_indices, and user-hour rows where the user has no prior likes in
   the dataset get empty lists.
@@ -64,7 +66,8 @@ def _build_user_history_directory(
         logger: Logger instance
 
     Returns:
-        LazyFrame with columns [did, like_hour_bucket, prior_emb_indices, raw_prior_count]
+        LazyFrame with columns [did, like_hour_bucket, prior_emb_indices, raw_prior_count,
+        prior_like_age_hours_at_bucket_start]
         where raw_prior_count is the uncapped number of prior likes (for distribution analysis).
     """
     logger.info("Building user history directory...")
@@ -90,6 +93,15 @@ def _build_user_history_directory(
             how="left"
         )
         .filter(pl.col(TIMESTAMP_COL_NAME) < pl.col("like_hour_bucket"))
+        .with_columns(
+            (
+                (pl.col("like_hour_bucket") - pl.col(TIMESTAMP_COL_NAME))
+                .dt.total_seconds()
+                / 3600.0
+            )
+            .cast(pl.Float32)
+            .alias("prior_like_age_hours_at_bucket_start")
+        )
     ) # [did, like_hour_bucket, record_created_at, emb_idx, (author_idx)]
 
     def _get_agg_expr(col_name: str):
@@ -106,6 +118,7 @@ def _build_user_history_directory(
     agg_exprs = [
         _get_agg_expr("emb_idx").alias("prior_emb_indices"),
         pl.len().alias("raw_prior_count"),
+        _get_agg_expr("prior_like_age_hours_at_bucket_start").alias("prior_like_age_hours_at_bucket_start"),
     ]
     if include_author_idx:
         agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
@@ -126,8 +139,12 @@ def _build_user_history_directory(
             .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
             .alias("prior_emb_indices"),
             pl.col("raw_prior_count").fill_null(0),
+            pl.when(pl.col("prior_like_age_hours_at_bucket_start").is_null())
+            .then(pl.lit([]).cast(pl.List(pl.Float32)))
+            .otherwise(pl.col("prior_like_age_hours_at_bucket_start").cast(pl.List(pl.Float32)))
+            .alias("prior_like_age_hours_at_bucket_start"),
         )
-    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count]
+    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, prior_like_age_hours_at_bucket_start]
     
     if include_author_idx:
         pairs_with_history_list_lf = (

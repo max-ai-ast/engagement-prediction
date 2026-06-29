@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 import polars as pl
@@ -15,13 +16,45 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS = 2_000_000
-FINAL_CLASSIFICATION_METRICS = ("auc_roc", "average_precision")
+FINAL_CLASSIFICATION_METRICS = ("auc_roc", "classification_average_precision")
+CLASSIFICATION_METRIC_ALIASES = {
+    "classification_average_precision": ("classification_average_precision", "average_precision"),
+}
+
+
+@dataclass
+class MatrixBatchScores:
+    scores: torch.Tensor
+    loss: Optional[torch.Tensor] = None
+
+
+class MatrixRankingScorer(Protocol):
+    def prepare_for_eval(self, device: str) -> None:
+        ...
+
+    def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        ...
+
+
+class TorchMatrixModelScorer:
+    def __init__(self, model: torch.nn.Module, embed_dim: int):
+        self.model = model
+        self.embed_dim = int(embed_dim)
+
+    def prepare_for_eval(self, device: str) -> None:
+        self.model = self.model.to(device)
+        self.model.eval()
+
+    def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        loss, scores = self.model.compute_loss_and_preds(batch, device, self.embed_dim)
+        return MatrixBatchScores(scores=scores, loss=loss)
 
 
 def empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
     metric_sums = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
     metric_sums.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
     metric_sums.update({f"recall@{k}": 0.0 for k in metrics_top_ks})
+    metric_sums["mean_average_precision"] = 0.0
     return metric_sums
 
 
@@ -50,6 +83,16 @@ def calc_baseline_rank_metrics_for_batch(
         )
         cumulative_discounts = discounts.cumsum(dim=0)
         relevant_probability = total_relevant / float(num_candidates)
+        positions = torch.arange(1, num_candidates + 1, device=labels.device, dtype=torch.float32)
+        if num_candidates == 1:
+            expected_average_precision = torch.ones_like(total_relevant)
+        else:
+            harmonic_sum = (1.0 / positions).sum()
+            tail_sum = ((positions - 1.0) / positions).sum()
+            expected_average_precision = (
+                harmonic_sum + tail_sum * ((total_relevant - 1.0) / float(num_candidates - 1))
+            ) / float(num_candidates)
+        metric_sums["mean_average_precision"] = float(expected_average_precision.sum().item())
 
         for k in metrics_top_ks:
             k_eff = min(k, num_candidates)
@@ -85,6 +128,16 @@ def rank_metric_sums_for_batch(
 
         ranked_labels = ranked_labels[eligible]
         total_relevant = total_relevant[eligible]
+        positions = torch.arange(
+            1,
+            ranked_labels.size(1) + 1,
+            device=ranked_labels.device,
+            dtype=torch.float32,
+        )
+        cumulative_relevant = ranked_labels.cumsum(dim=1)
+        precision_at_rank = cumulative_relevant / positions
+        average_precision = (precision_at_rank * ranked_labels).sum(dim=1) / total_relevant
+        metric_sums["mean_average_precision"] = float(average_precision.sum().item())
 
         max_k = min(max(metrics_top_ks), ranked_labels.size(1))
         discounts = 1.0 / torch.log2(
@@ -255,23 +308,22 @@ def run_matrix_epoch(
     return loss, metrics_dict, baseline_metrics_dict
 
 
-def evaluate_matrix_model(
-    model: torch.nn.Module,
+def evaluate_matrix_scorer(
+    scorer: MatrixRankingScorer,
     data_loader: DataLoader,
     device: str,
-    embed_dim: int,
     metrics_top_ks: list[int],
     max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
     collect_ranking_rows: bool = False,
     progress_desc: Optional[str] = None,
     disable_progress: bool = True,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Evaluate a matrix-ranking model with streamed rank metrics and sampled AUC/AP."""
-    model = model.to(device)
-    model.eval()
+    """Evaluate a matrix-ranking scorer with streamed rank metrics and sampled AUC/AP."""
+    scorer.prepare_for_eval(device)
 
     loss_sum = torch.zeros((), device=device)
-    batches = 0
+    loss_batches = 0
     metric_sums = empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
     classification_pair_count = 0
@@ -283,15 +335,22 @@ def evaluate_matrix_model(
     rng = np.random.default_rng(0)
 
     with torch.inference_mode():
-        for batch in tqdm(data_loader, desc=progress_desc, leave=False, disable=disable_progress):
-            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
+        for batch_idx, batch in enumerate(tqdm(data_loader, desc=progress_desc, leave=False, disable=disable_progress)):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            batch_scores = scorer.score_batch(batch, device)
+            scores = batch_scores.scores.to(device)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
+            if scores.shape != labels.shape:
+                raise RuntimeError("Expected scores and label_matrix to have matching [num_users, num_candidates] shapes")
+
             ranked_indices = torch.argsort(scores, dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
-            loss_sum += loss.detach()
-            batches += 1
+            if batch_scores.loss is not None:
+                loss_sum += batch_scores.loss.detach().to(device)
+                loss_batches += 1
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
@@ -328,7 +387,7 @@ def evaluate_matrix_model(
                         metric_priorities = metric_priorities[keep_idx]
 
     metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
-    metrics["loss"] = (loss_sum / max(batches, 1)).item()
+    metrics["loss"] = (loss_sum / loss_batches).item() if loss_batches > 0 else None
     metrics["rank_metric_user_count"] = metric_user_count
     metrics["classification_metric_pair_count"] = classification_pair_count
     metrics["classification_metric_positive_count"] = classification_positive_count
@@ -342,14 +401,40 @@ def evaluate_matrix_model(
     else:
         metrics["auc_roc"] = None
     if metric_labels is not None and int(metric_labels.sum()) > 0 and metric_scores is not None:
-        metrics["average_precision"] = float(average_precision_score(metric_labels, metric_scores))
+        metrics["classification_average_precision"] = float(average_precision_score(metric_labels, metric_scores))
     else:
-        metrics["average_precision"] = None
+        metrics["classification_average_precision"] = None
 
     return {
         "metrics": metrics,
         "ranking_rows": ranking_rows,
     }
+
+
+def evaluate_matrix_model(
+    model: torch.nn.Module,
+    data_loader: DataLoader,
+    device: str,
+    embed_dim: int,
+    metrics_top_ks: list[int],
+    max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
+    collect_ranking_rows: bool = False,
+    progress_desc: Optional[str] = None,
+    disable_progress: bool = True,
+    max_batches: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Evaluate a matrix-ranking model with streamed rank metrics and sampled AUC/AP."""
+    return evaluate_matrix_scorer(
+        TorchMatrixModelScorer(model, embed_dim),
+        data_loader,
+        device,
+        metrics_top_ks,
+        max_classification_metric_pairs=max_classification_metric_pairs,
+        collect_ranking_rows=collect_ranking_rows,
+        progress_desc=progress_desc,
+        disable_progress=disable_progress,
+        max_batches=max_batches,
+    )
 
 
 def optional_float_metric(value: Any) -> Optional[float]:
@@ -361,6 +446,14 @@ def optional_float_metric(value: Any) -> Optional[float]:
     return metric_value
 
 
+def optional_metric_value(metrics: Dict[str, Any], metric_name: str) -> Optional[float]:
+    for key in CLASSIFICATION_METRIC_ALIASES.get(metric_name, (metric_name,)):
+        metric_value = optional_float_metric(metrics.get(key))
+        if metric_value is not None:
+            return metric_value
+    return None
+
+
 def split_metric_label(split_name: str) -> str:
     return split_name.replace("_", " ").title()
 
@@ -368,7 +461,7 @@ def split_metric_label(split_name: str) -> str:
 def clearml_metric_label(metric_name: str) -> str:
     return {
         "auc_roc": "AUC-ROC",
-        "average_precision": "Average Precision",
+        "classification_average_precision": "Classification Average Precision",
     }.get(metric_name, metric_name.replace("_", " ").title())
 
 
@@ -381,7 +474,7 @@ def log_final_classification_metrics(
         return
     for split_name, metrics in split_metrics.items():
         for metric_name in FINAL_CLASSIFICATION_METRICS:
-            metric_value = optional_float_metric(metrics.get(metric_name))
+            metric_value = optional_metric_value(metrics, metric_name)
             if metric_value is None:
                 continue
             metric_label = clearml_metric_label(metric_name)
@@ -397,7 +490,7 @@ def stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[st
     lines = []
     for split_name, metrics in split_metrics.items():
         for metric_name in FINAL_CLASSIFICATION_METRICS:
-            metric_value = optional_float_metric(metrics.get(metric_name))
+            metric_value = optional_metric_value(metrics, metric_name)
             if metric_value is not None:
                 lines.append(f"{split_name}_{metric_name}: {metric_value:.4f}")
     return lines

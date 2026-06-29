@@ -6,9 +6,8 @@ import polars as pl
 import pytest
 from torch.utils.data import DataLoader
 
+from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
-    AUTHOR_PAD_IDX,
-    AUTHOR_UNK_IDX,
     BucketedBatchSampler,
     BucketedEngagementDataset,
     create_bucketed_data_loaders,
@@ -32,6 +31,15 @@ def mock_likes_core_df():
         "did": ["u1", "u2", "u1", "u1", "u3", "u4", "u5"],
         "subject_uri": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
         "split": ["train", "train", "train", "train", "train", "val", "val_unseen_users"],
+        "record_created_at": [
+            datetime(2024, 1, 1, 10, 15, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 10, 30, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 10, 45, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 11, 10, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 13, 20, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 13, 40, tzinfo=timezone.utc),
+        ],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "emb_idx": [0, 1, 2, 3, 4, 5, 6],
         "author_idx": pl.Series([2, 3, 4, None, 2, 2, 4], dtype=pl.UInt32),
@@ -56,6 +64,7 @@ def mock_history_df():
         "did": ["u1", "u2", "u1", "u3", "u4", "u5"],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "prior_emb_indices": [[5, 6, 7], [], [8], [], [9], [10]],
+        "prior_like_age_hours_at_bucket_start": [[1.0, 2.0, 3.0], [], [0.25], [], [4.0], [5.0]],
         "prior_author_indices": [[2, None, 4], [], [3], [], [2], [4]],
     })
 
@@ -130,6 +139,15 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
     assert batch["history_embeddings"].shape == (2, 3, 4)
     assert batch["history_mask"].tolist() == [[True, True, True], [False, False, False]]
+    np.testing.assert_allclose(
+        batch["history_time_deltas_hours"].numpy(),
+        np.array([
+            [1.0, 2.0, 3.0],
+            [0.0, 0.0, 0.0],
+        ], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
     assert batch["candidate_post_embeddings"].shape == (5, 4)
 
     labels_by_user = {
@@ -147,6 +165,117 @@ def test_bucketed_collate_dedupes_candidates(bucketed_dataset):
     assert batch["candidate_post_id"] == ["p1", "p3", "n1", "p2", "p4"]
     assert batch["label_matrix"].shape == (1, 5)
     assert batch["label_matrix"][0].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+
+
+def test_bucketed_collate_additional_negatives_are_added_after_positives(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        bst_additional_batch_negatives=1,
+        seed=0,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert len(batch["candidate_post_id"]) == 4
+    assert {"p1", "p2", "p3"} <= set(batch["candidate_post_id"])
+    assert len(set(batch["candidate_post_id"]).intersection({"n1", "p4"})) == 1
+    positive_indices = {
+        post_id: idx
+        for idx, post_id in enumerate(batch["candidate_post_id"])
+        if post_id in {"p1", "p2", "p3"}
+    }
+    assert batch["label_matrix"][0, positive_indices["p1"]].item() == 1.0
+    assert batch["label_matrix"][0, positive_indices["p3"]].item() == 1.0
+    assert batch["label_matrix"][1, positive_indices["p2"]].item() == 1.0
+
+
+def test_bucketed_collate_additional_negatives_do_not_cap_positives(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        bst_additional_batch_negatives=2,
+        seed=0,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert batch["label_matrix"].shape == (2, 5)
+
+
+def test_bucketed_candidate_sampling_changes_by_epoch(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        bst_additional_batch_negatives=1,
+        seed=0,
+    )
+
+    sampled_candidates = [
+        tuple(dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])["candidate_post_id"])
+        for epoch in range(8)
+    ]
+
+    assert len(set(sampled_candidates)) > 1
+    assert sampled_candidates == [
+        tuple(dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])["candidate_post_id"])
+        for epoch in range(8)
+    ]
+
+
+def test_bucketed_validation_candidate_sampling_is_deterministic(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        bst_additional_batch_negatives=1,
+        seed=0,
+    )
+
+    first = dataset.collate_batch([dataset[0], dataset[1]])
+    second = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert first["candidate_post_id"] == second["candidate_post_id"]
 
 
 def test_bucketed_collate_handles_empty_sampled_negative_bucket(bucketed_dataset):
@@ -232,4 +361,4 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
     assert isinstance(val_unseen_loader, DataLoader)
     assert holdout_loader is None
     batch = next(iter(train_loader))
-    assert {"history_embeddings", "history_mask", "candidate_post_embeddings", "label_matrix"} <= set(batch)
+    assert {"history_embeddings", "history_mask", "history_time_deltas_hours", "candidate_post_embeddings", "label_matrix"} <= set(batch)

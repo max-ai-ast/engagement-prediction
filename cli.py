@@ -17,15 +17,18 @@ import argparse
 import os
 import sys
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import copy
 
+import compare as compare_rankers
 from utils.pipeline import registry as reg
 from utils.pipeline.dependencies import (
     pin_lineage_aligned_inputs,
+    resolve_stage_dependencies_for_run,
     validate_explicit_prior_pin_consistency,
 )
 from utils.experiment_tracking import build_experiment_tracker
@@ -103,6 +106,20 @@ DEFAULTS: Dict[str, Any] = {
     "learning_rate": 0.001,
     "weight_decay_mlp": 0.1,
     "weight_decay_two_tower": 0.01,
+    "content_projection_dim": 128,
+    "author_projection_dim": 32,
+    "prediction_hidden_dims": [64, 32, 16],
+    "bst_additional_batch_negatives": 64,
+    "bst_model_dim": 128,
+    "bst_time_embedding_dim": 16,
+    "bst_num_attention_heads": 4,
+    "bst_num_transformer_layers": 1,
+    "bst_transformer_ff_dim": 256,
+    "bst_dropout_rate": 0.1,
+    "bst_norm_first": False,
+    "bst_time_delta_bucket_boundaries_hours": [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0],
+    "bst_weight_decay": 0.01,
+    "bst_max_train_batches_per_epoch": None,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -346,6 +363,14 @@ def _resolve_prior_spec(
     )
 
 
+def cmd_compare_rankers(args: argparse.Namespace) -> int:
+    return compare_rankers.cmd_compare_rankers(
+        args,
+        resolve_run_dir=_resolve_run_dir,
+        resolve_prior_spec=_resolve_prior_spec,
+    )
+
+
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 4-stage pipeline.
 
@@ -500,8 +525,56 @@ def _get_train_key(model_type: str) -> str:
         return 'train_mlp'
     elif model_type == 'two-tower':
         return 'train_two_tower'
+    elif model_type == 'bst-ranker':
+        return 'train_bst_ranker'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
+
+def _validate_bst_config(args: argparse.Namespace) -> None:
+    if not bool(args.use_author_embedding_table):
+        raise ValueError("--use-author-embedding-table is required when --model-type is 'bst-ranker'.")
+    if args.prediction_hidden_dims is None:
+        raise ValueError("--prediction-hidden-dims is required when --model-type is 'bst-ranker'.")
+
+    if isinstance(args.prediction_hidden_dims, (str, bytes)):
+        raise ValueError("--prediction-hidden-dims must be a list of integers.")
+    try:
+        prediction_hidden_dims = tuple(int(v) for v in args.prediction_hidden_dims)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--prediction-hidden-dims must be a list of integers.") from exc
+    if any(dim <= 0 for dim in prediction_hidden_dims):
+        raise ValueError("--prediction-hidden-dims values must be positive integers.")
+
+    model_dim = int(args.bst_model_dim)
+    content_projection_dim = int(args.content_projection_dim)
+    author_projection_dim = int(args.author_projection_dim)
+    time_embedding_dim = int(args.bst_time_embedding_dim)
+    num_attention_heads = int(args.bst_num_attention_heads)
+    num_transformer_layers = int(args.bst_num_transformer_layers)
+    bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
+    batch_size = int(args.batch_size)
+    bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
+    if model_dim <= 0:
+        raise ValueError("--bst-model-dim must be positive.")
+    if content_projection_dim <= 0:
+        raise ValueError("--content-projection-dim must be positive.")
+    if author_projection_dim <= 0:
+        raise ValueError("--author-projection-dim must be positive.")
+    if time_embedding_dim <= 0:
+        raise ValueError("--bst-time-embedding-dim must be positive.")
+    if num_attention_heads <= 0:
+        raise ValueError("--bst-num-attention-heads must be positive.")
+    if (model_dim + time_embedding_dim) % num_attention_heads != 0:
+        raise ValueError("--bst-model-dim + --bst-time-embedding-dim must be divisible by --bst-num-attention-heads.")
+    if num_transformer_layers != 1:
+        raise ValueError("BST ranker requires --bst-num-transformer-layers=1.")
+    if bst_additional_batch_negatives <= 0:
+        raise ValueError("--bst-additional-batch-negatives must be positive.")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
+        raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -582,12 +655,13 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
 
     # --- Validation for --user-encoder ---
     user_encoder = args.user_encoder
-    allowed = VALID_USER_ENCODERS_BY_MODEL_TYPE.get(model_type, ())
-    if user_encoder not in allowed:
-        raise ValueError(
-            f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
-            + f"Allowed values: {allowed}"
-        )
+    if model_type in VALID_USER_ENCODERS_BY_MODEL_TYPE:
+        allowed = VALID_USER_ENCODERS_BY_MODEL_TYPE[model_type]
+        if user_encoder not in allowed:
+            raise ValueError(
+                f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
+                + f"Allowed values: {allowed}"
+            )
 
     use_author_embedding_table = bool(args.use_author_embedding_table)
     if int(args.min_author_support) < 1:
@@ -597,6 +671,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             raise ValueError("--author-embedding-dim must be positive.")
         if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
             raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
+    if model_type == "bst-ranker":
+        _validate_bst_config(args)
 
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
@@ -651,6 +727,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'user_history': "Stage 2: Generate user history…",
                 'train_mlp': "Stage 3: Train model (MLP)…",
                 'train_two_tower': "Stage 3: Train model (Two-Tower)…",
+                'train_bst_ranker': "Stage 3: Train model (BST Ranker)…",
                 'evaluate': "Stage 4: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
@@ -674,13 +751,31 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="run-all",
-        choices=["run-all"],
+        choices=["run-all", "compare-rankers"],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--config",
         type=str,
         help="YAML/JSON config file with run-all parameters (CLI flags override config)",
+    )
+    parser.add_argument(
+        "--model",
+        action="append",
+        default=argparse.SUPPRESS,
+        help="compare-rankers model spec in name:type:path format; repeat for multiple models",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=argparse.SUPPRESS,
+        help=f"compare-rankers splits to evaluate (default: {' '.join(compare_rankers.DEFAULT_COMPARE_SPLITS)})",
+    )
+    parser.add_argument(
+        "--bst-candidate-chunk-size",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=f"compare-rankers BST candidate chunk size (default: {compare_rankers.DEFAULT_COMPARE_BST_CANDIDATE_CHUNK_SIZE})",
     )
     # run-all (modular 4-stage end-to-end)
     p_all = parser
@@ -745,8 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
                           default=argparse.SUPPRESS, help_text="User encoder type (summarized, full_transformer, or cross_attention).")
-    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
-                          default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, or bst-ranker")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
@@ -781,6 +876,37 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Minimum train-history author occurrence count required for a dedicated embedding row")
     _add_arg_with_default(p_all, "--author-unknown-dropout-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Training-time probability of replacing a supported history author with the UNK row")
+    # Ranker shared options
+    _add_arg_with_default(p_all, "--content-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Ranker content branch projection dimension")
+    _add_arg_with_default(p_all, "--author-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Ranker author branch projection dimension")
+    _add_arg_with_default(p_all, "--prediction-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
+                          help_text="Ranker prediction-head hidden dimensions. Use no values for a direct linear head")
+    _add_arg_with_default(p_all, "--bst-additional-batch-negatives", type=int, default=argparse.SUPPRESS,
+                          help_text="Additional same-hour negative-pool posts to sample per BST training batch")
+    # BST ranker specific options
+    _add_arg_with_default(p_all, "--bst-model-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker fused post/author model dimension")
+    _add_arg_with_default(p_all, "--bst-time-embedding-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker time-delta embedding dimension")
+    _add_arg_with_default(p_all, "--bst-num-attention-heads", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker transformer attention heads")
+    _add_arg_with_default(p_all, "--bst-num-transformer-layers", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker transformer encoder layers")
+    _add_arg_with_default(p_all, "--bst-transformer-ff-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker transformer feed-forward dimension")
+    _add_arg_with_default(p_all, "--bst-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="BST ranker dropout rate")
+    _add_arg_with_default(p_all, "--bst-norm-first", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable pre-norm transformer layers for the BST ranker")
+    _add_arg_with_default(p_all, "--bst-time-delta-bucket-boundaries-hours", type=float, nargs="+",
+                          default=argparse.SUPPRESS,
+                          help_text="BST ranker time-delta bucket boundaries in hours")
+    _add_arg_with_default(p_all, "--bst-weight-decay", type=float, default=argparse.SUPPRESS,
+                          help_text="Weight decay for BST ranker model")
+    _add_arg_with_default(p_all, "--bst-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional cap on BST train batches per epoch for fast experiments")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -846,10 +972,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
@@ -882,6 +1008,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     raw_args = parser.parse_args()
+    if raw_args.command == "compare-rankers":
+        return cmd_compare_rankers(raw_args)
     merged_args = _merge_args_with_config(raw_args)
     return merged_args.func(merged_args)
 

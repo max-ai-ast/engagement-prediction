@@ -71,6 +71,13 @@ def _history_by_bucket(df: pl.DataFrame) -> dict[datetime, list[int]]:
     }
 
 
+def _history_ages_by_bucket(df: pl.DataFrame) -> dict[datetime, list[float]]:
+    return {
+        row["like_hour_bucket"]: list(row["prior_like_age_hours_at_bucket_start"])
+        for row in df.iter_rows(named=True)
+    }
+
+
 def test_user_hour_history_preserves_empty_first_bucket(build_history):
     logger = _make_test_logger()
     likes_lf = _make_likes(
@@ -95,6 +102,10 @@ def test_user_hour_history_preserves_empty_first_bucket(build_history):
     assert histories[datetime(2024, 1, 1, 10)] == []
     assert histories[datetime(2024, 1, 1, 11)] == [100]
     assert histories[datetime(2024, 1, 1, 12)] == [200, 100]
+    age_histories = _history_ages_by_bucket(result)
+    assert age_histories[datetime(2024, 1, 1, 10)] == []
+    assert age_histories[datetime(2024, 1, 1, 11)] == pytest.approx([0.75])
+    assert age_histories[datetime(2024, 1, 1, 12)] == pytest.approx([2.0 / 3.0, 1.75])
     assert result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 10))["raw_prior_count"][0] == 0
 
 
@@ -120,6 +131,7 @@ def test_user_hour_history_recency_ordering_and_capping(build_history):
 
     row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 10))
     assert row["prior_emb_indices"][0].to_list() == [40, 10]
+    assert row["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx([72.0, 120.0])
     assert row["raw_prior_count"][0] == 3
 
 
@@ -144,6 +156,7 @@ def test_user_hour_history_excludes_same_hour_likes(build_history):
 
     row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 11))
     assert row["prior_emb_indices"][0].to_list() == [1]
+    assert row["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx([55.0 / 60.0])
     assert row["raw_prior_count"][0] == 1
 
 
@@ -190,8 +203,15 @@ def test_user_hour_history_output_schema(build_history):
         logger=logger,
     ).collect()
 
-    assert result.columns == ["did", "like_hour_bucket", "prior_emb_indices", "raw_prior_count"]
+    assert result.columns == [
+        "did",
+        "like_hour_bucket",
+        "prior_emb_indices",
+        "raw_prior_count",
+        "prior_like_age_hours_at_bucket_start",
+    ]
     assert result.schema["prior_emb_indices"] == pl.List(pl.UInt32)
+    assert result.schema["prior_like_age_hours_at_bucket_start"] == pl.List(pl.Float32)
 
 
 def test_user_hour_author_indices_preserve_order_and_unknowns(build_history):
@@ -217,6 +237,7 @@ def test_user_hour_author_indices_preserve_order_and_unknowns(build_history):
 
     row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 13))
     assert row["prior_emb_indices"][0].to_list() == [300, 200, 100]
+    assert row["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx([1.0, 2.0, 3.0])
     assert row["prior_author_indices"][0].to_list() == [4, None, 2]
 
 
@@ -236,4 +257,3 @@ def test_user_hour_without_author_idx_omits_author_history(build_history):
     ).collect()
 
     assert "prior_author_indices" not in result.columns
-

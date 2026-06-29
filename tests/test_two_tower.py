@@ -20,6 +20,8 @@ _calc_baseline_rank_metrics_for_batch = matrix_ranking.calc_baseline_rank_metric
 _finalize_rank_metrics = matrix_ranking.finalize_rank_metrics
 run_matrix_epoch = matrix_ranking.run_matrix_epoch
 _evaluate_two_tower_model = matrix_ranking.evaluate_matrix_model
+_evaluate_matrix_scorer = matrix_ranking.evaluate_matrix_scorer
+_MatrixBatchScores = matrix_ranking.MatrixBatchScores
 _ranking_rows_for_batch = matrix_ranking.ranking_rows_for_batch
 
 
@@ -44,6 +46,7 @@ def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
     assert metrics["dcg@2"] == pytest.approx((1.0 + discount_2 + discount_2) / 2.0)
     assert metrics["ndcg@2"] == pytest.approx((1.0 + discount_2) / 2.0)
     assert metrics["recall@2"] == pytest.approx(1.0)
+    assert metrics["mean_average_precision"] == pytest.approx(0.75)
 
 
 def test_baseline_rank_metrics_use_expected_random_order_value():
@@ -75,6 +78,25 @@ class DummyTwoTowerForEpoch(nn.Module):
         return torch.zeros((), device=device), labels
 
 
+class DummyMatrixScorer:
+    def __init__(self, scores_by_batch, losses_by_batch=None):
+        self.scores_by_batch = scores_by_batch
+        self.losses_by_batch = losses_by_batch or [None] * len(scores_by_batch)
+        self.prepared_device = None
+        self.calls = 0
+
+    def prepare_for_eval(self, device):
+        self.prepared_device = device
+
+    def score_batch(self, batch, device):
+        batch_idx = self.calls
+        self.calls += 1
+        return _MatrixBatchScores(
+            scores=self.scores_by_batch[batch_idx].to(device),
+            loss=self.losses_by_batch[batch_idx],
+        )
+
+
 def test_evaluate_two_tower_model_reports_auc_and_average_precision():
     model = DummyTwoTowerForEpoch()
     dataloader = [{
@@ -95,12 +117,111 @@ def test_evaluate_two_tower_model_reports_auc_and_average_precision():
 
     metrics = result["metrics"]
     assert metrics["auc_roc"] == pytest.approx(1.0)
-    assert metrics["average_precision"] == pytest.approx(1.0)
+    assert metrics["classification_average_precision"] == pytest.approx(1.0)
+    assert metrics["mean_average_precision"] == pytest.approx(1.0)
     assert metrics["classification_metric_pair_count"] == 6
     assert metrics["classification_metric_positive_count"] == 3
     assert metrics["classification_metric_sampled_pair_count"] == 6
     assert metrics["classification_metric_sampled"] is False
+    assert metrics["loss"] == pytest.approx(0.0)
     assert result["ranking_rows"] == []
+
+
+def test_evaluate_matrix_scorer_reports_metrics_without_loss():
+    labels = torch.tensor([
+        [1.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ])
+    scorer = DummyMatrixScorer([labels])
+    dataloader = [{
+        "label_matrix": labels,
+        "user_id": ["u1", "u2"],
+        "bucket": "2026-05-01T00:00:00Z",
+        "history_mask": torch.tensor([
+            [True, True, False],
+            [True, False, False],
+        ]),
+    }]
+
+    result = _evaluate_matrix_scorer(
+        scorer=scorer,
+        data_loader=dataloader,
+        device="cpu",
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+        collect_ranking_rows=True,
+    )
+
+    metrics = result["metrics"]
+    assert scorer.prepared_device == "cpu"
+    assert metrics["loss"] is None
+    assert metrics["auc_roc"] == pytest.approx(1.0)
+    assert metrics["classification_average_precision"] == pytest.approx(1.0)
+    assert metrics["mean_average_precision"] == pytest.approx(1.0)
+    assert metrics["classification_metric_pair_count"] == 6
+    assert len(result["ranking_rows"]) == 2
+
+
+def test_evaluate_matrix_scorer_reports_mean_average_precision_separately_from_classification_ap():
+    labels = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    scores = torch.tensor([
+        [0.2, 0.1],
+        [0.7, 0.8],
+    ])
+    scorer = DummyMatrixScorer([scores])
+    dataloader = [{"label_matrix": labels}]
+
+    result = _evaluate_matrix_scorer(
+        scorer=scorer,
+        data_loader=dataloader,
+        device="cpu",
+        metrics_top_ks=[1],
+        max_classification_metric_pairs=None,
+    )
+
+    metrics = result["metrics"]
+    assert metrics["mean_average_precision"] == pytest.approx(1.0)
+    assert metrics["classification_average_precision"] == pytest.approx((1.0 + 2.0 / 3.0) / 2.0)
+
+
+def test_evaluate_matrix_scorer_averages_optional_loss():
+    dataloader = [
+        {"label_matrix": torch.tensor([[1.0, 0.0, 1.0]])},
+        {"label_matrix": torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])},
+    ]
+    scorer = DummyMatrixScorer(
+        [batch["label_matrix"] for batch in dataloader],
+        [torch.tensor(2.0), torch.tensor(4.0)],
+    )
+
+    result = _evaluate_matrix_scorer(
+        scorer=scorer,
+        data_loader=dataloader,
+        device="cpu",
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+    )
+
+    assert result["metrics"]["loss"] == pytest.approx(3.0)
+    assert result["metrics"]["rank_metric_user_count"] == 3
+
+
+def test_evaluate_matrix_scorer_rejects_score_label_shape_mismatch():
+    scorer = DummyMatrixScorer([torch.ones((1, 2), dtype=torch.float32)])
+    dataloader = [{
+        "label_matrix": torch.ones((1, 3), dtype=torch.float32),
+    }]
+
+    with pytest.raises(RuntimeError, match="Expected scores and label_matrix"):
+        _evaluate_matrix_scorer(
+            scorer=scorer,
+            data_loader=dataloader,
+            device="cpu",
+            metrics_top_ks=[1, 2],
+        )
 
 
 def test_ranking_rows_for_batch_reports_per_user_matrix_metrics():
@@ -222,6 +343,8 @@ def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
         } | {
             f"recall@{k}": float(user_count)
             for k in metrics_top_ks
+        } | {
+            "mean_average_precision": float(user_count),
         }, user_count
 
     monkeypatch.setattr(matrix_ranking, "calc_baseline_rank_metrics_for_batch", fake_baseline_metrics)
@@ -247,6 +370,7 @@ def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
         "ndcg@2": pytest.approx(1.0),
         "recall@1": pytest.approx(1.0),
         "recall@2": pytest.approx(1.0),
+        "mean_average_precision": pytest.approx(1.0),
     }
 
 def test_post_tower_initialization():

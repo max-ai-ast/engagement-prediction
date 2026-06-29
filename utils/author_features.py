@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from utils.dataloaders import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
+from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 
 
 class PostAuthorFeatureEncoder(nn.Module):

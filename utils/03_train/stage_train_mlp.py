@@ -34,9 +34,8 @@ from utils.helpers import (
     set_random_seeds,
     find_author_idx_artifact_path,
 )
+from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
-    AUTHOR_PAD_IDX,
-    AUTHOR_UNK_IDX,
     BucketedEngagementDataset,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,

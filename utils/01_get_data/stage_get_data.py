@@ -588,6 +588,25 @@ def _apply_per_user_random_cap(
     )
 
 
+def _apply_per_user_recency_cap(
+    likes_lf: pl.LazyFrame,
+    max_likes_per_user: int,
+) -> pl.LazyFrame:
+    """
+    Get the N most recent posts per user.
+    """
+    if max_likes_per_user <= 0:
+        return likes_lf
+    return (
+        likes_lf
+        .with_columns(
+            pl.col(TIMESTAMP_COL_NAME).rank('ordinal', descending=True).over('did').alias('_recency_order')
+        ).filter(
+            pl.col('_recency_order') <= max_likes_per_user
+        ).drop('_recency_order')
+    )
+
+
 def _load_likes_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
