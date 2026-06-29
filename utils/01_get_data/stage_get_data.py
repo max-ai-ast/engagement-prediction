@@ -1122,7 +1122,6 @@ def _load_posts_core_polars(
         'record_text': str,
         'is_liked': bool,
         'negative_hour_bucket': 'datetime',
-        'prior_cumulative_likes': 'int',
         'split_window': str,
     }
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
