@@ -97,7 +97,6 @@ def _make_bst_model(config):
 
 
 def _bst_bucketed_batch():
-    labels = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
     return {
         "history_embeddings": torch.randn(2, 3, 4),
         "history_mask": torch.tensor([[True, True, False], [True, False, False]]),
@@ -105,8 +104,7 @@ def _bst_bucketed_batch():
         "candidate_post_embeddings": torch.randn(3, 4),
         "history_author_indices": torch.tensor([[2, 3, 0], [4, 0, 0]]),
         "candidate_post_author_idx": torch.tensor([2, 3, 5]),
-        "label_matrix": labels,
-        "candidate_valid_mask": torch.ones_like(labels, dtype=torch.bool),
+        "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
     }
 
 
@@ -117,13 +115,11 @@ def test_two_tower_pth_adapter_scores_bucketed_batch(tmp_path):
     model.eval()
     checkpoint_path = tmp_path / "two_tower.pth"
     torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
-    labels = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
     batch = {
         "history_embeddings": torch.randn(2, 3, 4),
         "history_mask": torch.tensor([[True, True, False], [True, False, False]]),
         "candidate_post_embeddings": torch.randn(3, 4),
-        "label_matrix": labels,
-        "candidate_valid_mask": torch.ones_like(labels, dtype=torch.bool),
+        "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
     }
 
     adapter = TwoTowerPthAdapter(checkpoint_path)
@@ -151,13 +147,11 @@ def test_two_tower_pth_adapter_requires_author_tensors_for_author_checkpoint(tmp
     model = _make_two_tower_model(config)
     checkpoint_path = tmp_path / "two_tower_author.pth"
     torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
-    labels = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
     batch = {
         "history_embeddings": torch.randn(2, 3, 4),
         "history_mask": torch.tensor([[True, True, False], [True, False, False]]),
         "candidate_post_embeddings": torch.randn(3, 4),
-        "label_matrix": labels,
-        "candidate_valid_mask": torch.ones_like(labels, dtype=torch.bool),
+        "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
     }
 
     adapter = TwoTowerPthAdapter(checkpoint_path)

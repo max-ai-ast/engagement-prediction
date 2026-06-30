@@ -51,7 +51,6 @@ class _TinyBucketedDataset(Dataset):
                 ),
             }
         ]
-        self.batches[0]["candidate_valid_mask"] = torch.ones_like(self.batches[0]["label_matrix"], dtype=torch.bool)
         assert self.batches[0]["history_embeddings"].shape[-1] == embed_dim
 
     def __len__(self) -> int:

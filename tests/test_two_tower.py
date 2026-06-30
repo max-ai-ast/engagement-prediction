@@ -25,10 +25,6 @@ _MatrixBatchScores = matrix_ranking.MatrixBatchScores
 _ranking_rows_for_batch = matrix_ranking.ranking_rows_for_batch
 
 
-def _all_valid(label_matrix: torch.Tensor) -> torch.Tensor:
-    return torch.ones_like(label_matrix, dtype=torch.bool)
-
-
 # =============================================================================
 # PostTower Tests
 # =============================================================================
@@ -39,7 +35,7 @@ def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
         [0.0, 1.0, 0.0],
     ])
 
-    metric_sums, user_count = _rank_metric_sums_for_batch(ranked_labels, [1, 2], _all_valid(ranked_labels))
+    metric_sums, user_count = _rank_metric_sums_for_batch(ranked_labels, [1, 2])
     metrics = _finalize_rank_metrics(metric_sums, user_count)
 
     discount_2 = 1.0 / math.log2(3.0)
@@ -72,7 +68,7 @@ def test_baseline_rank_metrics_use_expected_random_order_value():
         [0.0, 1.0, 0.0, 0.0],
     ])
 
-    metric_sums, user_count = _calc_baseline_rank_metrics_for_batch(labels, [1, 3], _all_valid(labels))
+    metric_sums, user_count = _calc_baseline_rank_metrics_for_batch(labels, [1, 3])
     metrics = _finalize_rank_metrics(metric_sums, user_count)
 
     discount_2 = 1.0 / math.log2(3.0)
@@ -140,7 +136,6 @@ def test_evaluate_two_tower_model_reports_auc_and_average_precision():
             [0.0, 1.0, 0.0],
         ]),
     }]
-    dataloader[0]["candidate_valid_mask"] = _all_valid(dataloader[0]["label_matrix"])
 
     result = _evaluate_two_tower_model(
         model=model,
@@ -171,7 +166,6 @@ def test_evaluate_matrix_scorer_reports_metrics_without_loss():
     scorer = DummyMatrixScorer([labels])
     dataloader = [{
         "label_matrix": labels,
-        "candidate_valid_mask": _all_valid(labels),
         "user_id": ["u1", "u2"],
         "bucket": "2026-05-01T00:00:00Z",
         "history_mask": torch.tensor([
@@ -241,7 +235,7 @@ def test_evaluate_matrix_scorer_reports_mean_average_precision_separately_from_c
         [0.7, 0.8],
     ])
     scorer = DummyMatrixScorer([scores])
-    dataloader = [{"label_matrix": labels, "candidate_valid_mask": _all_valid(labels)}]
+    dataloader = [{"label_matrix": labels}]
 
     result = _evaluate_matrix_scorer(
         scorer=scorer,
@@ -261,8 +255,6 @@ def test_evaluate_matrix_scorer_averages_optional_loss():
         {"label_matrix": torch.tensor([[1.0, 0.0, 1.0]])},
         {"label_matrix": torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])},
     ]
-    for batch in dataloader:
-        batch["candidate_valid_mask"] = _all_valid(batch["label_matrix"])
     scorer = DummyMatrixScorer(
         [batch["label_matrix"] for batch in dataloader],
         [torch.tensor(2.0), torch.tensor(4.0)],
@@ -284,7 +276,6 @@ def test_evaluate_matrix_scorer_rejects_score_label_shape_mismatch():
     scorer = DummyMatrixScorer([torch.ones((1, 2), dtype=torch.float32)])
     dataloader = [{
         "label_matrix": torch.ones((1, 3), dtype=torch.float32),
-        "candidate_valid_mask": torch.ones((1, 3), dtype=torch.bool),
     }]
 
     with pytest.raises(RuntimeError, match="Expected scores and label_matrix"):
@@ -314,7 +305,7 @@ def test_ranking_rows_for_batch_reports_per_user_matrix_metrics():
         [0.0, 1.0, 0.0],
     ])
 
-    rows = _ranking_rows_for_batch(batch, scores, labels, [1, 2], _all_valid(labels))
+    rows = _ranking_rows_for_batch(batch, scores, labels, [1, 2])
 
     assert len(rows) == 2
     assert rows[0]["did"] == "u1"
@@ -350,7 +341,6 @@ def test_evaluate_two_tower_model_collects_ranking_rows_when_requested():
             [True, False, False],
         ]),
     }]
-    dataloader[0]["candidate_valid_mask"] = _all_valid(dataloader[0]["label_matrix"])
 
     result = _evaluate_two_tower_model(
         model=model,
@@ -375,7 +365,6 @@ def test_run_matrix_epoch_baseline_metrics_do_not_advance_global_torch_rng():
             [0.0, 1.0, 0.0],
         ]),
     }]
-    dataloader[0]["candidate_valid_mask"] = _all_valid(dataloader[0]["label_matrix"])
 
     torch.manual_seed(1234)
     expected_next_random = torch.rand(5)
@@ -405,10 +394,8 @@ def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
         {"label_matrix": torch.ones((2, 3), dtype=torch.float32)},
         {"label_matrix": torch.ones((3, 3), dtype=torch.float32)},
     ]
-    for batch in dataloader:
-        batch["candidate_valid_mask"] = _all_valid(batch["label_matrix"])
 
-    def fake_baseline_metrics(labels, metrics_top_ks, candidate_valid_mask):
+    def fake_baseline_metrics(labels, metrics_top_ks, generator=None):
         user_count = labels.shape[0]
         return {
             f"dcg@{k}": float(user_count)
@@ -1106,7 +1093,6 @@ def test_two_tower_compute_loss_and_preds():
         "history_mask": history_mask,
         "candidate_post_embeddings": post_embeddings,
         "label_matrix": label_matrix,
-        "candidate_valid_mask": _all_valid(label_matrix),
     }
     loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=32)
     
@@ -1159,7 +1145,6 @@ def test_two_tower_multi_positive_loss_averages_per_user():
         "history_mask": torch.ones(2, 1, dtype=torch.bool),
         "candidate_post_embeddings": torch.randn(3, 3),
         "label_matrix": label_matrix,
-        "candidate_valid_mask": _all_valid(label_matrix),
     }
 
     loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=3)
@@ -1239,7 +1224,6 @@ def test_two_tower_compute_loss_all_positive():
         "history_mask": history_mask,
         "candidate_post_embeddings": post_embeddings,
         "label_matrix": label_matrix,
-        "candidate_valid_mask": _all_valid(label_matrix),
     }
     loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
     
@@ -1281,7 +1265,6 @@ def test_two_tower_compute_loss_rejects_rows_without_positives():
         "history_mask": history_mask,
         "candidate_post_embeddings": post_embeddings,
         "label_matrix": label_matrix,
-        "candidate_valid_mask": _all_valid(label_matrix),
     }
     
     with pytest.raises(RuntimeError, match="at least one positive"):
@@ -1326,7 +1309,6 @@ def test_two_tower_backward_pass():
         "history_mask": history_mask,
         "candidate_post_embeddings": post_embeddings,
         "label_matrix": label_matrix,
-        "candidate_valid_mask": _all_valid(label_matrix),
     }
     loss, _ = model.compute_loss_and_preds(batch, device="cpu", embed_dim=384)
     
@@ -1672,7 +1654,6 @@ def test_two_tower_compute_loss_and_preds_with_author_embeddings():
             [0.0, 0.0, 1.0, 0.0],
         ]),
     }
-    batch["candidate_valid_mask"] = _all_valid(batch["label_matrix"])
 
     loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=8)
 

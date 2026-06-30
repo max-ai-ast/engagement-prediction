@@ -105,7 +105,6 @@ def _listwise_batch() -> dict[str, torch.Tensor]:
     return {
         **batch,
         "label_matrix": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
-        "candidate_valid_mask": torch.ones((2, 2), dtype=torch.bool),
     }
 
 
