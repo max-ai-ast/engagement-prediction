@@ -73,8 +73,6 @@ For foreground local iteration:
 python cli.py --config config.yml --background false --experiment-tracker none
 ```
 
-For a small Stage 1 smoke run, see `config_test.yml`.
-
 ### Output Layout
 
 By default, outputs are written under `outputs/` in two coordinated views:
