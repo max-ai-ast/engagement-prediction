@@ -126,10 +126,10 @@ class BSTRanker(nn.Module):
         norm_first: bool,
         time_delta_bucket_boundaries_hours: List[float],
         prediction_hidden_dims: List[int],
-        use_popularity_feature: bool = False,
-        popularity_projection_dim: int = 0,
-        popularity_log_mean: float = 0.0,
-        popularity_log_std: float = 1.0,
+        use_popularity_feature: bool,
+        popularity_projection_dim: int,
+        popularity_log_mean: float,
+        popularity_log_std: float,
     ):
         super().__init__()
         if time_embedding_dim <= 0:
