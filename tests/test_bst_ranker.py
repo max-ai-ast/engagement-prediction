@@ -261,6 +261,10 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             norm_first=False,
             time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
             prediction_hidden_dims=(7,),
+            use_popularity_feature=False,
+            popularity_projection_dim=0,
+            popularity_log_mean=0.0,
+            popularity_log_std=1.0,
         )
 
 
