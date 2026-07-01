@@ -131,6 +131,7 @@ The history artifact includes:
 
 - `prior_emb_indices`: prior liked post embedding ids, sorted most-recent first.
 - `prior_like_age_hours_at_bucket_start`: age of each prior like relative to the target hour bucket, aligned with `prior_emb_indices`.
+- `prior_cumulative_likes`: prior-hour popularity count for each prior liked post, aligned with `prior_emb_indices`.
 - `prior_author_indices`: aligned author ids when Stage 1 wrote author metadata.
 - `raw_prior_count`: uncapped count before `max_prior_likes`.
 
@@ -223,6 +224,8 @@ Useful options:
 - `--bst-dropout-rate`
 - `--bst-time-delta-bucket-boundaries-hours`
 - `--bst-max-train-batches-per-epoch`
+- `--bst-use-popularity-feature` / `--no-bst-use-popularity-feature`
+- `--bst-popularity-projection-dim`
 
 Current branch note: BST training writes train/validation metrics and checkpoints, but Stage 4 evaluation expects holdout ranking-row artifacts. Until BST holdout ranking rows are wired in, use `--stop-after train` for BST runs and compare checkpoints with `compare-rankers`.
 
