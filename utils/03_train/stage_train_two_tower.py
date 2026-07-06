@@ -122,7 +122,7 @@ from utils.dataloaders import (
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
 )
-from utils.author_features import PostAuthorFeatureEncoder
+from utils.author_features import ProjectedPostFeatureEncoder
 from utils.matrix_ranking import (
     evaluate_matrix_model,
     log_final_classification_metrics,
@@ -239,7 +239,7 @@ class AuthorAwareUserTower(nn.Module):
 
     def __init__(
         self,
-        post_author_feature_encoder: PostAuthorFeatureEncoder,
+        post_author_feature_encoder: ProjectedPostFeatureEncoder,
         user_tower: nn.Module,
     ):
         super().__init__()
@@ -268,7 +268,7 @@ class AuthorAwarePostTower(nn.Module):
 
     def __init__(
         self,
-        post_author_feature_encoder: PostAuthorFeatureEncoder,
+        post_author_feature_encoder: ProjectedPostFeatureEncoder,
         post_tower: nn.Module,
     ):
         super().__init__()
@@ -352,6 +352,8 @@ class TwoTowerModel(nn.Module):
         use_author_embedding_table: bool = False,
         author_table_num_rows: Optional[int] = None,
         author_embedding_dim: Optional[int] = None,
+        content_projection_dim: Optional[int] = None,
+        author_projection_dim: Optional[int] = None,
         author_unknown_dropout_rate: float = 0.0,
     ):
         super().__init__()
@@ -364,7 +366,8 @@ class TwoTowerModel(nn.Module):
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
         self.use_author_embedding_table = bool(use_author_embedding_table)
-        post_author_feature_encoder: Optional[PostAuthorFeatureEncoder] = None
+        post_feature_input_dim = post_embedding_dim
+        post_author_feature_encoder: Optional[ProjectedPostFeatureEncoder] = None
 
         if self.use_author_embedding_table:
             if user_encoder_type == "summarized":
@@ -373,17 +376,29 @@ class TwoTowerModel(nn.Module):
                 raise ValueError("author_table_num_rows must be provided and >= 2 when use_author_embedding_table is True")
             if author_embedding_dim is None or author_embedding_dim <= 0:
                 raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
-            post_author_feature_encoder = PostAuthorFeatureEncoder(
+            if content_projection_dim is None or content_projection_dim <= 0:
+                raise ValueError("content_projection_dim must be provided and positive when use_author_embedding_table is True")
+            if author_projection_dim is None or author_projection_dim <= 0:
+                raise ValueError("author_projection_dim must be provided and positive when use_author_embedding_table is True")
+            post_feature_input_dim = int(content_projection_dim)
+            post_author_feature_encoder = ProjectedPostFeatureEncoder(
                 post_embedding_dim=post_embedding_dim,
                 author_table_num_rows=author_table_num_rows,
                 author_embedding_dim=author_embedding_dim,
+                content_projection_dim=content_projection_dim,
+                author_projection_dim=author_projection_dim,
+                output_dim=post_feature_input_dim,
                 author_unknown_dropout_rate=author_unknown_dropout_rate,
+                use_popularity_feature=False,
+                popularity_projection_dim=0,
+                popularity_log_mean=0.0,
+                popularity_log_std=1.0,
             )
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
             raw_user_tower = CrossAttentionPoolingEncoder(
-                input_dim=post_embedding_dim,
+                input_dim=post_feature_input_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
                 max_seq_len=max_history_len,
@@ -391,7 +406,7 @@ class TwoTowerModel(nn.Module):
             )
         elif user_encoder_type == "full_transformer":
             raw_user_tower = TransformerDualPoolingEncoder(
-                input_dim=post_embedding_dim,
+                input_dim=post_feature_input_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
                 num_attention_heads=num_attention_heads,
@@ -404,12 +419,12 @@ class TwoTowerModel(nn.Module):
             # (e.g., mean/EMA/linear-recency summary). The model treats the
             # history input as an already-encoded user embedding (placed at
             # position 0 in a padded sequence for a consistent forward() signature).
-            raw_user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
+            raw_user_tower = SummarizedUserTower(embed_dim=post_feature_input_dim)
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
-            if use_post_encoder and (shared_dim != post_embedding_dim):
-                raise ValueError(f"--shared-dim ({shared_dim}) and post embedding dim ({post_embedding_dim}) do not match! They must match for two tower with user summarization.")
+            if use_post_encoder and (shared_dim != post_feature_input_dim):
+                raise ValueError(f"--shared-dim ({shared_dim}) and post feature dim ({post_feature_input_dim}) do not match! They must match for two tower with user summarization.")
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
@@ -420,16 +435,16 @@ class TwoTowerModel(nn.Module):
         # space and must match the user embedding dim for dot product scoring.
         #
         # In summarized mode, the user embedding is also in the raw embedding space.
-        if (not use_post_encoder) and (user_encoder_type != "summarized") and (shared_dim != post_embedding_dim):
+        if (not use_post_encoder) and (user_encoder_type != "summarized") and (shared_dim != post_feature_input_dim):
             raise ValueError(
-                f"use_post_encoder=False requires --shared-dim ({shared_dim}) to equal post embedding dim ({post_embedding_dim}) "
+                f"use_post_encoder=False requires --shared-dim ({shared_dim}) to equal post feature dim ({post_feature_input_dim}) "
                 f"(or set use_post_encoder=True to project posts to shared_dim)."
             )
 
         if use_post_encoder:
             # Post tower is the same regardless of user encoder type
             raw_post_tower = PostTower(
-                input_dim=post_embedding_dim,
+                input_dim=post_feature_input_dim,
                 hidden_dim=post_hidden_dim,
                 output_dim=shared_dim,
                 dropout_rate=dropout_rate,
@@ -450,7 +465,7 @@ class TwoTowerModel(nn.Module):
             self.post_tower = base_post_tower
 
     @property
-    def post_author_feature_encoder(self) -> Optional[PostAuthorFeatureEncoder]:
+    def post_author_feature_encoder(self) -> Optional[ProjectedPostFeatureEncoder]:
         """Return the shared author fusion module when author-aware towers are enabled."""
         if isinstance(self.user_tower, AuthorAwareUserTower):
             return self.user_tower.post_author_feature_encoder
@@ -922,6 +937,8 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_holdout_type = str(args.eval_holdout_type)
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
+    content_projection_dim = int(args.content_projection_dim)
+    author_projection_dim = int(args.author_projection_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     metrics_top_ks = list(args.metrics_top_ks)
     if not metrics_top_ks:
@@ -978,6 +995,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         "similarity_temperature": similarity_temperature,
         "use_author_embedding_table": use_author_embedding_table,
         "author_embedding_dim": author_embedding_dim if use_author_embedding_table else None,
+        "content_projection_dim": content_projection_dim if use_author_embedding_table else None,
+        "author_projection_dim": author_projection_dim if use_author_embedding_table else None,
         "author_unknown_dropout_rate": author_unknown_dropout_rate if use_author_embedding_table else None,
         "author_table_num_rows": author_table_num_rows if use_author_embedding_table else None,
         "author_pad_idx": AUTHOR_PAD_IDX,
@@ -1062,6 +1081,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         author_table_num_rows=author_table_num_rows if use_author_embedding_table else None,
         author_embedding_dim=author_embedding_dim if use_author_embedding_table else None,
+        content_projection_dim=content_projection_dim if use_author_embedding_table else None,
+        author_projection_dim=author_projection_dim if use_author_embedding_table else None,
         author_unknown_dropout_rate=author_unknown_dropout_rate,
     )
 

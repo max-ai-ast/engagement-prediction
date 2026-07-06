@@ -12,7 +12,7 @@ stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_
 matrix_ranking = importlib.import_module("utils.matrix_ranking")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
-PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
+ProjectedPostFeatureEncoder = stage_train_two_tower.ProjectedPostFeatureEncoder
 AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
 AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
 _rank_metric_sums_for_batch = matrix_ranking.rank_metric_sums_for_batch
@@ -1399,12 +1399,19 @@ def test_two_tower_different_num_heads():
         assert scores.shape == (batch_size, num_candidates)
 
 
-def test_post_author_feature_encoder_zeroes_padding_row():
-    encoder = PostAuthorFeatureEncoder(
+def test_projected_post_feature_encoder_zeroes_padding_row():
+    encoder = ProjectedPostFeatureEncoder(
         post_embedding_dim=16,
         author_table_num_rows=8,
         author_embedding_dim=4,
+        content_projection_dim=10,
+        author_projection_dim=3,
+        output_dim=10,
         author_unknown_dropout_rate=0.0,
+        use_popularity_feature=False,
+        popularity_projection_dim=0,
+        popularity_log_mean=0.0,
+        popularity_log_std=1.0,
     )
 
     assert torch.all(encoder.author_embedding.weight[0] == 0)
@@ -1412,6 +1419,7 @@ def test_post_author_feature_encoder_zeroes_padding_row():
 
 
 def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
+    torch.manual_seed(0)
     model = TwoTowerModel(
         post_embedding_dim=16,
         shared_dim=8,
@@ -1428,6 +1436,8 @@ def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
         use_author_embedding_table=True,
         author_table_num_rows=6,
         author_embedding_dim=4,
+        content_projection_dim=10,
+        author_projection_dim=3,
         author_unknown_dropout_rate=0.0,
     )
     model.eval()
@@ -1441,17 +1451,17 @@ def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
 
     assert isinstance(model.user_tower, AuthorAwareUserTower)
     assert isinstance(model.post_tower, AuthorAwarePostTower)
-    user_without_authors = model.user_tower.user_tower(history_embeddings, history_mask)
+    assert isinstance(model.post_author_feature_encoder, ProjectedPostFeatureEncoder)
     user_with_authors = model.encode_user(history_embeddings, history_mask, history_author_indices)
-    post_without_authors = model.post_tower.post_tower(post_embeddings)
+    changed_history_author_indices = history_author_indices.clone()
+    changed_history_author_indices[0, 0] = 5
+    user_with_changed_authors = model.encode_user(history_embeddings, history_mask, changed_history_author_indices)
     post_with_authors = model.encode_post(post_embeddings, target_author_indices)
+    changed_target_author_indices = torch.tensor([5, 2], dtype=torch.long)
+    post_with_changed_authors = model.encode_post(post_embeddings, changed_target_author_indices)
 
-    assert model.post_author_feature_encoder is not None
-    post_forward = model.post_tower.post_tower(post_embeddings)
-
-    assert not torch.allclose(user_without_authors, user_with_authors)
-    assert not torch.allclose(post_without_authors, post_with_authors)
-    assert torch.allclose(post_without_authors, post_forward)
+    assert not torch.allclose(user_with_authors, user_with_changed_authors)
+    assert not torch.allclose(post_with_authors, post_with_changed_authors)
 
 
 def test_two_tower_author_dropout_only_remaps_supported_rows():
@@ -1471,6 +1481,8 @@ def test_two_tower_author_dropout_only_remaps_supported_rows():
         use_author_embedding_table=True,
         author_table_num_rows=6,
         author_embedding_dim=3,
+        content_projection_dim=6,
+        author_projection_dim=2,
         author_unknown_dropout_rate=1.0,
     )
     model.train()
@@ -1480,11 +1492,21 @@ def test_two_tower_author_dropout_only_remaps_supported_rows():
     assert model.post_author_feature_encoder is not None
     fused = model.post_author_feature_encoder(history_embeddings, history_author_indices)
 
-    remapped = model.post_author_feature_encoder.author_embedding(
+    remapped_authors = model.post_author_feature_encoder.author_embedding(
         torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
     )
+    expected_content = model.post_author_feature_encoder.content_projection_norm(
+        model.post_author_feature_encoder.projection_activation(
+            model.post_author_feature_encoder.content_projection(history_embeddings)
+        )
+    )
+    expected_authors = model.post_author_feature_encoder.author_projection_norm(
+        model.post_author_feature_encoder.projection_activation(
+            model.post_author_feature_encoder.author_projection(remapped_authors)
+        )
+    )
     expected = model.post_author_feature_encoder.fusion_layer(
-        torch.cat([history_embeddings, remapped], dim=-1)
+        torch.cat([expected_content, expected_authors], dim=-1)
     )
 
     assert torch.allclose(fused, expected)
@@ -1507,6 +1529,8 @@ def test_two_tower_author_embeddings_require_target_author_indices():
         use_author_embedding_table=True,
         author_table_num_rows=6,
         author_embedding_dim=3,
+        content_projection_dim=6,
+        author_projection_dim=2,
         author_unknown_dropout_rate=0.0,
     )
 
@@ -1531,6 +1555,8 @@ def test_two_tower_compute_loss_and_preds_with_author_embeddings():
         use_author_embedding_table=True,
         author_table_num_rows=6,
         author_embedding_dim=3,
+        content_projection_dim=6,
+        author_projection_dim=2,
         author_unknown_dropout_rate=0.0,
     )
 
@@ -1576,6 +1602,8 @@ def test_author_enabled_towers_are_torchscriptable():
         use_author_embedding_table=True,
         author_table_num_rows=6,
         author_embedding_dim=3,
+        content_projection_dim=6,
+        author_projection_dim=2,
         author_unknown_dropout_rate=0.0,
     )
     model.eval()
@@ -1616,5 +1644,7 @@ def test_two_tower_rejects_author_embeddings_for_summarized_encoder():
             use_author_embedding_table=True,
             author_table_num_rows=4,
             author_embedding_dim=2,
+            content_projection_dim=8,
+            author_projection_dim=2,
             author_unknown_dropout_rate=0.1,
         )

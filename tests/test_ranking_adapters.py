@@ -27,6 +27,8 @@ def _two_tower_config():
         "similarity_temperature": 1.0,
         "use_author_embedding_table": False,
         "author_embedding_dim": None,
+        "content_projection_dim": None,
+        "author_projection_dim": None,
         "author_unknown_dropout_rate": None,
         "author_table_num_rows": None,
     }
@@ -49,6 +51,8 @@ def _make_two_tower_model(config):
         use_author_embedding_table=config["use_author_embedding_table"],
         author_table_num_rows=config["author_table_num_rows"],
         author_embedding_dim=config["author_embedding_dim"],
+        content_projection_dim=config["content_projection_dim"],
+        author_projection_dim=config["author_projection_dim"],
         author_unknown_dropout_rate=config["author_unknown_dropout_rate"] or 0.0,
     )
 
@@ -147,6 +151,8 @@ def test_two_tower_pth_adapter_requires_author_tensors_for_author_checkpoint(tmp
     config.update({
         "use_author_embedding_table": True,
         "author_embedding_dim": 2,
+        "content_projection_dim": 4,
+        "author_projection_dim": 2,
         "author_unknown_dropout_rate": 0.0,
         "author_table_num_rows": 6,
     })

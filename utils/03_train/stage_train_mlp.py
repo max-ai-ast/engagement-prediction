@@ -43,7 +43,7 @@ from utils.dataloaders import (
     get_author_table_num_rows,
     load_bucketed_training_data,
 )
-from utils.author_features import PostAuthorFeatureEncoder
+from utils.author_features import ProjectedPostFeatureEncoder
 from utils.matrix_ranking import (
     evaluate_matrix_model,
     log_final_classification_metrics,
@@ -127,11 +127,18 @@ class MLPModel(nn.Module):
                 raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
             if author_unknown_dropout_rate is None or author_unknown_dropout_rate < 0.0 or author_unknown_dropout_rate > 1.0:
                 raise ValueError("author_unknown_dropout_rate must be provided when use_author_embedding_table is True")
-            self.post_author_feature_encoder = PostAuthorFeatureEncoder(
+            self.post_author_feature_encoder = ProjectedPostFeatureEncoder(
                 post_embedding_dim=post_embedding_dim,
                 author_table_num_rows=author_table_num_rows,
                 author_embedding_dim=author_embedding_dim,
+                content_projection_dim=post_embedding_dim,
+                author_projection_dim=author_embedding_dim,
+                output_dim=post_embedding_dim,
                 author_unknown_dropout_rate=author_unknown_dropout_rate,
+                use_popularity_feature=False,
+                popularity_projection_dim=0,
+                popularity_log_mean=0.0,
+                popularity_log_std=1.0,
             )
 
         if self.user_encoder_type == "cross_attention":

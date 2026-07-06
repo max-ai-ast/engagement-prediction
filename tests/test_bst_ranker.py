@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
 BSTRanker = stage_train_bst_ranker.BSTRanker
 LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
+ProjectedPostFeatureEncoder = stage_train_bst_ranker.ProjectedPostFeatureEncoder
 _compute_bst_listwise_loss_and_preds = stage_train_bst_ranker._compute_bst_listwise_loss_and_preds
 run_bst_listwise_epoch = stage_train_bst_ranker.run_bst_listwise_epoch
 train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
@@ -150,6 +151,7 @@ def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
 
     output = model._forward_transformer(**batch)
 
+    assert isinstance(model.post_feature_encoder, ProjectedPostFeatureEncoder)
     assert isinstance(model.transformer_encoder, nn.TransformerEncoder)
     assert isinstance(model.prediction_head, LinearPredictionHead)
     assert output.shape == (2, model.transformer_input_dim)

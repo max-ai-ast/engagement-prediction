@@ -44,7 +44,8 @@ from utils.matrix_ranking import (
     stage_info_metric_lines,
 )
 from utils.pipeline.core import Context
-from utils.ranker_utilities import BSTPostAuthorFeatureEncoder, LinearPredictionHead
+from utils.author_features import ProjectedPostFeatureEncoder
+from utils.ranker_utilities import LinearPredictionHead
 
 
 STAGE_LOG_NAME = "STAGE_03_TRAIN_BST_RANKER"
@@ -170,13 +171,13 @@ class BSTRanker(nn.Module):
         if self.transformer_input_dim % int(num_attention_heads) != 0:
             raise ValueError("model_dim + time_embedding_dim must be divisible by num_attention_heads")
 
-        self.post_feature_encoder = BSTPostAuthorFeatureEncoder(
+        self.post_feature_encoder = ProjectedPostFeatureEncoder(
             post_embedding_dim=post_embedding_dim,
             author_table_num_rows=author_table_num_rows,
             author_embedding_dim=author_embedding_dim,
             content_projection_dim=content_projection_dim,
             author_projection_dim=author_projection_dim,
-            model_dim=model_dim,
+            output_dim=model_dim,
             author_unknown_dropout_rate=author_unknown_dropout_rate,
             use_popularity_feature=use_popularity_feature,
             popularity_projection_dim=popularity_projection_dim,

@@ -95,6 +95,16 @@ class TwoTowerPthAdapter:
                     if config.get("use_author_embedding_table")
                     else None
                 ),
+                content_projection_dim=(
+                    int(_require_config(config, "content_projection_dim"))
+                    if config.get("use_author_embedding_table")
+                    else None
+                ),
+                author_projection_dim=(
+                    int(_require_config(config, "author_projection_dim"))
+                    if config.get("use_author_embedding_table")
+                    else None
+                ),
                 author_unknown_dropout_rate=float(config.get("author_unknown_dropout_rate") or 0.0),
             )
             model.load_state_dict(checkpoint["model_state_dict"])
