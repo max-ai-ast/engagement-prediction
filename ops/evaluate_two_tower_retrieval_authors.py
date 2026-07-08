@@ -928,9 +928,32 @@ def print_console_summary(
             )
 
 
+def cleanup_empty_default_output_dir(output_dir: Path, *, is_default_output_dir: bool) -> bool:
+    if not is_default_output_dir:
+        return False
+    try:
+        output_dir.rmdir()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 async def run(args: argparse.Namespace) -> Path:
-    device = torch.device(args.device)
     output_dir = create_output_dir(args.output_dir)
+    try:
+        return await run_with_output_dir(args, output_dir)
+    except Exception:
+        cleanup_empty_default_output_dir(
+            output_dir,
+            is_default_output_dir=getattr(args, "output_dir", None) is None,
+        )
+        raise
+
+
+async def run_with_output_dir(args: argparse.Namespace, output_dir: Path) -> Path:
+    device = torch.device(args.device)
     args.es_host = normalize_es_host(args.es_host)
     if args.es_insecure is None:
         args.es_insecure = is_local_https(args.es_host)

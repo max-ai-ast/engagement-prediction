@@ -262,6 +262,64 @@ def test_output_dir_and_json_artifacts_are_written_by_default(retrieval_eval_mod
     assert top_k_rows[0]["content"] == "post one"
 
 
+def test_run_removes_empty_default_output_dir_on_failure(retrieval_eval_module, tmp_path, monkeypatch):
+    output_dir = tmp_path / "20260706_120000_abc12345"
+
+    def fake_create_output_dir(output_dir_arg):
+        assert output_dir_arg is None
+        output_dir.mkdir()
+        return output_dir
+
+    def fail_load_model_bundle(*_args, **_kwargs):
+        raise RuntimeError("model load failed")
+
+    monkeypatch.setattr(retrieval_eval_module, "create_output_dir", fake_create_output_dir)
+    monkeypatch.setattr(retrieval_eval_module, "load_model_bundle", fail_load_model_bundle)
+    args = argparse.Namespace(
+        output_dir=None,
+        device="cpu",
+        es_host="https://localhost:9200",
+        es_insecure=None,
+        es_api_key=None,
+        train_run_ids=["model-a"],
+        train_artifacts_dir=Path("/models"),
+    )
+
+    with pytest.raises(RuntimeError, match="model load failed"):
+        asyncio.run(retrieval_eval_module.run(args))
+
+    assert not output_dir.exists()
+
+
+def test_run_keeps_explicit_output_dir_on_failure(retrieval_eval_module, tmp_path, monkeypatch):
+    output_dir = tmp_path / "explicit-output"
+
+    def fake_create_output_dir(output_dir_arg):
+        path = Path(output_dir_arg)
+        path.mkdir()
+        return path
+
+    def fail_load_model_bundle(*_args, **_kwargs):
+        raise RuntimeError("model load failed")
+
+    monkeypatch.setattr(retrieval_eval_module, "create_output_dir", fake_create_output_dir)
+    monkeypatch.setattr(retrieval_eval_module, "load_model_bundle", fail_load_model_bundle)
+    args = argparse.Namespace(
+        output_dir=output_dir,
+        device="cpu",
+        es_host="https://localhost:9200",
+        es_insecure=None,
+        es_api_key=None,
+        train_run_ids=["model-a"],
+        train_artifacts_dir=Path("/models"),
+    )
+
+    with pytest.raises(RuntimeError, match="model load failed"):
+        asyncio.run(retrieval_eval_module.run(args))
+
+    assert output_dir.exists()
+
+
 def test_resolve_author_handles_falls_back_to_did(retrieval_eval_module):
     async def fake_fetch_profile(_client, did):
         if did == "did:a":
