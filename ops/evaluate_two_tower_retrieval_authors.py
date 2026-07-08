@@ -47,6 +47,7 @@ DEFAULT_OUTPUT_ROOT = Path("/mnt/data/dave/outputs/artifacts/two_tower_retrieval
 DEFAULT_GCS_BUCKET = "greenearth-471522-ingex-extract-prod"
 DEFAULT_EMBEDDING_MODEL = "all_MiniLM_L12_v2"
 DEFAULT_ES_HOST = "https://localhost:9200"
+MIN_LIKES_PREFILTER_MULTIPLIER = 20
 POST_BLOB_PREFIX = "bsky_posts"
 LIKES_INDEX = "likes"
 POSTS_INDEX = "posts"
@@ -144,6 +145,16 @@ class TopKAccumulator:
             )
             for rank, (score, post) in enumerate(self._items, start=1)
         ]
+
+
+def top_k_buffer_size(top_k: int, min_likes: Optional[int]) -> int:
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if min_likes is None:
+        return top_k
+    if min_likes < 0:
+        raise ValueError("--min-likes must be non-negative")
+    return top_k * MIN_LIKES_PREFILTER_MULTIPLIER
 
 
 def get_post_id(at_uri: str) -> str:
@@ -880,6 +891,47 @@ def top_k_posts_json(
     return rows
 
 
+def rerank_top_posts(top_posts: list[TopPost], limit: int) -> list[TopPost]:
+    return [
+        TopPost(
+            model_run_id=post.model_run_id,
+            rank=rank,
+            score=post.score,
+            at_uri=post.at_uri,
+            author_did=post.author_did,
+            record_created_at=post.record_created_at,
+            content=post.content,
+        )
+        for rank, post in enumerate(top_posts[:limit], start=1)
+    ]
+
+
+def filter_top_posts_by_min_likes(
+    top_posts_by_model: dict[str, list[TopPost]],
+    like_counts_by_uri: dict[str, int],
+    *,
+    min_likes: Optional[int],
+    top_k: int,
+) -> dict[str, list[TopPost]]:
+    if min_likes is None:
+        return {
+            model_run_id: rerank_top_posts(top_posts, top_k)
+            for model_run_id, top_posts in top_posts_by_model.items()
+        }
+    return {
+        model_run_id: rerank_top_posts(
+            [
+                post
+                for post in top_posts
+                if like_counts_by_uri.get(post.at_uri) is not None
+                and int(like_counts_by_uri[post.at_uri]) >= min_likes
+            ],
+            top_k,
+        )
+        for model_run_id, top_posts in top_posts_by_model.items()
+    }
+
+
 def build_summary(
     *,
     args: argparse.Namespace,
@@ -914,6 +966,10 @@ def build_summary(
             "start_date": args.start_date,
             "end_date": args.end_date,
             "top_k": args.top_k,
+            "min_likes": getattr(args, "min_likes", None),
+            "min_likes_prefilter_multiplier": (
+                MIN_LIKES_PREFILTER_MULTIPLIER if getattr(args, "min_likes", None) is not None else None
+            ),
             "gcs_bucket": gcs_bucket,
             "embedding_model": embedding_model,
             "es_host": args.es_host,
@@ -1066,8 +1122,10 @@ async def run_with_output_dir(args: argparse.Namespace, output_dir: Path) -> Pat
     if not post_paths:
         raise FileNotFoundError(f"No {POST_BLOB_PREFIX} parquet files found in gs://{gcs_bucket} for {args.start_date} to {args.end_date}")
 
+    min_likes = getattr(args, "min_likes", None)
+    prefilter_top_k = top_k_buffer_size(args.top_k, min_likes)
     topk_by_model = {
-        model.run_id: TopKAccumulator(args.top_k)
+        model.run_id: TopKAccumulator(prefilter_top_k)
         for model in models
     }
     score_bars = {
@@ -1099,13 +1157,13 @@ async def run_with_output_dir(args: argparse.Namespace, output_dir: Path) -> Pat
         for bar in score_bars.values():
             bar.close()
 
-    top_posts_by_model = {
+    prefilter_top_posts_by_model = {
         model.run_id: topk_by_model[model.run_id].ranked(model.run_id)
         for model in models
     }
     top_post_uris = {
         post.at_uri
-        for top_posts in top_posts_by_model.values()
+        for top_posts in prefilter_top_posts_by_model.values()
         for post in top_posts
         if post.at_uri
     }
@@ -1118,6 +1176,12 @@ async def run_with_output_dir(args: argparse.Namespace, output_dir: Path) -> Pat
                 api_key=api_key,
             )
             pbar.update(1)
+    top_posts_by_model = filter_top_posts_by_min_likes(
+        prefilter_top_posts_by_model,
+        like_counts_by_uri,
+        min_likes=min_likes,
+        top_k=args.top_k,
+    )
     author_dids = {
         post.author_did
         for top_posts in top_posts_by_model.values()
@@ -1168,6 +1232,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", default=default_start_date)
     parser.add_argument("--end-date", default=default_end_date)
     parser.add_argument("--top-k", type=int, default=30)
+    parser.add_argument("--min-likes", type=int, default=None)
     parser.add_argument("--gcs-bucket", default=None)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--es-host", default=DEFAULT_ES_HOST)

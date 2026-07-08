@@ -195,6 +195,38 @@ def test_fetch_post_like_counts_queries_es_posts(retrieval_eval_module, monkeypa
     assert like_counts == {"at://post/1": 12, "at://post/2": 3}
 
 
+def test_min_likes_filter_buffers_filters_and_reranks(retrieval_eval_module):
+    assert retrieval_eval_module.top_k_buffer_size(2, None) == 2
+    assert retrieval_eval_module.top_k_buffer_size(2, 5) == 2 * retrieval_eval_module.MIN_LIKES_PREFILTER_MULTIPLIER
+    with pytest.raises(ValueError, match="--min-likes"):
+        retrieval_eval_module.top_k_buffer_size(2, -1)
+
+    top_posts_by_model = {
+        "model-a": [
+            retrieval_eval_module.TopPost("model-a", 1, 0.9, "p1", "did:a", "2026-07-03T00:00:00"),
+            retrieval_eval_module.TopPost("model-a", 2, 0.8, "p2", "did:b", "2026-07-03T00:00:00"),
+            retrieval_eval_module.TopPost("model-a", 3, 0.7, "p3", "did:c", "2026-07-03T00:00:00"),
+            retrieval_eval_module.TopPost("model-a", 4, 0.6, "p4", "did:d", "2026-07-03T00:00:00"),
+        ]
+    }
+
+    unfiltered = retrieval_eval_module.filter_top_posts_by_min_likes(
+        top_posts_by_model,
+        {"p1": 1},
+        min_likes=None,
+        top_k=2,
+    )
+    filtered = retrieval_eval_module.filter_top_posts_by_min_likes(
+        top_posts_by_model,
+        {"p1": 4, "p2": 5, "p3": 20},
+        min_likes=5,
+        top_k=2,
+    )
+
+    assert [(post.at_uri, post.rank) for post in unfiltered["model-a"]] == [("p1", 1), ("p2", 2)]
+    assert [(post.at_uri, post.rank) for post in filtered["model-a"]] == [("p2", 1), ("p3", 2)]
+
+
 def test_topk_accumulator_and_author_counts_match_exact_scores(retrieval_eval_module):
     accumulator = retrieval_eval_module.TopKAccumulator(2)
     first_batch = [
