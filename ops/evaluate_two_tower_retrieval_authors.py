@@ -592,6 +592,46 @@ def build_history_posts_from_es(
     return history_posts
 
 
+def coerce_like_count(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def fetch_post_like_counts(
+    client: httpx.AsyncClient,
+    *,
+    es_host: str,
+    at_uris: Iterable[str],
+    api_key: Optional[str],
+) -> dict[str, int]:
+    unique_uris = sorted({str(uri) for uri in at_uris if uri})
+    if not unique_uris:
+        return {}
+    payload = await es_search_json(
+        client,
+        es_host=es_host,
+        index=POSTS_INDEX,
+        api_key=api_key,
+        body={
+            "_source": ["at_uri", "like_count"],
+            "query": {"terms": {"at_uri": unique_uris}},
+            "size": len(unique_uris),
+        },
+    )
+    like_counts: dict[str, int] = {}
+    for hit in payload.get("hits", {}).get("hits", []):
+        source = hit.get("_source") or {}
+        at_uri = source.get("at_uri")
+        like_count = coerce_like_count(source.get("like_count"))
+        if at_uri and like_count is not None:
+            like_counts[str(at_uri)] = like_count
+    return like_counts
+
+
 async def fetch_history_posts(
     client: httpx.AsyncClient,
     *,
@@ -814,7 +854,12 @@ def history_posts_json(history_posts: list[HistoryPost], handles_by_did: dict[st
     ]
 
 
-def top_k_posts_json(top_posts_by_model: dict[str, list[TopPost]], handles_by_did: dict[str, str]) -> list[dict[str, Any]]:
+def top_k_posts_json(
+    top_posts_by_model: dict[str, list[TopPost]],
+    handles_by_did: dict[str, str],
+    like_counts_by_uri: Optional[dict[str, int]] = None,
+) -> list[dict[str, Any]]:
+    like_counts_by_uri = like_counts_by_uri or {}
     rows: list[dict[str, Any]] = []
     for model_run_id, top_posts in top_posts_by_model.items():
         for post in top_posts:
@@ -829,6 +874,7 @@ def top_k_posts_json(top_posts_by_model: dict[str, list[TopPost]], handles_by_di
                     "handle": handles_by_did.get(post.author_did, post.author_did),
                     "record_created_at": post.record_created_at,
                     "content": post.content,
+                    "like_count": like_counts_by_uri.get(post.at_uri),
                 }
             )
     return rows
@@ -1057,6 +1103,21 @@ async def run_with_output_dir(args: argparse.Namespace, output_dir: Path) -> Pat
         model.run_id: topk_by_model[model.run_id].ranked(model.run_id)
         for model in models
     }
+    top_post_uris = {
+        post.at_uri
+        for top_posts in top_posts_by_model.values()
+        for post in top_posts
+        if post.at_uri
+    }
+    async with httpx.AsyncClient(timeout=600, verify=not bool(args.es_insecure)) as client:
+        with tqdm(total=1, desc="Querying ES top-k like counts", unit="step") as pbar:
+            like_counts_by_uri = await fetch_post_like_counts(
+                client,
+                es_host=args.es_host,
+                at_uris=top_post_uris,
+                api_key=api_key,
+            )
+            pbar.update(1)
     author_dids = {
         post.author_did
         for top_posts in top_posts_by_model.values()
@@ -1075,7 +1136,7 @@ async def run_with_output_dir(args: argparse.Namespace, output_dir: Path) -> Pat
         for model in models
     }
     history_rows = history_posts_json(history_posts, handles_by_did)
-    top_k_rows = top_k_posts_json(top_posts_by_model, handles_by_did)
+    top_k_rows = top_k_posts_json(top_posts_by_model, handles_by_did, like_counts_by_uri)
     summary = build_summary(
         args=args,
         output_dir=output_dir,
@@ -1106,7 +1167,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-did", required=True)
     parser.add_argument("--start-date", default=default_start_date)
     parser.add_argument("--end-date", default=default_end_date)
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--gcs-bucket", default=None)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--es-host", default=DEFAULT_ES_HOST)

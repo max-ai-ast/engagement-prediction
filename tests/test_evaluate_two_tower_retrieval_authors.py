@@ -156,6 +156,45 @@ def test_history_posts_preserve_es_like_order_and_debug_fields(retrieval_eval_mo
     assert rows[2]["embedding_present"] is False
 
 
+def test_fetch_post_like_counts_queries_es_posts(retrieval_eval_module, monkeypatch):
+    captured = {}
+
+    async def fake_es_search_json(client, *, es_host, index, body, api_key):
+        captured["client"] = client
+        captured["es_host"] = es_host
+        captured["index"] = index
+        captured["body"] = body
+        captured["api_key"] = api_key
+        return {
+            "hits": {
+                "hits": [
+                    {"_source": {"at_uri": "at://post/1", "like_count": 12}},
+                    {"_source": {"at_uri": "at://post/2", "like_count": "3"}},
+                    {"_source": {"at_uri": "at://post/3", "like_count": "not-an-int"}},
+                    {"_source": {"at_uri": "at://post/4"}},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(retrieval_eval_module, "es_search_json", fake_es_search_json)
+
+    like_counts = asyncio.run(
+        retrieval_eval_module.fetch_post_like_counts(
+            object(),
+            es_host="https://localhost:9200",
+            at_uris=["at://post/2", "at://post/1", "at://post/1"],
+            api_key="secret",
+        )
+    )
+
+    assert captured["index"] == retrieval_eval_module.POSTS_INDEX
+    assert captured["body"]["_source"] == ["at_uri", "like_count"]
+    assert captured["body"]["query"] == {"terms": {"at_uri": ["at://post/1", "at://post/2"]}}
+    assert captured["body"]["size"] == 2
+    assert captured["api_key"] == "secret"
+    assert like_counts == {"at://post/1": 12, "at://post/2": 3}
+
+
 def test_topk_accumulator_and_author_counts_match_exact_scores(retrieval_eval_module):
     accumulator = retrieval_eval_module.TopKAccumulator(2)
     first_batch = [
@@ -241,7 +280,11 @@ def test_output_dir_and_json_artifacts_are_written_by_default(retrieval_eval_mod
         embedding_model="all_MiniLM_L12_v2",
     )
     history_rows = [{"at_uri": "h1", "author_did": "did:h"}]
-    top_k_rows = retrieval_eval_module.top_k_posts_json(top_posts_by_model, {})
+    top_k_rows = retrieval_eval_module.top_k_posts_json(
+        top_posts_by_model,
+        {},
+        {"at://did:a/app.bsky.feed.post/p1": 17},
+    )
 
     retrieval_eval_module.write_output_artifacts(
         output_dir=output_dir,
@@ -260,6 +303,8 @@ def test_output_dir_and_json_artifacts_are_written_by_default(retrieval_eval_mod
     assert top_k_rows[0]["url"] == "https://bsky.app/profile/did:a/post/p1"
     assert top_k_rows[0]["author_did"] == "did:a"
     assert top_k_rows[0]["content"] == "post one"
+    assert top_k_rows[0]["like_count"] == 17
+    assert top_k_rows[1]["like_count"] is None
 
 
 def test_run_removes_empty_default_output_dir_on_failure(retrieval_eval_module, tmp_path, monkeypatch):
