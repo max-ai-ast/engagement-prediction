@@ -17,6 +17,7 @@ from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
     get_padded_embedding_history_and_mask_batched,
     get_padded_history_time_deltas,
+    get_padded_prior_cumulative_likes,
 )
 
 
@@ -147,6 +148,14 @@ def test_get_padded_history_time_deltas_padding_and_truncation():
     assert truncated.tolist() == pytest.approx([1.0, 2.0])
 
 
+def test_get_padded_prior_cumulative_likes_padding_and_truncation():
+    padded = get_padded_prior_cumulative_likes([10, 20], max_history_len=4)
+    assert padded.tolist() == [10, 20, 0, 0]
+
+    truncated = get_padded_prior_cumulative_likes([10, 20, 30], max_history_len=2)
+    assert truncated.tolist() == [10, 20]
+
+
 def test_classify_history_embeddings_shape_covers_public_shapes():
     assert classify_history_embeddings_shape([]) == "single_empty"
     assert classify_history_embeddings_shape([[]]) == "single_empty"
@@ -164,7 +173,7 @@ def test_classify_history_embeddings_shape_rejects_invalid_inputs():
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_empty_history():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [],
         max_history_len=3,
         embed_dim=2,
@@ -174,10 +183,11 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_single_empty_hist
     assert mask == [[False, False, False]]
     assert author_indices == [[AUTHOR_PAD_IDX, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]]
     assert time_deltas == [[0.0, 0.0, 0.0]]
+    assert prior_likes == [[0, 0, 0]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_history():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[1.0, 2.0], [3.0, 4.0]],
         max_history_len=3,
         embed_dim=2,
@@ -187,24 +197,27 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_single_history():
     assert mask == [[True, True, False]]
     assert author_indices == [[2, 3, AUTHOR_PAD_IDX]]
     assert time_deltas == [[0.0, 0.0, 0.0]]
+    assert prior_likes == [[0, 0, 0]]
 
 
-def test_get_padded_embedding_history_and_mask_batched_accepts_single_history_time_deltas():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+def test_get_padded_embedding_history_and_mask_batched_accepts_single_history_time_deltas_and_prior_likes():
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[1.0, 2.0], [3.0, 4.0]],
         max_history_len=3,
         embed_dim=2,
         author_indices=[2, 3],
         time_deltas_hours=[1.5, 2.25],
+        prior_cumulative_likes=[10, 20],
     )
     assert padded == [[[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]]
     assert mask == [[True, True, False]]
     assert author_indices == [[2, 3, AUTHOR_PAD_IDX]]
     assert time_deltas == [[1.5, 2.25, 0.0]]
+    assert prior_likes == [[10, 20, 0]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_defaults_single_history_author_indices_to_unknown():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[1.0, 2.0], [3.0, 4.0]],
         max_history_len=3,
         embed_dim=2,
@@ -214,10 +227,11 @@ def test_get_padded_embedding_history_and_mask_batched_defaults_single_history_a
     assert mask == [[True, True, False]]
     assert author_indices == [[AUTHOR_UNK_IDX, AUTHOR_UNK_IDX, AUTHOR_PAD_IDX]]
     assert time_deltas == [[0.0, 0.0, 0.0]]
+    assert prior_likes == [[0, 0, 0]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories_and_normalizes_empty_entries():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[], [[1.0, 2.0], [3.0, 4.0]], [[]]],
         max_history_len=3,
         embed_dim=2,
@@ -243,15 +257,21 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories
         [0.0, 0.0, 0.0],
         [0.0, 0.0, 0.0],
     ]
+    assert prior_likes == [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+    ]
 
 
-def test_get_padded_embedding_history_and_mask_batched_accepts_batched_time_deltas():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+def test_get_padded_embedding_history_and_mask_batched_accepts_batched_time_deltas_and_prior_likes():
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[], [[1.0, 2.0], [3.0, 4.0]], [[]]],
         max_history_len=3,
         embed_dim=2,
         author_indices=[[], [2, 3], []],
         time_deltas_hours=[[], [1.5, 2.25], []],
+        prior_cumulative_likes=[[], [10, 20], []],
     )
     assert padded == [
         [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
@@ -273,10 +293,15 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_batched_time_delt
         [1.5, 2.25, 0.0],
         [0.0, 0.0, 0.0],
     ]
+    assert prior_likes == [
+        [0, 0, 0],
+        [10, 20, 0],
+        [0, 0, 0],
+    ]
 
 
 def test_get_padded_embedding_history_and_mask_batched_defaults_batched_author_indices_to_unknown():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[], [[1.0, 2.0]], [[]]],
         max_history_len=2,
         embed_dim=2,
@@ -302,10 +327,15 @@ def test_get_padded_embedding_history_and_mask_batched_defaults_batched_author_i
         [0.0, 0.0],
         [0.0, 0.0],
     ]
+    assert prior_likes == [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ]
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_nested_empty_history():
-    padded, mask, author_indices, time_deltas = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices, time_deltas, prior_likes = get_padded_embedding_history_and_mask_batched(
         [[]],
         max_history_len=2,
         embed_dim=2,
@@ -315,6 +345,7 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_single_nested_emp
     assert mask == [[False, False]]
     assert author_indices == [[AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]]
     assert time_deltas == [[0.0, 0.0]]
+    assert prior_likes == [[0, 0]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_rejects_non_list_top_level():
@@ -386,6 +417,28 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_time_delta_histor
             embed_dim=2,
             author_indices=[2, 3],
             time_deltas_hours=[1.5],
+        )
+
+
+def test_get_padded_embedding_history_and_mask_batched_rejects_prior_likes_batch_size_mismatch():
+    with pytest.raises(ValueError, match="Batch size of history_embeddings and prior_cumulative_likes must match"):
+        get_padded_embedding_history_and_mask_batched(
+            [[[1.0, 2.0]], [[3.0, 4.0]]],
+            max_history_len=3,
+            embed_dim=2,
+            author_indices=[[2], [3]],
+            prior_cumulative_likes=[[10]],
+        )
+
+
+def test_get_padded_embedding_history_and_mask_batched_rejects_prior_likes_history_length_mismatch():
+    with pytest.raises(ValueError, match="Length of prior_cumulative_likes must match history length"):
+        get_padded_embedding_history_and_mask_batched(
+            [[1.0, 2.0], [3.0, 4.0]],
+            max_history_len=3,
+            embed_dim=2,
+            author_indices=[2, 3],
+            prior_cumulative_likes=[10],
         )
 
 
