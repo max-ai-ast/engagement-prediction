@@ -85,7 +85,7 @@ def _build_user_history_directory(
         logger.warning(
             "STRONG WARNING: max_prior_likes is not finite; target-time history popularity "
             "lookups will be uncapped and may use high memory. Set max_prior_likes to bound "
-            "the Stage 2 explode/join/regroup step."
+            "the Stage 2 rank/join/group step."
         )
     likes_schema = likes_lf.collect_schema()
     include_author_idx = "author_idx" in likes_schema
@@ -129,48 +129,30 @@ def _build_user_history_directory(
             .cast(pl.Float32)
             .alias("prior_like_age_hours_at_bucket_start"),
         )
-    ) # [did, like_hour_bucket, record_created_at, emb_idx, (author_idx)]
-
-    def _get_agg_expr(col_name: str):
-        # Build aggregation expression: sort by recency (descending) and optionally cap
-        # The result is a list of emb_idx values, most recent first
-        agg_expr = (
-            pl.col(col_name)
-            .sort_by(pl.col(TIMESTAMP_COL_NAME), descending=True)
-        )
-        if max_prior_likes is not None and max_prior_likes > 0:
-            agg_expr = agg_expr.head(max_prior_likes)
-        return agg_expr
-    
-    agg_exprs = [
-        _get_agg_expr("emb_idx").alias("prior_emb_indices"),
-        pl.len().alias("raw_prior_count"),
-        _get_agg_expr("prior_like_age_hours_at_bucket_start").alias("prior_like_age_hours_at_bucket_start"),
-    ]
-    if include_author_idx:
-        agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
-
-    # Group by user and hour bucket, and collect prior emb_idx as list.
-    # Also compute raw (uncapped) count for distribution analysis.
-    history_lists_lf = (
-        pairs_with_prior_likes_lf
-        .group_by(["did", "like_hour_bucket"])
-        .agg(agg_exprs)
-    )
-
-    logger.info("Adding target-hour popularity counts to capped history lists...")
-    history_lists_with_idx_lf = history_lists_lf.with_row_index("_history_group_idx")
-    exploded_history_lf = (
-        history_lists_with_idx_lf
-        .explode([
-            "prior_emb_indices",
+        .select([
+            "did",
+            "like_hour_bucket",
+            "emb_idx",
             "prior_like_age_hours_at_bucket_start",
-            *(['prior_author_indices'] if include_author_idx else []),
+            *(["author_idx"] if include_author_idx else []),
         ])
+    ) # [did, like_hour_bucket, emb_idx, prior_like_age_hours_at_bucket_start, (author_idx)]
+
+    ranked_prior_likes_lf = (
+        pairs_with_prior_likes_lf
         .with_columns(
-            pl.col("prior_emb_indices").cast(pl.UInt32).alias("emb_idx")
+            pl.len().over(["did", "like_hour_bucket"]).alias("raw_prior_count"),
+            pl.col("prior_like_age_hours_at_bucket_start")
+            .rank(method="ordinal")
+            .over(["did", "like_hour_bucket"])
+            .alias("_prior_rank"),
+            pl.col("emb_idx").cast(pl.UInt32).alias("emb_idx"),
         )
-    )
+    ) # [did, like_hour_bucket, emb_idx, prior_like_age_hours_at_bucket_start, (author_idx), raw_prior_count, _prior_rank]
+    if max_prior_likes is not None and max_prior_likes > 0:
+        ranked_prior_likes_lf = ranked_prior_likes_lf.filter(pl.col("_prior_rank") <= max_prior_likes)
+
+    logger.info("Adding target-hour popularity counts to capped history rows...")
     popularity_lf = (
         liked_post_hour_cumulative_likes_lf
         .select(["emb_idx", "popularity_hour_bucket", "prior_cumulative_likes"])
@@ -180,7 +162,7 @@ def _build_user_history_directory(
         )
     )
     history_with_popularity_lf = (
-        exploded_history_lf
+        ranked_prior_likes_lf
         .sort(["like_hour_bucket", "emb_idx"])
         .join_asof(
             popularity_lf.sort(["popularity_hour_bucket", "emb_idx"]),
@@ -194,21 +176,18 @@ def _build_user_history_directory(
             pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64)
         )
     )
-    regroup_exprs = [
-        pl.col("prior_emb_indices").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_emb_indices"),
+    agg_exprs = [
+        pl.col("emb_idx").sort_by(pl.col("_prior_rank")).alias("prior_emb_indices"),
         pl.col("raw_prior_count").first().alias("raw_prior_count"),
-        pl.col("prior_like_age_hours_at_bucket_start").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_like_age_hours_at_bucket_start"),
-        pl.col("prior_cumulative_likes").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_cumulative_likes"),
+        pl.col("prior_like_age_hours_at_bucket_start").sort_by(pl.col("_prior_rank")).alias("prior_like_age_hours_at_bucket_start"),
+        pl.col("prior_cumulative_likes").sort_by(pl.col("_prior_rank")).alias("prior_cumulative_likes"),
     ]
     if include_author_idx:
-        regroup_exprs += [
-            pl.col("prior_author_indices").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_author_indices")
-        ]
+        agg_exprs += [pl.col("author_idx").sort_by(pl.col("_prior_rank")).alias("prior_author_indices")]
     history_lists_with_counts_lf = (
         history_with_popularity_lf
-        .group_by(["_history_group_idx", "did", "like_hour_bucket"])
-        .agg(regroup_exprs)
-        .drop("_history_group_idx")
+        .group_by(["did", "like_hour_bucket"])
+        .agg(agg_exprs)
     )
     pairs_with_history_list_lf = (
         user_bucket_pairs_lf
@@ -446,7 +425,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # === Build user history directory ===
     log_operation_start('Build user history directory', 'STAGE_02_USER_HISTORY', logger)
 
-    mem_tracker.checkpoint("before_history_explode_join_regroup", quiet=True)
+    mem_tracker.checkpoint("before_history_rank_join_group", quiet=True)
     directory_lf = _build_user_history_directory(
         likes_lf=likes_lf,
         liked_post_hour_cumulative_likes_lf=liked_post_hour_cumulative_likes_lf,
@@ -463,7 +442,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # is processed in batches rather than fully materialised in memory.
     # Falls back to the default engine automatically if the plan can't be streamed.
     directory_df = directory_lf.collect(engine="streaming")
-    mem_tracker.checkpoint("after_history_explode_join_regroup", quiet=True)
+    mem_tracker.checkpoint("after_history_rank_join_group", quiet=True)
 
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
