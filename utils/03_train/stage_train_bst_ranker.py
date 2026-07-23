@@ -958,10 +958,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     clear_cuda_memory()
     random_seed = int(args.random_seed)
     set_random_seeds(random_seed)
+    use_popularity_feature = bool(args.bst_use_popularity_feature)
 
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
     embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim = load_bucketed_training_data(
-        context, logger=logger,
+        context,
+        logger=logger,
+        require_target_hour_history_popularity=use_popularity_feature,
     )
     log_prior_stage_inputs(context, logger)
 
@@ -982,7 +985,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
-    use_popularity_feature = bool(args.bst_use_popularity_feature)
     popularity_projection_dim = int(args.bst_popularity_projection_dim)
     batch_size = int(args.batch_size)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)

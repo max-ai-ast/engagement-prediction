@@ -218,7 +218,8 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     created_datasets = []
     eval_calls = []
 
-    def fake_load_bucketed_training_data(context, logger=None):
+    def fake_load_bucketed_training_data(context, logger=None, require_target_hour_history_popularity=False):
+        assert require_target_hour_history_popularity is False
         return (
             np.zeros((4, 2), dtype=np.float32),
             object(),

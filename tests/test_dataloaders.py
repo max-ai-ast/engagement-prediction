@@ -1,4 +1,5 @@
 """Tests for bucketed two-tower dataloaders."""
+import json
 from datetime import datetime, timezone
 
 import numpy as np
@@ -12,6 +13,7 @@ from utils.dataloaders import (
     BucketedEngagementDataset,
     create_bucketed_data_loaders,
     get_author_table_num_rows,
+    validate_history_popularity_semantics,
 )
 
 
@@ -101,6 +103,28 @@ def test_get_author_table_num_rows_empty_mapping_still_reserves_pad_and_unk_rows
     })
 
     assert get_author_table_num_rows(author_idx_mapping_df) == 2
+
+
+def test_validate_history_popularity_semantics_accepts_target_hour_summary(tmp_path):
+    (tmp_path / "summary.json").write_text(json.dumps({
+        "history_prior_cumulative_likes_semantics": "target_hour",
+    }))
+
+    validate_history_popularity_semantics(tmp_path)
+
+
+def test_validate_history_popularity_semantics_rejects_stale_summary(tmp_path):
+    (tmp_path / "summary.json").write_text(json.dumps({
+        "history_prior_cumulative_likes_semantics": "liked_hour",
+    }))
+
+    with pytest.raises(RuntimeError, match="target-hour history prior_cumulative_likes"):
+        validate_history_popularity_semantics(tmp_path)
+
+
+def test_validate_history_popularity_semantics_rejects_missing_summary(tmp_path):
+    with pytest.raises(RuntimeError, match="summary.json"):
+        validate_history_popularity_semantics(tmp_path)
 
 
 def test_bucketed_dataset_groups_user_hours_and_joins_history(bucketed_dataset):

@@ -20,6 +20,10 @@ from datetime import datetime, timedelta, timezone
 import multiprocessing as mp
 import subprocess
 
+
+HISTORY_POPULARITY_SEMANTICS = "target_hour"
+
+
 if TYPE_CHECKING:  # pragma: no cover
     import numpy as np  # type: ignore
     import pandas as pd  # type: ignore

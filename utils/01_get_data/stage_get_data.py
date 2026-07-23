@@ -54,6 +54,7 @@ Process posts (single scan, metadata only):
   - Left-join liked URIs.
   - Keep posts that are in the negative sample OR are liked.
   - Compute exact prior_cumulative_likes afterward for only the selected positive and negative post-hour pairs.
+  - Write a sparse liked-post popularity curve for final liked/history posts only.
   - Collect metadata-only DataFrame (NO embedding expansion here).
   - Assign emb_idx as row number for later memmap lookup.
 
@@ -104,6 +105,7 @@ OUTPUTS
 Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, prior_cumulative_likes, emb_idx, author_did, author_idx
   - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
+  - liked_post_hour_cumulative_likes_*.parquet: emb_idx, popularity_hour_bucket, prior_cumulative_likes
   - author_idx_*.parquet: author_did, author_train_count, author_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
   - summary.json: full filtering statistics and parameters
@@ -791,6 +793,78 @@ def _build_exact_prior_cumulative_likes_df(
     return prior_counts_df.select(list(output_schema.keys())), stats
 
 
+def _build_liked_post_hour_cumulative_likes_df(
+    raw_likes_lf: pl.LazyFrame,
+    liked_post_mapping_df: pl.DataFrame,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    output_schema = {
+        "emb_idx": pl.UInt32,
+        "popularity_hour_bucket": pl.Datetime(time_zone="UTC"),
+        "prior_cumulative_likes": pl.UInt64,
+    }
+    if liked_post_mapping_df.height == 0:
+        stats = {
+            "n_liked_history_posts": 0,
+            "n_liked_post_popularity_source_like_rows": 0,
+            "n_liked_post_popularity_hourly_rows": 0,
+            "n_liked_post_popularity_output_rows": 0,
+        }
+        return pl.DataFrame(schema=output_schema), stats
+
+    liked_posts_lf = (
+        liked_post_mapping_df
+        .with_columns(pl.col("emb_idx").cast(pl.UInt32))
+        .lazy()
+    )
+    hourly_likes_df = (
+        raw_likes_lf
+        .select(["subject_uri", TIMESTAMP_COL_NAME])
+        .join(liked_posts_lf, on="subject_uri", how="inner")
+        .with_columns(
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_like_hour_bucket")
+        )
+        .group_by(["emb_idx", "_like_hour_bucket"])
+        .len()
+        .rename({"len": "likes_this_hour"})
+        .with_columns(
+            pl.col("likes_this_hour").cast(pl.UInt64)
+        )
+        .collect(engine="streaming")
+    ) # emb_idx, _like_hour_bucket, likes_this_hour
+    n_source_like_rows = int(hourly_likes_df["likes_this_hour"].sum()) if hourly_likes_df.height > 0 else 0
+    if hourly_likes_df.height == 0:
+        liked_post_hour_cumulative_likes_df = pl.DataFrame(schema=output_schema)
+    else:
+        liked_post_hour_cumulative_likes_df = (
+            hourly_likes_df
+            .sort(["emb_idx", "_like_hour_bucket"])
+            .with_columns(
+                pl.col("likes_this_hour").cum_sum().over("emb_idx").alias("prior_cumulative_likes")
+            )
+            .select(
+                "emb_idx",
+                (pl.col("_like_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
+                pl.col("prior_cumulative_likes").cast(pl.UInt64),
+            )
+        ) # emb_idx, popularity_hour_bucket, prior_cumulative_likes
+
+    stats = {
+        "n_liked_history_posts": liked_post_mapping_df["emb_idx"].n_unique(),
+        "n_liked_post_popularity_source_like_rows": n_source_like_rows,
+        "n_liked_post_popularity_hourly_rows": hourly_likes_df.height,
+        "n_liked_post_popularity_output_rows": liked_post_hour_cumulative_likes_df.height,
+    }
+    if logger is not None:
+        logger.info(
+            "Built liked-post sparse popularity curve: "
+            f"{stats['n_liked_post_popularity_output_rows']:,} hourly rows across "
+            f"{stats['n_liked_history_posts']:,} final liked/history posts; "
+            f"{stats['n_liked_post_popularity_source_like_rows']:,} raw like rows"
+        )
+    return liked_post_hour_cumulative_likes_df.select(list(output_schema.keys())), stats
+
+
 def _add_prior_cumulative_likes_to_likes(
     likes_core_df: pl.DataFrame,
     prior_counts_df: pl.DataFrame,
@@ -1371,6 +1445,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         likes_core_path, 
         posts_core_path, 
         author_idx_path,
+        liked_post_hour_cumulative_likes_path,
         embeddings_path, 
         embed_dim, 
         all_stats
@@ -1487,6 +1562,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'embedding_dim': embed_dim,
             'embeddings_file': str(embeddings_path.name) if embeddings_path is not None else None,
             'author_idx_file': author_idx_path.name,
+            'liked_post_hour_cumulative_likes_file': liked_post_hour_cumulative_likes_path.name,
             'embeddings_written': not skip_embeddings,
         },
         'filtering_stats': all_stats,
@@ -1511,6 +1587,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"N_posts_core: {n_posts}",
         f"embedding_dim: {embed_dim}",
         f"embeddings_file: {embeddings_path.name if embeddings_path is not None else 'SKIPPED'}",
+        f"liked_post_hour_cumulative_likes_file: {liked_post_hour_cumulative_likes_path.name}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
     
@@ -1522,6 +1599,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'likes_core_path': str(likes_core_path),
             'posts_core_path': str(posts_core_path),
             'author_idx_path': str(author_idx_path),
+            'liked_post_hour_cumulative_likes_path': str(liked_post_hour_cumulative_likes_path),
             'embeddings_path': str(embeddings_path) if embeddings_path is not None else None,
             'embed_dim': embed_dim,
         },
@@ -1699,7 +1777,7 @@ def _run_greenearth_pipeline(
     holdout_end: Optional[str],
     embedding_model: str,
     skip_embeddings: bool,
-) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Path, Optional[Path], int, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Path, Path, Optional[Path], int, Dict[str, Any]]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
     
@@ -2043,10 +2121,26 @@ def _run_greenearth_pipeline(
     # PHASE 8: Save parquets (FINAL - after all filtering complete)
     # ========================================================================
     log_operation_start('Save parquet files', '01_GET_DATA', logger)
+
+    log_operation_start('Build liked-post sparse popularity curve', '01_GET_DATA', logger)
+    mem_tracker.checkpoint("before_liked_post_popularity_curve", quiet=True)
+    liked_post_mapping_for_history_df = (
+        likes_core_df
+        .select(["subject_uri", "emb_idx"])
+        .unique(subset=["subject_uri"])
+    )
+    liked_post_hour_cumulative_likes_df, liked_post_popularity_stats = _build_liked_post_hour_cumulative_likes_df(
+        raw_likes_lf=raw_likes_lf,
+        liked_post_mapping_df=liked_post_mapping_for_history_df,
+        logger=logger,
+    )
+    all_stats['liked_post_hour_cumulative_likes'] = liked_post_popularity_stats
+    mem_tracker.checkpoint("after_liked_post_popularity_curve", quiet=True)
     
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
     author_idx_path = out_dir / f"author_idx_{ts_name}.parquet"
+    liked_post_hour_cumulative_likes_path = out_dir / f"liked_post_hour_cumulative_likes_{ts_name}.parquet"
     
     posts_core_df.write_parquet(posts_core_path, compression="zstd")
     logger.info(f"Saved posts_core: {posts_core_path} ({len(posts_core_df):,} rows)")
@@ -2056,6 +2150,12 @@ def _run_greenearth_pipeline(
 
     author_idx_df.write_parquet(author_idx_path, compression="zstd")
     logger.info(f"Saved author_idx: {author_idx_path} ({len(author_idx_df):,} rows)")
+
+    liked_post_hour_cumulative_likes_df.write_parquet(liked_post_hour_cumulative_likes_path, compression="zstd")
+    logger.info(
+        f"Saved liked_post_hour_cumulative_likes: {liked_post_hour_cumulative_likes_path} "
+        f"({len(liked_post_hour_cumulative_likes_df):,} rows)"
+    )
     
     mem_tracker.checkpoint("after_parquet_save", quiet=True)
     
@@ -2075,7 +2175,17 @@ def _run_greenearth_pipeline(
     max_trainval_users_for_report = max_trainval_users if max_trainval_users is not None else 0
     _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_trainval_users_for_report, logger)
     
-    return likes_core_df, posts_core_df, likes_core_path, posts_core_path, author_idx_path, embeddings_path, embed_dim, all_stats
+    return (
+        likes_core_df,
+        posts_core_df,
+        likes_core_path,
+        posts_core_path,
+        author_idx_path,
+        liked_post_hour_cumulative_likes_path,
+        embeddings_path,
+        embed_dim,
+        all_stats,
+    )
 
 
 def _filter_likes_after_post_join(

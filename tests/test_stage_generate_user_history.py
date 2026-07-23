@@ -27,7 +27,22 @@ def stage_module():
 
 @pytest.fixture
 def build_history(stage_module):
-    return stage_module._build_user_history_directory
+    def _build_history(
+        *,
+        likes_lf: pl.LazyFrame,
+        max_prior_likes: int | None,
+        logger: logging.Logger,
+        liked_post_hour_cumulative_likes_lf: pl.LazyFrame | None = None,
+    ) -> pl.LazyFrame:
+        if liked_post_hour_cumulative_likes_lf is None:
+            liked_post_hour_cumulative_likes_lf = _default_popularity_curve(likes_lf)
+        return stage_module._build_user_history_directory(
+            likes_lf=likes_lf,
+            liked_post_hour_cumulative_likes_lf=liked_post_hour_cumulative_likes_lf,
+            max_prior_likes=max_prior_likes,
+            logger=logger,
+        )
+    return _build_history
 
 
 def _make_test_logger() -> logging.Logger:
@@ -64,6 +79,33 @@ def _make_likes(
     if author_idxs is not None:
         data["author_idx"] = author_idxs
     return pl.DataFrame(data).lazy()
+
+
+def _default_popularity_curve(likes_lf: pl.LazyFrame) -> pl.LazyFrame:
+    likes_df = likes_lf.collect()
+    return (
+        likes_df
+        .select(["emb_idx", "like_hour_bucket", "prior_cumulative_likes"])
+        .rename({"like_hour_bucket": "popularity_hour_bucket"})
+        .with_columns(
+            pl.col("emb_idx").cast(pl.UInt32),
+            (pl.col("popularity_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
+            pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64),
+        )
+        .lazy()
+    )
+
+
+def _make_popularity_curve(
+    emb_idxs: list[int],
+    popularity_hour_buckets: list[datetime],
+    prior_cumulative_likes: list[int],
+) -> pl.LazyFrame:
+    return pl.DataFrame({
+        "emb_idx": pl.Series(emb_idxs, dtype=pl.UInt32),
+        "popularity_hour_bucket": popularity_hour_buckets,
+        "prior_cumulative_likes": pl.Series(prior_cumulative_likes, dtype=pl.UInt64),
+    }).lazy()
 
 
 def _history_by_bucket(df: pl.DataFrame) -> dict[datetime, list[int]]:
@@ -178,6 +220,70 @@ def test_user_hour_history_excludes_same_hour_likes(build_history):
     assert row["raw_prior_count"][0] == 1
 
 
+def test_user_hour_history_popularity_uses_target_hour_counts(build_history):
+    logger = _make_test_logger()
+    likes_lf = _make_likes(
+        ["u1", "u1"],
+        [
+            datetime(2024, 1, 1, 10, 15),
+            datetime(2024, 1, 1, 12, 5),
+        ],
+        ["p1", "p2"],
+        [100, 200],
+        [5, 25],
+    )
+    popularity_lf = _make_popularity_curve(
+        [100, 100, 200],
+        [
+            datetime(2024, 1, 1, 11),
+            datetime(2024, 1, 1, 12),
+            datetime(2024, 1, 1, 13),
+        ],
+        [5, 99, 25],
+    )
+
+    result = build_history(
+        likes_lf=likes_lf,
+        liked_post_hour_cumulative_likes_lf=popularity_lf,
+        max_prior_likes=None,
+        logger=logger,
+    ).collect()
+
+    row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 12))
+    assert row["prior_emb_indices"][0].to_list() == [100]
+    assert row["prior_cumulative_likes"][0].to_list() == [99]
+
+
+def test_user_hour_history_missing_popularity_curve_rows_fill_zero(build_history):
+    logger = _make_test_logger()
+    likes_lf = _make_likes(
+        ["u1", "u1"],
+        [
+            datetime(2024, 1, 1, 10, 15),
+            datetime(2024, 1, 1, 11, 5),
+        ],
+        ["p1", "p2"],
+        [100, 200],
+        [5, 25],
+    )
+    popularity_lf = _make_popularity_curve(
+        [200],
+        [datetime(2024, 1, 1, 12)],
+        [25],
+    )
+
+    result = build_history(
+        likes_lf=likes_lf,
+        liked_post_hour_cumulative_likes_lf=popularity_lf,
+        max_prior_likes=None,
+        logger=logger,
+    ).collect()
+
+    row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 11))
+    assert row["prior_emb_indices"][0].to_list() == [100]
+    assert row["prior_cumulative_likes"][0].to_list() == [0]
+
+
 def test_user_hour_history_multiple_users(build_history):
     logger = _make_test_logger()
     likes_lf = _make_likes(
@@ -234,7 +340,7 @@ def test_user_hour_history_output_schema(build_history):
     assert result.schema["prior_cumulative_likes"] == pl.List(pl.UInt64)
 
 
-def test_user_hour_history_requires_prior_cumulative_likes(build_history):
+def test_user_hour_history_requires_liked_post_popularity_curve_columns(build_history):
     logger = _make_test_logger()
     likes_lf = pl.DataFrame({
         "did": ["u1"],
@@ -243,10 +349,14 @@ def test_user_hour_history_requires_prior_cumulative_likes(build_history):
         "subject_uri": ["p1"],
         "emb_idx": [100],
     }).lazy()
+    bad_popularity_lf = pl.DataFrame({
+        "subject_uri": ["p1"],
+    }).lazy()
 
-    with pytest.raises(ValueError, match="prior_cumulative_likes"):
+    with pytest.raises(ValueError, match="liked_post_hour_cumulative_likes"):
         build_history(
             likes_lf=likes_lf,
+            liked_post_hour_cumulative_likes_lf=bad_popularity_lf,
             max_prior_likes=None,
             logger=logger,
         )

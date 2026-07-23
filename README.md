@@ -119,9 +119,10 @@ Important Stage 1 behavior:
 - `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
 - `negative_sampling_alpha` weights negative sampling by `global_like_count ** alpha`.
 - `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
+- `liked_post_hour_cumulative_likes_*.parquet` stores sparse prior-hour popularity curves keyed by `emb_idx` for final liked/history posts only. It is used by Stage 2 history features, not sampled negatives.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
-Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
+Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
 
 ### Stage 2: User History
 
@@ -131,7 +132,7 @@ The history artifact includes:
 
 - `prior_emb_indices`: prior liked post embedding ids, sorted most-recent first.
 - `prior_like_age_hours_at_bucket_start`: age of each prior like relative to the target hour bucket, aligned with `prior_emb_indices`.
-- `prior_cumulative_likes`: prior-hour popularity count for each prior liked post, aligned with `prior_emb_indices`.
+- `prior_cumulative_likes`: prior-hour popularity count for each prior liked post as of the target `like_hour_bucket`, aligned with `prior_emb_indices`.
 - `prior_author_indices`: aligned author ids when Stage 1 wrote author metadata.
 - `raw_prior_count`: uncapped count before `max_prior_likes`.
 

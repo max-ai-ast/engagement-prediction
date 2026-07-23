@@ -49,6 +49,7 @@ Utilities:
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -67,6 +68,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
     validate_dataframe_schema,
+    HISTORY_POPULARITY_SEMANTICS,
 )
 from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
@@ -907,6 +909,26 @@ def _resolve_prior(
     return context.resolve_prior_output(folder, prior_path=context.prior_outputs.get(folder))
 
 
+def validate_history_popularity_semantics(history_dir: Path) -> None:
+    summary_path = history_dir / "summary.json"
+    if not summary_path.exists():
+        raise RuntimeError(
+            "BST popularity features require a Stage 2 summary.json with "
+            f"history_prior_cumulative_likes_semantics={HISTORY_POPULARITY_SEMANTICS!r}. "
+            "Rerun Stage 2 from a Stage 1 output that includes liked_post_hour_cumulative_likes. "
+            f"Missing: {summary_path}"
+        )
+    with open(summary_path) as f:
+        summary = json.load(f)
+    actual_semantics = summary.get("history_prior_cumulative_likes_semantics")
+    if actual_semantics != HISTORY_POPULARITY_SEMANTICS:
+        raise RuntimeError(
+            "BST popularity features require target-hour history prior_cumulative_likes. "
+            f"Expected history_prior_cumulative_likes_semantics={HISTORY_POPULARITY_SEMANTICS!r}, "
+            f"got {actual_semantics!r} in {summary_path}. Rerun Stage 2."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bucketed two-tower data path
 # ---------------------------------------------------------------------------
@@ -914,6 +936,7 @@ def _resolve_prior(
 def load_bucketed_training_data(
     context: Context,
     logger: Optional[logging.Logger] = None,
+    require_target_hour_history_popularity: bool = False,
 ) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, pl.DataFrame, Optional[pl.DataFrame], int]:
     """Locate and load artifacts for bucketed two-tower training."""
     if logger is None:
@@ -946,6 +969,8 @@ def load_bucketed_training_data(
 
     log_operation_start("Locate user_history", "DATALOADERS", logger)
     history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
+    if require_target_hour_history_popularity:
+        validate_history_popularity_semantics(history_dir)
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 

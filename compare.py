@@ -303,6 +303,7 @@ def cmd_compare_rankers(
     embeddings_mmap, likes_core_df, posts_core_df, history_df, _author_idx_mapping_df, embed_dim = load_bucketed_training_data(
         ctx,
         logger=logger,
+        require_target_hour_history_popularity=use_popularity_feature_for_compare,
     )
 
     worker_kw: Dict[str, Any] = {
