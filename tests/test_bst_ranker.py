@@ -552,6 +552,33 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
         assert 0.0 <= metrics[metric_name] <= 1.0
 
 
+def test_run_bst_listwise_epoch_reports_zero_history_metrics():
+    model = _make_model()
+    model.eval()
+    batch = {key: value.clone() for key, value in _listwise_batch().items()}
+    batch["history_mask"][1] = False
+    loader = DataLoader(_SingleBatchDataset(batch), batch_size=None, shuffle=False)
+
+    _, metrics = run_bst_listwise_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=loader,
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+        metrics_top_ks=[1, 2],
+    )
+
+    assert metrics["zero_history_rank_metric_user_count"] == 1
+    assert metrics["zero_history_ndcg@1"] == pytest.approx(1.0)
+    assert metrics["zero_history_recall@1"] == pytest.approx(0.5)
+    assert metrics["zero_history_ndcg@2"] == pytest.approx(1.0)
+    assert metrics["zero_history_recall@2"] == pytest.approx(1.0)
+    assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
+
+
 def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric_and_checkpoint(
     tmp_path,
     monkeypatch,

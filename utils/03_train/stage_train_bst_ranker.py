@@ -40,8 +40,12 @@ from utils.matrix_ranking import (
     MatrixBatchScores,
     empty_rank_metric_sums,
     evaluate_matrix_scorer,
+    finalize_rank_metrics,
+    finalize_zero_history_rank_metrics,
+    log_zero_history_rank_metrics,
     rank_metric_sums_for_batch,
     stage_info_metric_lines,
+    zero_history_rank_metric_sums_for_batch,
 )
 from utils.pipeline.core import Context
 from utils.author_features import ProjectedPostFeatureEncoder
@@ -654,6 +658,8 @@ def run_bst_listwise_epoch(
     batches = 0
     metric_sums = empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
+    zero_history_metric_sums = empty_rank_metric_sums(metrics_top_ks)
+    zero_history_metric_user_count = 0
 
     with nullcontext() if train else torch.inference_mode():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress)):
@@ -669,6 +675,11 @@ def run_bst_listwise_epoch(
                 ranked_labels,
                 metrics_top_ks,
             )
+            batch_zero_history_metric_sums, batch_zero_history_metric_user_count = zero_history_rank_metric_sums_for_batch(
+                batch,
+                ranked_labels,
+                metrics_top_ks,
+            )
 
             if train and optimizer is not None:
                 loss.backward()
@@ -680,12 +691,13 @@ def run_bst_listwise_epoch(
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
+            zero_history_metric_user_count += batch_zero_history_metric_user_count
+            for key, value in batch_zero_history_metric_sums.items():
+                zero_history_metric_sums[key] += value
 
     loss = (loss_sum / max(batches, 1)).item()
-    metrics: Dict[str, Any] = {
-        key: value / metric_user_count if metric_user_count > 0 else 0.0
-        for key, value in metric_sums.items()
-    }
+    metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
+    metrics.update(finalize_zero_history_rank_metrics(zero_history_metric_sums, zero_history_metric_user_count))
     metrics["loss"] = loss
     metrics["rank_metric_user_count"] = metric_user_count
     return loss, metrics
@@ -771,6 +783,16 @@ def _log_bst_listwise_epoch_metrics(
                 if metric_value is None:
                     continue
                 experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
+    log_zero_history_rank_metrics(
+        experiment_tracker,
+        {
+            "train": train_metrics,
+            "validation": val_metrics,
+            "validation_unseen_users": val_unseen_metrics,
+        },
+        metrics_top_ks,
+        iteration,
+    )
 
 
 def train_bst_ranker_model(

@@ -124,6 +124,10 @@ def test_evaluate_two_tower_model_reports_auc_and_average_precision():
     assert metrics["classification_metric_sampled_pair_count"] == 6
     assert metrics["classification_metric_sampled"] is False
     assert metrics["loss"] == pytest.approx(0.0)
+    assert metrics["zero_history_rank_metric_user_count"] == 0
+    assert metrics["zero_history_ndcg@1"] == pytest.approx(0.0)
+    assert metrics["zero_history_recall@1"] == pytest.approx(0.0)
+    assert metrics["zero_history_mean_average_precision"] == pytest.approx(0.0)
     assert result["ranking_rows"] == []
 
 
@@ -159,7 +163,42 @@ def test_evaluate_matrix_scorer_reports_metrics_without_loss():
     assert metrics["classification_average_precision"] == pytest.approx(1.0)
     assert metrics["mean_average_precision"] == pytest.approx(1.0)
     assert metrics["classification_metric_pair_count"] == 6
+    assert metrics["zero_history_rank_metric_user_count"] == 0
+    assert metrics["zero_history_ndcg@1"] == pytest.approx(0.0)
     assert len(result["ranking_rows"]) == 2
+
+
+def test_evaluate_matrix_scorer_reports_zero_history_subset_metrics():
+    labels = torch.tensor([
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ])
+    scorer = DummyMatrixScorer([labels])
+    dataloader = [{
+        "label_matrix": labels,
+        "history_mask": torch.tensor([
+            [False, False],
+            [True, False],
+            [False, False],
+        ]),
+    }]
+
+    result = _evaluate_matrix_scorer(
+        scorer=scorer,
+        data_loader=dataloader,
+        device="cpu",
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+    )
+
+    metrics = result["metrics"]
+    assert metrics["rank_metric_user_count"] == 3
+    assert metrics["zero_history_rank_metric_user_count"] == 2
+    assert metrics["zero_history_dcg@1"] == pytest.approx(1.0)
+    assert metrics["zero_history_ndcg@1"] == pytest.approx(1.0)
+    assert metrics["zero_history_recall@1"] == pytest.approx(1.0)
+    assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
 
 
 def test_evaluate_matrix_scorer_reports_mean_average_precision_separately_from_classification_ap():
@@ -207,6 +246,46 @@ def test_evaluate_matrix_scorer_averages_optional_loss():
 
     assert result["metrics"]["loss"] == pytest.approx(3.0)
     assert result["metrics"]["rank_metric_user_count"] == 3
+    assert result["metrics"]["zero_history_rank_metric_user_count"] == 0
+
+
+def test_run_matrix_epoch_accumulates_zero_history_metrics_across_batches():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [
+        {
+            "label_matrix": torch.tensor([
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ]),
+            "history_mask": torch.tensor([
+                [False, False],
+                [True, False],
+            ]),
+        },
+        {
+            "label_matrix": torch.tensor([[1.0, 0.0, 0.0]]),
+            "history_mask": torch.tensor([[False, False]]),
+        },
+    ]
+
+    _, metrics, _ = run_matrix_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=dataloader,
+        optimizer=None,
+        disable_progress=True,
+        embed_dim=0,
+        gradient_clip_max_norm=0.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=False,
+    )
+
+    assert metrics["zero_history_rank_metric_user_count"] == 2
+    assert metrics["zero_history_ndcg@1"] == pytest.approx(1.0)
+    assert metrics["zero_history_recall@1"] == pytest.approx(1.0)
+    assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
 
 
 def test_evaluate_matrix_scorer_rejects_score_label_shape_mismatch():

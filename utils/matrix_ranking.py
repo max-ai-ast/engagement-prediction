@@ -20,6 +20,8 @@ FINAL_CLASSIFICATION_METRICS = ("auc_roc", "classification_average_precision")
 CLASSIFICATION_METRIC_ALIASES = {
     "classification_average_precision": ("classification_average_precision", "average_precision"),
 }
+ZERO_HISTORY_METRIC_PREFIX = "zero_history_"
+ZERO_HISTORY_RANK_METRIC_USER_COUNT = f"{ZERO_HISTORY_METRIC_PREFIX}rank_metric_user_count"
 
 
 @dataclass
@@ -173,6 +175,37 @@ def finalize_rank_metrics(metric_sums: Dict[str, float], user_count: int) -> Dic
     }
 
 
+def zero_history_row_mask_for_batch(batch: Dict[str, Any], ranked_labels: torch.Tensor) -> torch.Tensor:
+    history_mask = batch.get("history_mask")
+    if history_mask is None:
+        return torch.zeros(ranked_labels.size(0), dtype=torch.bool, device=ranked_labels.device)
+    history_mask = history_mask.to(device=ranked_labels.device, dtype=torch.bool, non_blocking=True)
+    if history_mask.dim() != 2 or history_mask.size(0) != ranked_labels.size(0):
+        raise RuntimeError("history_mask must have shape [num_users, history_len]")
+    return history_mask.sum(dim=1) == 0
+
+
+def zero_history_rank_metric_sums_for_batch(
+    batch: Dict[str, Any],
+    ranked_labels: torch.Tensor,
+    metrics_top_ks: list[int],
+) -> Tuple[Dict[str, float], int]:
+    zero_history_mask = zero_history_row_mask_for_batch(batch, ranked_labels)
+    return rank_metric_sums_for_batch(ranked_labels[zero_history_mask], metrics_top_ks)
+
+
+def finalize_zero_history_rank_metrics(
+    metric_sums: Dict[str, float],
+    user_count: int,
+) -> Dict[str, float]:
+    metrics = {
+        f"{ZERO_HISTORY_METRIC_PREFIX}{key}": value
+        for key, value in finalize_rank_metrics(metric_sums, user_count).items()
+    }
+    metrics[ZERO_HISTORY_RANK_METRIC_USER_COUNT] = user_count
+    return metrics
+
+
 def ranking_rows_for_batch(
     batch: Dict[str, Any],
     scores: torch.Tensor,
@@ -268,6 +301,8 @@ def run_matrix_epoch(
     baseline_metric_user_count = 0
     metric_sums = empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
+    zero_history_metric_sums = empty_rank_metric_sums(metrics_top_ks)
+    zero_history_metric_user_count = 0
 
     with nullcontext() if train else torch.inference_mode():
         for batch in tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress):
@@ -289,6 +324,11 @@ def run_matrix_epoch(
             ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
+            batch_zero_history_metric_sums, batch_zero_history_metric_user_count = zero_history_rank_metric_sums_for_batch(
+                batch,
+                ranked_labels,
+                metrics_top_ks,
+            )
 
             if train and optimizer is not None:
                 loss.backward()
@@ -301,10 +341,14 @@ def run_matrix_epoch(
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
+            zero_history_metric_user_count += batch_zero_history_metric_user_count
+            for key, value in batch_zero_history_metric_sums.items():
+                zero_history_metric_sums[key] += value
 
     loss = (loss_sum / max(batches, 1)).item()
     baseline_metrics_dict = finalize_rank_metrics(baseline_metric_sums, baseline_metric_user_count)
     metrics_dict = finalize_rank_metrics(metric_sums, metric_user_count)
+    metrics_dict.update(finalize_zero_history_rank_metrics(zero_history_metric_sums, zero_history_metric_user_count))
     return loss, metrics_dict, baseline_metrics_dict
 
 
@@ -326,6 +370,8 @@ def evaluate_matrix_scorer(
     loss_batches = 0
     metric_sums = empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
+    zero_history_metric_sums = empty_rank_metric_sums(metrics_top_ks)
+    zero_history_metric_user_count = 0
     classification_pair_count = 0
     classification_positive_count = 0
     metric_labels: Optional[np.ndarray] = None
@@ -347,6 +393,11 @@ def evaluate_matrix_scorer(
             ranked_indices = torch.argsort(scores, dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
+            batch_zero_history_metric_sums, batch_zero_history_metric_user_count = zero_history_rank_metric_sums_for_batch(
+                batch,
+                ranked_labels,
+                metrics_top_ks,
+            )
 
             if batch_scores.loss is not None:
                 loss_sum += batch_scores.loss.detach().to(device)
@@ -354,6 +405,9 @@ def evaluate_matrix_scorer(
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
+            zero_history_metric_user_count += batch_zero_history_metric_user_count
+            for key, value in batch_zero_history_metric_sums.items():
+                zero_history_metric_sums[key] += value
 
             if collect_ranking_rows:
                 ranking_rows.extend(ranking_rows_for_batch(batch, scores, labels, metrics_top_ks))
@@ -387,6 +441,7 @@ def evaluate_matrix_scorer(
                         metric_priorities = metric_priorities[keep_idx]
 
     metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
+    metrics.update(finalize_zero_history_rank_metrics(zero_history_metric_sums, zero_history_metric_user_count))
     metrics["loss"] = (loss_sum / loss_batches).item() if loss_batches > 0 else None
     metrics["rank_metric_user_count"] = metric_user_count
     metrics["classification_metric_pair_count"] = classification_pair_count
@@ -441,7 +496,7 @@ def optional_float_metric(value: Any) -> Optional[float]:
     if value is None:
         return None
     metric_value = float(value)
-    if math.isnan(metric_value):
+    if not math.isfinite(metric_value):
         return None
     return metric_value
 
@@ -486,12 +541,84 @@ def log_final_classification_metrics(
             )
 
 
+def log_zero_history_rank_metrics(
+    experiment_tracker: Optional[Any],
+    split_metrics: Dict[str, Dict[str, Any]],
+    metrics_top_ks: list[int],
+    iteration: int,
+) -> None:
+    if experiment_tracker is None:
+        return
+    for k in metrics_top_ks:
+        for metric_name, metric_label in (
+            (f"{ZERO_HISTORY_METRIC_PREFIX}ndcg@{k}", f"Zero-History NDCG@{k}"),
+            (f"{ZERO_HISTORY_METRIC_PREFIX}recall@{k}", f"Zero-History Recall@{k}"),
+        ):
+            for split_name, metrics in split_metrics.items():
+                metric_value = optional_float_metric(metrics.get(metric_name))
+                if metric_value is None:
+                    continue
+                experiment_tracker.log_scalar(
+                    title=metric_label,
+                    series=f"{split_metric_label(split_name)} {metric_label}",
+                    value=metric_value,
+                    iteration=iteration,
+                )
+    for metric_name, metric_label in (
+        (f"{ZERO_HISTORY_METRIC_PREFIX}mean_average_precision", "Zero-History MAP"),
+        (ZERO_HISTORY_RANK_METRIC_USER_COUNT, "Zero-History User Count"),
+    ):
+        for split_name, metrics in split_metrics.items():
+            metric_value = optional_float_metric(metrics.get(metric_name))
+            if metric_value is None:
+                continue
+            experiment_tracker.log_scalar(
+                title=metric_label,
+                series=f"{split_metric_label(split_name)} {metric_label}",
+                value=metric_value,
+                iteration=iteration,
+            )
+
+
+def _metric_at_k_sort_key(metric_name: str) -> int:
+    try:
+        return int(metric_name.rsplit("@", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
 def stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[str]:
     lines = []
     for split_name, metrics in split_metrics.items():
         for metric_name in FINAL_CLASSIFICATION_METRICS:
             metric_value = optional_metric_value(metrics, metric_name)
             if metric_value is not None:
+                lines.append(f"{split_name}_{metric_name}: {metric_value:.4f}")
+        zero_history_metric_names: List[str] = []
+        if ZERO_HISTORY_RANK_METRIC_USER_COUNT in metrics:
+            zero_history_metric_names.append(ZERO_HISTORY_RANK_METRIC_USER_COUNT)
+        zero_history_metric_names.extend(
+            sorted(
+                (key for key in metrics if key.startswith(f"{ZERO_HISTORY_METRIC_PREFIX}ndcg@")),
+                key=_metric_at_k_sort_key,
+            )
+        )
+        zero_history_metric_names.extend(
+            sorted(
+                (key for key in metrics if key.startswith(f"{ZERO_HISTORY_METRIC_PREFIX}recall@")),
+                key=_metric_at_k_sort_key,
+            )
+        )
+        zero_history_map_metric = f"{ZERO_HISTORY_METRIC_PREFIX}mean_average_precision"
+        if zero_history_map_metric in metrics:
+            zero_history_metric_names.append(zero_history_map_metric)
+        for metric_name in zero_history_metric_names:
+            metric_value = optional_float_metric(metrics.get(metric_name))
+            if metric_value is None:
+                continue
+            if metric_name == ZERO_HISTORY_RANK_METRIC_USER_COUNT:
+                lines.append(f"{split_name}_{metric_name}: {int(metric_value)}")
+            else:
                 lines.append(f"{split_name}_{metric_name}: {metric_value:.4f}")
     return lines
 

@@ -129,6 +129,7 @@ from utils.author_features import ProjectedPostFeatureEncoder
 from utils.matrix_ranking import (
     evaluate_matrix_model,
     log_final_classification_metrics,
+    log_zero_history_rank_metrics,
     run_matrix_epoch,
     stage_info_metric_lines,
     write_ranking_rows,
@@ -836,6 +837,16 @@ def train_two_tower_model(
                         value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
                         iteration=iteration,
                     )
+            log_zero_history_rank_metrics(
+                experiment_tracker,
+                {
+                    "train": train_metrics_dict,
+                    "validation": val_metrics_dict,
+                    "validation_unseen_users": val_unseen_metrics_dict,
+                },
+                metrics_top_ks,
+                iteration,
+            )
 
         scheduler.step(val_primary_metric)
 
